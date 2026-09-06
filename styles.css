@@ -448,7 +448,6 @@ button {
 .line-item .desc { color: var(--ink-soft); font-size: 0.8rem; }
 
 .table-scroll {
-  overflow-x: auto;
   margin-bottom: 4px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -457,8 +456,7 @@ button {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.8rem;
-  white-space: nowrap;
-  table-layout: auto;
+  table-layout: fixed;
 }
 .items-table th {
   text-align: left;
@@ -469,21 +467,67 @@ button {
   padding: 8px 10px;
   border-bottom: 1px solid var(--line);
   background: var(--bg-soft, rgba(120,120,120,0.06));
+  overflow-wrap: break-word;
 }
 .items-table td {
   padding: 7px 10px;
   border-bottom: 1px solid var(--line);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
-.items-table td.wrap { white-space: normal; min-width: 140px; }
 .items-table tbody tr:last-child td { border-bottom: none; }
 .items-table td.monto { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
 .items-table td.center { text-align: center; }
 .items-table th.center { text-align: center; }
-.items-table .acciones-cell { display: flex; gap: 6px; flex-wrap: nowrap; }
+.items-table .acciones-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+.items-table .btn-sm { white-space: nowrap; }
 .items-table .item-extra-row td { background: var(--bg-soft, rgba(120,120,120,0.04)); }
 .items-table tbody tr.row-clickable { cursor: pointer; }
 .items-table tbody tr.row-clickable:hover td { background: var(--bg-soft, rgba(4,107,210,0.06)); }
+
+/* En celular una tabla de muchas columnas no entra sin cortar texto ni sin
+   scroll horizontal (lo probamos: 10 columnas en ~390px es imposible). En
+   vez de eso, cada fila se convierte en una tarjeta y cada celda muestra su
+   propia etiqueta (el nombre de columna) arriba del valor. */
+@media (max-width: 700px) {
+  .items-table, .items-table thead, .items-table tbody, .items-table tr {
+    display: block;
+    width: 100%;
+  }
+  .items-table thead { display: none; }
+  .items-table tbody tr {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    padding: 6px 10px;
+    background: var(--card);
+  }
+  .items-table tbody tr.item-extra-row {
+    border: none; margin: -6px 0 10px; padding: 0 10px 10px;
+    background: transparent;
+  }
+  .items-table td {
+    display: block;
+    width: auto !important;
+    border-bottom: 1px dashed var(--line);
+    padding: 7px 0;
+  }
+  .items-table tr:last-child td:not(.acciones-cell) { border-bottom: 1px dashed var(--line); }
+  .items-table td:last-of-type { border-bottom: none; }
+  .items-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--ink-soft);
+    margin-bottom: 2px;
+  }
+  .items-table td.monto { text-align: left; }
+  .items-table td.center { text-align: left; }
+  .items-table .acciones-cell { border-bottom: none; padding-top: 10px; }
+}
 
 .btn-sm {
   padding: 5px 10px;

@@ -82,12 +82,12 @@ const CENTROS_COSTO_POR_EMPRESA = {
 // electrónicas comunes (de un local, bencinera, etc.) NUNCA llegan por SII
 // a la contabilidad, así que van como "Gasto directo" -- se categorizan
 // igual que cualquier otro gasto directo, con foto obligatoria igual.
-const TIPOS_DOCUMENTO = ["Factura Electronica", "Factura Exenta Electronica", "Boleta de Honorarios"];
+const TIPOS_DOCUMENTO = ["Factura Electrónica", "Factura Exenta Electrónica", "Boleta de Honorario"];
 
 const CUENTA_POR_TIPO_DOC = {
-  "Factura Electronica": "2.01.07.01",
-  "Factura Exenta Electronica": "2.01.07.01",
-  "Boleta de Honorarios": "2.01.07.03",
+  "Factura Electrónica": "2.01.07.01",
+  "Factura Exenta Electrónica": "2.01.07.01",
+  "Boleta de Honorario": "2.01.07.03",
 };
 
 const CUENTA_CONTRAPARTIDA = {
@@ -602,6 +602,7 @@ function renderList(container, rows, showEmpleado) {
       el("td", { class: "monto" }, fmtCLP(r.monto_total)),
       el("td", { class: "center" }, el("span", { class: "pill " + r.estado }, r.estado)),
     );
+    celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
     tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalle(r.id) }, celdas));
   });
 
@@ -681,11 +682,12 @@ async function openAdminUsuarios(pushHistory = true) {
       mostrarPanel("perfil", (cell) => renderEditarPerfilPanel(cell, u, nombreCell));
     });
 
+    nombreCell.setAttribute("data-label", "Nombre");
     tbody.appendChild(el("tr", {}, [
       nombreCell,
-      el("td", {}, u.rut || "-"),
-      el("td", {}, select),
-      el("td", { class: "acciones-cell" }, [btnEditar, btnCuentas]),
+      el("td", { "data-label": "RUT" }, u.rut || "-"),
+      el("td", { "data-label": "Rol" }, select),
+      el("td", { class: "acciones-cell", "data-label": "Acciones" }, [btnEditar, btnCuentas]),
     ]));
     tbody.appendChild(filaExtra);
   });
@@ -1388,12 +1390,15 @@ async function openDetalle(id, pushHistory = true) {
     celdas.push(el("td", { class: "wrap" }, esCon ? "-" : (it.centro_costo || it.empresa || "-")));
     celdas.push(el("td", { class: "wrap" }, it.descripcion || "-"));
     celdas.push(el("td", { class: "monto" }, fmtCLP(it.monto)));
+    // En celular la tabla se apila como tarjetas (ver CSS) -- cada celda
+    // necesita saber el nombre de su columna para mostrarlo como etiqueta.
+    celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
 
     const filaExtra = el("tr", { class: "item-extra-row", style: "display:none;" });
     const extraCell = el("td", { colspan: String(columnas.length) });
     filaExtra.appendChild(extraCell);
 
-    const accionesCell = el("td", { class: "acciones-cell" });
+    const accionesCell = el("td", { class: "acciones-cell", "data-label": "Acciones" });
     if (it.adjunto_url) {
       accionesCell.appendChild(el("button", { class: "btn btn-sm", type: "button", onclick: () => verComprobante(it) }, "Ver"));
     }
@@ -1410,7 +1415,7 @@ async function openDetalle(id, pushHistory = true) {
     // contabilidad, así que verificarlas contra "movimientos" no tiene
     // sentido: van directo como gasto aprobado. Solo las facturas
     // electrónicas se pueden verificar.
-    if (esAprobadorViewer && esCon && (it.tipo_documento === "Factura Electronica" || it.tipo_documento === "Factura Exenta Electronica")) {
+    if (esAprobadorViewer && esCon && (it.tipo_documento === "Factura Electrónica" || it.tipo_documento === "Factura Exenta Electrónica")) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-sm", type: "button",
         onclick: () => {

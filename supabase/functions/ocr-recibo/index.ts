@@ -24,7 +24,7 @@ ni explicaciones, con exactamente esta forma:
 {
   "nombre_proveedor": "razón social o nombre del proveedor" o null,
   "rut_proveedor": "12.345.678-9" o null,
-  "tipo_documento": "Factura Electronica" | "Boleta Electronica" | "Boleta de Honorarios" | null,
+  "tipo_documento": "Factura Electrónica" | "Factura Exenta Electrónica" | "Boleta de Honorario" | "Boleta Electrónica" | null,
   "nro_documento": "string" o null,
   "fecha": "YYYY-MM-DD" o null,
   "monto": number o null,
