@@ -480,6 +480,7 @@ button {
 .items-table td.monto { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
 .items-table td.center { text-align: center; }
 .items-table th.center { text-align: center; }
+.items-table th.right { text-align: right; }
 .items-table .acciones-cell { display: flex; gap: 6px; flex-wrap: wrap; }
 .items-table .btn-sm { white-space: nowrap; }
 .items-table .item-extra-row td { background: var(--bg-soft, rgba(120,120,120,0.04)); }

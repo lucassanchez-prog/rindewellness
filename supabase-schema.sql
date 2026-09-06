@@ -37,7 +37,10 @@ create table if not exists public.rendiciones (
   aprobador_nombre text,
   fecha_aprobacion timestamptz,
   numero_comprobante_kame text,
-  comentario text
+  comentario text,
+  -- Motivo que escribe el aprobador cuando rechaza la rendición. Se le
+  -- muestra al empleado en la app y se le envía por correo.
+  motivo_rechazo text
 );
 
 -- Líneas / ítems de cada rendición
@@ -86,6 +89,8 @@ alter table public.rendicion_items add column if not exists centro_costo text;
 -- tilde hacía fallar hasta el valor "correcto" -- se sacó la restricción
 -- del todo, ver comentario en la definición de la columna más arriba.
 alter table public.rendicion_items drop constraint if exists rendicion_items_tipo_documento_check;
+-- Motivo del rechazo, para avisarle al empleado por qué se rechazó su rendición.
+alter table public.rendiciones add column if not exists motivo_rechazo text;
 
 create index if not exists idx_rendicion_items_rendicion_id on public.rendicion_items(rendicion_id);
 create index if not exists idx_rendiciones_empleado on public.rendiciones(empleado_id);

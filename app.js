@@ -586,7 +586,7 @@ function renderList(container, rows, showEmpleado) {
   const columnasCentradas = new Set(["Folio", "Fecha", "Tipo", "Estado"]);
   const tabla = el("table", { class: "items-table" });
   tabla.appendChild(el("thead", {}, [
-    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : "" }, c))),
+    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c === "Monto" ? "right" : "") }, c))),
   ]));
   const tbody = el("tbody");
   tabla.appendChild(tbody);
@@ -1366,7 +1366,7 @@ async function openDetalle(id, pushHistory = true) {
   columnas.push("Centro de Costo", "Descripción", "Monto", "Acciones");
 
   const tabla = el("table", { class: "items-table" });
-  const thead = el("thead", {}, [el("tr", {}, columnas.map((c) => el("th", {}, c)))]);
+  const thead = el("thead", {}, [el("tr", {}, columnas.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]);
   const tbody = el("tbody");
   tabla.appendChild(thead);
   tabla.appendChild(tbody);
@@ -1446,12 +1446,40 @@ async function openDetalle(id, pushHistory = true) {
     box.appendChild(el("button", { class: "btn btn-secondary", onclick: () => descargarCSV(r, items) }, "Descargar comprobante para Kame"));
   }
 
+  if (r.estado === "Rechazado") {
+    box.appendChild(el("div", {
+      style: "margin-top:10px; padding:12px 14px; border-radius:8px; background:var(--danger-bg); color:var(--danger);",
+    }, [
+      el("p", { style: "margin:0 0 4px; font-weight:600;" }, `Rechazado por ${r.aprobador_nombre || "-"} el ${fmtDate(r.fecha_aprobacion)}`),
+      el("p", { style: "margin:0;" }, r.motivo_rechazo || "No se dejó un motivo."),
+    ]));
+  }
+
   if (puedeAprobar) {
+    const rechazoBox = el("div", { style: "display:none; margin-top:14px;" });
+    const rechazoInput = el("textarea", {
+      rows: "2", placeholder: "Explica brevemente por qué se rechaza (se le avisa por correo al empleado)...",
+      style: "width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:0.9rem; resize:vertical;",
+    });
+    rechazoBox.appendChild(rechazoInput);
+    rechazoBox.appendChild(el("div", { style: "display:flex; gap:10px; margin-top:8px;" }, [
+      el("button", {
+        class: "btn btn-danger", type: "button",
+        onclick: () => {
+          const motivo = rechazoInput.value.trim();
+          if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
+          aprobarRendicion(r, items, "Rechazado", motivo);
+        },
+      }, "Confirmar rechazo"),
+      el("button", { class: "btn btn-ghost", type: "button", onclick: () => { rechazoBox.style.display = "none"; } }, "Cancelar"),
+    ]));
+
     const actions = el("div", { style: "display:flex;gap:10px;margin-top:16px" }, [
       el("button", { class: "btn btn-success", onclick: () => aprobarRendicion(r, items, "Aprobado") }, "Aprobar"),
-      el("button", { class: "btn btn-danger", onclick: () => aprobarRendicion(r, items, "Rechazado") }, "Rechazar"),
+      el("button", { class: "btn btn-danger", onclick: () => { rechazoBox.style.display = "block"; } }, "Rechazar"),
     ]);
     box.appendChild(actions);
+    box.appendChild(rechazoBox);
   }
 
   if (pushHistory) pushView("view-detalle", { id }); else show("view-detalle");
@@ -1574,24 +1602,37 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   lineWrap.appendChild(acciones);
 }
 
-async function aprobarRendicion(rendicion, items, estado) {
-  const { error } = await db
-    .from("rendiciones")
-    .update({
-      estado,
-      aprobador_id: currentUser.id,
-      aprobador_nombre: currentProfile?.nombre || currentUser.email,
-      fecha_aprobacion: new Date().toISOString(),
-    })
-    .eq("id", rendicion.id);
+async function aprobarRendicion(rendicion, items, estado, motivoRechazo = null) {
+  const cambios = {
+    estado,
+    aprobador_id: currentUser.id,
+    aprobador_nombre: currentProfile?.nombre || currentUser.email,
+    fecha_aprobacion: new Date().toISOString(),
+  };
+  if (estado === "Rechazado") cambios.motivo_rechazo = motivoRechazo;
 
+  const { error } = await db.from("rendiciones").update(cambios).eq("id", rendicion.id);
   if (error) { toast("Error al actualizar: " + error.message); return; }
 
   toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
+  Object.assign(rendicion, cambios);
+
+  // Le avisamos por correo a quien envió la rendición cómo quedó -- no
+  // bloqueamos el flujo si el correo falla, la actualización ya se guardó.
+  db.functions.invoke("notificar-estado-rendicion", {
+    body: {
+      folio: rendicion.folio,
+      empleado_id: rendicion.empleado_id,
+      empleado_nombre: rendicion.empleado_nombre,
+      empresa: rendicion.empresa,
+      monto_total: rendicion.monto_total,
+      estado,
+      motivo_rechazo: motivoRechazo,
+      aprobador_nombre: cambios.aprobador_nombre,
+    },
+  }).catch((err) => console.error("No se pudo notificar al empleado:", err));
+
   if (estado === "Aprobado") {
-    rendicion.estado = "Aprobado";
-    rendicion.aprobador_nombre = currentProfile?.nombre || currentUser.email;
-    rendicion.fecha_aprobacion = new Date().toISOString();
     await descargarCSV(rendicion, items);
   }
   replaceView("view-dashboard");
