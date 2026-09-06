@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RindeWellness</title>
+<link rel="stylesheet" href="styles.css" />
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+  // Aplicar el tema guardado antes de pintar la página, para que no "parpadee".
+  try {
+    const savedTheme = localStorage.getItem("rw-theme");
+    if (savedTheme) document.documentElement.setAttribute("data-theme", savedTheme);
+  } catch (e) {}
+</script>
+</head>
+<body>
+
+  <!-- LOGIN -->
+  <div id="view-login" class="view active">
+    <button class="btn btn-ghost theme-toggle" id="btn-theme-toggle-login" title="Cambiar tema" type="button">🌙</button>
+    <div class="login-wrap">
+      <div class="login-card">
+        <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
+        <h1>RindeWellness</h1>
+        <p class="sub">Rendición de gastos del grupo</p>
+
+        <form id="form-login">
+          <div class="field">
+            <label>Correo</label>
+            <input type="email" id="login-email" required autocomplete="email" />
+          </div>
+          <div class="field">
+            <label>Contraseña</label>
+            <div class="password-field">
+              <input type="password" id="login-password" required autocomplete="current-password" />
+              <button type="button" class="btn-ver-password" id="btn-ver-password" aria-label="Mostrar contraseña">👁</button>
+            </div>
+          </div>
+          <div id="signup-extra" style="display:none">
+            <div class="field">
+              <label>Nombre completo</label>
+              <input type="text" id="login-nombre" autocomplete="name" />
+            </div>
+            <div class="field">
+              <label>RUT</label>
+              <input type="text" id="login-rut" placeholder="12.345.678-9" />
+              <p class="ocr-status" id="login-rut-hint"></p>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-block" id="btn-login-submit">Ingresar</button>
+          <div class="login-error" id="login-error"></div>
+        </form>
+
+        <div class="login-toggle">
+          <span id="login-toggle-text">¿No tienes cuenta?</span>
+          <button type="button" id="btn-toggle-mode">Crear una</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- APP SHELL (topbar + views) -->
+  <div id="app-shell" style="display:none">
+    <div class="topbar">
+      <div class="brand"><img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" /> RindeWellness</div>
+      <div class="user">
+        <span id="user-name"></span>
+        <button class="btn btn-ghost" id="btn-admin-usuarios" style="display:none">Usuarios</button>
+        <button class="btn btn-ghost" id="btn-theme-toggle" title="Cambiar tema" type="button">🌙</button>
+        <button class="btn btn-ghost" id="btn-logout">Salir</button>
+      </div>
+    </div>
+
+    <div class="app-shell">
+
+      <!-- DASHBOARD -->
+      <div id="view-dashboard" class="view">
+        <div class="hero-row">
+          <div>
+            <h1>Mis rendiciones</h1>
+            <p>Registra tus gastos y sigue el estado de tus reembolsos</p>
+          </div>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-secondary" id="btn-exportar-excel" style="display:none">Exportar a Excel</button>
+            <button class="btn btn-secondary" id="btn-comprobante-rango" style="display:none">Comprobante por rango</button>
+            <button class="btn btn-primary" id="btn-nueva">+ Nueva rendición</button>
+          </div>
+        </div>
+
+        <div class="card" id="panel-rango" style="display:none; margin-bottom:18px;">
+          <div class="field-row">
+            <div class="field">
+              <label>Desde</label>
+              <input type="date" id="rango-desde" />
+            </div>
+            <div class="field">
+              <label>Hasta</label>
+              <input type="date" id="rango-hasta" />
+            </div>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button class="btn btn-primary" type="button" id="btn-generar-rango">Generar comprobantes</button>
+            <button class="btn btn-ghost" type="button" id="btn-cancelar-rango">Cancelar</button>
+          </div>
+          <p class="ocr-status" id="rango-status"></p>
+        </div>
+
+        <div class="stat-row" id="stat-row"></div>
+
+        <div class="filter-bar" id="filter-bar">
+          <div class="field">
+            <label>Estado</label>
+            <select id="filtro-estado">
+              <option value="">Todos</option>
+              <option value="Pendiente">Pendiente</option>
+              <option value="Aprobado">Aprobado</option>
+              <option value="Rechazado">Rechazado</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Empresa</label>
+            <select id="filtro-empresa">
+              <option value="">Todas</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Buscar</label>
+            <input type="text" id="filtro-texto" placeholder="Comentario o nombre..." />
+          </div>
+        </div>
+
+        <div class="tabs" id="tabs-row">
+          <button class="tab-btn active" data-tab="mias">Mis rendiciones</button>
+          <button class="tab-btn" data-tab="aprobaciones" id="tab-aprobaciones" style="display:none">Aprobaciones pendientes</button>
+        </div>
+
+        <div id="list-mias" class="card-list"></div>
+        <div id="list-aprobaciones" class="card-list" style="display:none"></div>
+      </div>
+
+      <!-- NUEVA RENDICION -->
+      <div id="view-nueva" class="view">
+        <button class="back-link" data-back="dashboard">&larr; Volver</button>
+        <div class="hero-row"><div><h1>Nueva rendición</h1><p>Agrega uno o más gastos</p></div></div>
+
+        <div class="card" style="margin-bottom:18px">
+          <div class="field-row">
+            <div class="field">
+              <label>Fecha</label>
+              <input type="date" id="nr-fecha" required />
+            </div>
+            <div class="field">
+              <label>Tipo de rendición</label>
+              <select id="nr-tipo">
+                <option value="Reembolso">Reembolso</option>
+                <option value="FondoPorRendir">Rendición de fondo por rendir</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>Empresa (en que se registrará esta rendición)</label>
+            <select id="nr-empresa"></select>
+          </div>
+          <div class="field">
+            <label>Comentario general</label>
+            <input type="text" id="nr-comentario" placeholder="Ej: Rendición viaje a terreno" />
+          </div>
+        </div>
+
+        <div id="items-container"></div>
+        <button class="btn btn-secondary" id="btn-add-item" type="button">+ Agregar ítem</button>
+
+        <div class="totals-bar">
+          <span>Total rendición</span>
+          <span class="amount" id="nr-total">$0</span>
+        </div>
+
+        <div style="margin-top:18px; display:flex; gap:10px;">
+          <button class="btn btn-primary" id="btn-guardar-rendicion">Enviar a aprobación</button>
+        </div>
+      </div>
+
+      <!-- DETALLE / APROBACION -->
+      <div id="view-detalle" class="view">
+        <button class="back-link" data-back="dashboard">&larr; Volver</button>
+        <div class="card" id="detalle-card"></div>
+      </div>
+
+      <!-- ADMINISTRACION DE USUARIOS -->
+      <div id="view-admin" class="view">
+        <button class="back-link" data-back="dashboard">&larr; Volver</button>
+        <div class="hero-row"><div><h1>Usuarios</h1><p>Administra los permisos de cada persona del grupo</p></div></div>
+        <div class="card-list" id="list-usuarios"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="config.js"></script>
+  <script src="app.js?v=27"></script>
+</body>
+</html>
