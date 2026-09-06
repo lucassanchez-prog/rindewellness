@@ -47,7 +47,7 @@ create table if not exists public.rendicion_items (
   tipo_item text not null check (tipo_item in ('ConDocumento','SinDocumento')),
   nombre_proveedor text,
   rut_proveedor text,
-  tipo_documento text check (tipo_documento in ('Factura Electronica','Boleta Electronica','Boleta de Honorarios')),
+  tipo_documento text check (tipo_documento in ('Factura Electrónica','Factura Exenta Electrónica','Boleta de Honorario')),
   nro_documento text,
   fecha_vencimiento date,
   cuenta_contable text,
@@ -74,6 +74,13 @@ alter table public.rendicion_items add column if not exists nombre_proveedor tex
 -- unidad de negocio, y no siempre coincide con el nombre de la empresa
 -- (ej. Dmoov Corp SpA puede tener varios centros: Casa Matriz, Chicureo, etc).
 alter table public.rendicion_items add column if not exists centro_costo text;
+-- La app cambió los nombres de tipo de documento para que coincidan
+-- exactamente con la tabla oficial de Kame (con tilde, "Boleta de
+-- Honorario" en singular). La restricción CHECK original quedó con los
+-- valores viejos y hay que reemplazarla, o los inserts nuevos fallan.
+alter table public.rendicion_items drop constraint if exists rendicion_items_tipo_documento_check;
+alter table public.rendicion_items add constraint rendicion_items_tipo_documento_check
+  check (tipo_documento in ('Factura Electrónica','Factura Exenta Electrónica','Boleta de Honorario'));
 
 create index if not exists idx_rendicion_items_rendicion_id on public.rendicion_items(rendicion_id);
 create index if not exists idx_rendiciones_empleado on public.rendiciones(empleado_id);
