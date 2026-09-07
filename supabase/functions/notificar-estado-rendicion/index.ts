@@ -106,7 +106,7 @@ Deno.serve(async (req: Request) => {
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${aprobado ? "Aprobado" : "Rechazado"} por</td><td>${aprobador_nombre || "-"}</td></tr>
           ${!aprobado ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">Motivo</td><td>${motivo_rechazo || "No se indicó un motivo."}</td></tr>` : ""}
         </table>
-        ${aprobado && esSolicitud ? `<p style="color:#5b6472;">Recuerda que la entrega del fondo la gestiona Finanzas fuera de la app.</p>` : ""}
+        ${aprobado && esSolicitud ? `<p style="color:#5b6472;">La entrega del fondo corresponde a que la gestione Finanzas, fuera de la app.</p>` : ""}
         <p>Ingresa a RindeWellness para ver el detalle.</p>
       </div>
     `;
