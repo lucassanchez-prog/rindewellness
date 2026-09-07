@@ -54,8 +54,10 @@ Deno.serve(async (req: Request) => {
       generationConfig: { temperature: 0, responseMimeType: "application/json" },
     };
 
-    // Gemini a veces devuelve "high demand" de forma transitoria (picos de uso).
-    // Reintentamos un par de veces antes de darnos por vencidos.
+    // Gemini a veces devuelve "high demand" de forma transitoria (picos de uso),
+    // y la capa gratuita tiene un límite de solicitudes POR MINUTO ("quota
+    // exceeded") que se libera solo unos segundos después -- ambos casos se
+    // solucionan reintentando con espera, no son errores permanentes.
     const INTENTOS = 3;
     let data;
     for (let intento = 1; intento <= INTENTOS; intento++) {
@@ -68,9 +70,13 @@ Deno.serve(async (req: Request) => {
       if (resp.ok) break;
 
       const mensaje = data?.error?.message || "Error consultando Gemini";
-      const esTransitorio = /high demand|unavailable|overloaded/i.test(mensaje);
+      const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensaje);
       if (!esTransitorio || intento === INTENTOS) throw new Error(mensaje);
-      await new Promise((r) => setTimeout(r, 1500 * intento));
+      // El error de cuota trae su propio "retry in Ns"; si no lo trae, usamos
+      // el backoff normal. Esperamos un poco más que lo pedido por margen.
+      const retrySugerido = /retry in ([\d.]+)s/i.exec(mensaje);
+      const espera = retrySugerido ? Number(retrySugerido[1]) * 1000 + 1000 : 1500 * intento;
+      await new Promise((r) => setTimeout(r, espera));
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
