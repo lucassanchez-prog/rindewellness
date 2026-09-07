@@ -200,6 +200,7 @@ button {
 
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   border-bottom: 1px solid var(--line);
   margin-bottom: 18px;

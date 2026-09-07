@@ -25,7 +25,7 @@
       <div class="login-card">
         <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
         <h1>RindeWellness</h1>
-        <p class="sub">Plataforma oficial de rendición de gastos de <strong>Grupo Wellness</strong></p>
+        <p class="sub">Plataforma de <strong>Grupo Wellness</strong></p>
 
         <form id="form-login">
           <div class="field">
@@ -86,6 +86,7 @@
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
             <button class="btn btn-secondary" id="btn-exportar-excel" style="display:none">Exportar a Excel</button>
             <button class="btn btn-secondary" id="btn-comprobante-rango" style="display:none">Comprobante por rango</button>
+            <button class="btn btn-secondary" id="btn-solicitar-fondos">+ Solicitar fondos</button>
             <button class="btn btn-primary" id="btn-nueva">+ Nueva rendición</button>
           </div>
         </div>
@@ -135,10 +136,54 @@
         <div class="tabs" id="tabs-row">
           <button class="tab-btn active" data-tab="mias">Mis rendiciones</button>
           <button class="tab-btn" data-tab="aprobaciones" id="tab-aprobaciones" style="display:none">Aprobaciones pendientes</button>
+          <button class="tab-btn" data-tab="solicitudes-mias">Mis solicitudes de fondos</button>
+          <button class="tab-btn" data-tab="solicitudes-aprobacion" id="tab-solicitudes-aprobacion" style="display:none">Solicitudes de fondos pendientes</button>
         </div>
 
         <div id="list-mias" class="card-list"></div>
         <div id="list-aprobaciones" class="card-list" style="display:none"></div>
+        <div id="list-solicitudes-mias" class="card-list" style="display:none"></div>
+        <div id="list-solicitudes-aprobacion" class="card-list" style="display:none"></div>
+      </div>
+
+      <!-- NUEVA SOLICITUD DE FONDOS -->
+      <div id="view-nueva-solicitud" class="view">
+        <button class="back-link" data-back="dashboard">&larr; Volver</button>
+        <div class="hero-row"><div><h1>Solicitar fondos</h1><p>Pide que se te entregue un monto para gastos futuros, antes de rendirlo</p></div></div>
+
+        <div class="card" style="max-width:560px">
+          <div class="field-row">
+            <div class="field">
+              <label>Empresa</label>
+              <select id="sf-empresa"></select>
+            </div>
+            <div class="field">
+              <label>Centro de Costo</label>
+              <select id="sf-cc"></select>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>Monto solicitado</label>
+              <input type="text" id="sf-monto" inputmode="numeric" placeholder="0" />
+            </div>
+            <div class="field">
+              <label>Fecha en que se necesita</label>
+              <input type="date" id="sf-fecha" />
+            </div>
+          </div>
+          <div class="field">
+            <label>Motivo / para qué es</label>
+            <textarea id="sf-motivo" rows="3" placeholder="Ej: Compra de materiales para evento en sucursal Talca"></textarea>
+          </div>
+          <button class="btn btn-primary" id="btn-guardar-solicitud">Enviar solicitud</button>
+        </div>
+      </div>
+
+      <!-- DETALLE DE SOLICITUD DE FONDOS -->
+      <div id="view-detalle-solicitud" class="view">
+        <button class="back-link" data-back="dashboard">&larr; Volver</button>
+        <div class="card" id="detalle-solicitud-card"></div>
       </div>
 
       <!-- NUEVA RENDICION -->
@@ -159,6 +204,10 @@
                 <option value="FondoPorRendir">Rendición de fondo por rendir</option>
               </select>
             </div>
+          </div>
+          <div class="field" id="nr-fondo-wrap" style="display:none">
+            <label>Fondo asociado (solicitud aprobada que estás rindiendo)</label>
+            <select id="nr-fondo"></select>
           </div>
           <div class="field">
             <label>Empresa (en que se registrará esta rendición)</label>
@@ -202,6 +251,6 @@
   <div class="toast" id="toast"></div>
 
   <script src="config.js"></script>
-  <script src="app.js?v=30"></script>
+  <script src="app.js?v=31"></script>
 </body>
 </html>

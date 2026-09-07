@@ -199,13 +199,16 @@ function show(viewId) {
 // al dashboard.
 function hashDeVista(viewId, params) {
   if (viewId === "view-detalle" && params?.id) return `detalle/${params.id}`;
+  if (viewId === "view-detalle-solicitud" && params?.id) return `detalle-solicitud/${params.id}`;
   return viewId.replace("view-", "");
 }
 function estadoDesdeHash() {
   const [base, param] = location.hash.replace(/^#/, "").split("/");
   if (base === "detalle" && param) return { viewId: "view-detalle", params: { id: param } };
+  if (base === "detalle-solicitud" && param) return { viewId: "view-detalle-solicitud", params: { id: param } };
   if (base === "admin") return { viewId: "view-admin", params: {} };
   if (base === "nueva") return { viewId: "view-nueva", params: {} };
+  if (base === "nueva-solicitud") return { viewId: "view-nueva-solicitud", params: {} };
   return { viewId: "view-dashboard", params: {} };
 }
 function pushView(viewId, params = {}) {
@@ -221,8 +224,10 @@ function renderRoute(state) {
   const viewId = resuelto?.viewId || "view-dashboard";
   const params = resuelto?.params || {};
   if (viewId === "view-detalle" && params.id) { openDetalle(params.id, false); return; }
+  if (viewId === "view-detalle-solicitud" && params.id) { openDetalleSolicitud(params.id, false); return; }
   if (viewId === "view-admin") { openAdminUsuarios(false); return; }
   if (viewId === "view-nueva") { openNuevaRendicion(false); return; }
+  if (viewId === "view-nueva-solicitud") { openNuevaSolicitud(false); return; }
   show("view-dashboard");
   loadDashboard();
 }
@@ -293,6 +298,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireLoginForm();
   wireDashboard();
   wireNuevaRendicion();
+  wireNuevaSolicitud();
 
   const { data } = await db.auth.getSession();
   if (data.session) {
@@ -437,6 +443,8 @@ async function onLoggedIn(user) {
   document.getElementById("app-shell").style.display = "block";
   document.getElementById("tab-aprobaciones").style.display =
     profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
+  document.getElementById("tab-solicitudes-aprobacion").style.display =
+    profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
   document.getElementById("btn-admin-usuarios").style.display =
     profile && profile.rol === "admin" ? "inline-block" : "none";
   document.getElementById("btn-exportar-excel").style.display =
@@ -469,6 +477,7 @@ async function cargarCuentasPermitidas() {
 // ------------------------------------------------------------
 function wireDashboard() {
   document.getElementById("btn-nueva").addEventListener("click", () => openNuevaRendicion());
+  document.getElementById("btn-solicitar-fondos").addEventListener("click", () => openNuevaSolicitud());
   document.getElementById("btn-admin-usuarios").addEventListener("click", () => openAdminUsuarios());
   document.getElementById("btn-exportar-excel").addEventListener("click", exportarExcel);
   document.getElementById("btn-comprobante-rango").addEventListener("click", () => {
@@ -494,19 +503,26 @@ function wireDashboard() {
     document.getElementById(id).addEventListener("change", applyDashboardFilters)
   );
   document.getElementById("filtro-texto").addEventListener("input", applyDashboardFilters);
+  const LISTAS_POR_TAB = {
+    "mias": "list-mias",
+    "aprobaciones": "list-aprobaciones",
+    "solicitudes-mias": "list-solicitudes-mias",
+    "solicitudes-aprobacion": "list-solicitudes-aprobacion",
+  };
   document.querySelectorAll(".tab-btn").forEach((b) =>
     b.addEventListener("click", () => {
       document.querySelectorAll(".tab-btn").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       const tab = b.dataset.tab;
-      document.getElementById("list-mias").style.display = tab === "mias" ? "flex" : "none";
-      document.getElementById("list-aprobaciones").style.display = tab === "aprobaciones" ? "flex" : "none";
+      Object.entries(LISTAS_POR_TAB).forEach(([t, listId]) => {
+        document.getElementById(listId).style.display = t === tab ? "flex" : "none";
+      });
     })
   );
 }
 
 // Cache de la última carga, para poder filtrar sin volver a golpear la base.
-const dashboardData = { mias: [], aprobaciones: [] };
+const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [] };
 
 async function loadDashboard() {
   const { data: mias } = await db
@@ -520,6 +536,13 @@ async function loadDashboard() {
   const aprobado = dashboardData.mias.filter((r) => r.estado === "Aprobado").reduce((s, r) => s + Number(r.monto_total), 0);
   renderStats(pendiente, aprobado, dashboardData.mias.length);
 
+  const { data: solicitudesMias } = await db
+    .from("solicitudes_fondos")
+    .select("*")
+    .eq("empleado_id", currentUser.id)
+    .order("created_at", { ascending: false });
+  dashboardData.solicitudesMias = solicitudesMias || [];
+
   if (currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin")) {
     // El admin (usuario maestro) ve todas las rendiciones de todo el grupo;
     // un aprobador normal solo ve las pendientes de aprobar.
@@ -531,8 +554,18 @@ async function loadDashboard() {
     dashboardData.aprobaciones = pendientes || [];
     document.getElementById("tab-aprobaciones").textContent =
       currentProfile.rol === "admin" ? "Todas las rendiciones" : "Aprobaciones pendientes";
+
+    let querySolicitudes = db.from("solicitudes_fondos").select("*");
+    querySolicitudes = currentProfile.rol === "admin"
+      ? querySolicitudes.order("created_at", { ascending: false })
+      : querySolicitudes.eq("estado", "Pendiente").order("created_at", { ascending: true });
+    const { data: solicitudesPendientes } = await querySolicitudes;
+    dashboardData.solicitudesAprobacion = solicitudesPendientes || [];
+    document.getElementById("tab-solicitudes-aprobacion").textContent =
+      currentProfile.rol === "admin" ? "Todas las solicitudes de fondos" : "Solicitudes de fondos pendientes";
   } else {
     dashboardData.aprobaciones = [];
+    dashboardData.solicitudesAprobacion = [];
   }
 
   applyDashboardFilters();
@@ -548,8 +581,15 @@ function applyDashboardFilters() {
     (!empresa || r.empresa === empresa) &&
     (!texto || `${r.comentario || ""} ${r.empleado_nombre || ""}`.toLowerCase().includes(texto));
 
+  const pasaFiltroSolicitud = (s) =>
+    (!estado || s.estado === estado) &&
+    (!empresa || s.empresa === empresa) &&
+    (!texto || `${s.motivo || ""} ${s.empleado_nombre || ""}`.toLowerCase().includes(texto));
+
   renderList(document.getElementById("list-mias"), dashboardData.mias.filter(pasaFiltro), false);
   renderList(document.getElementById("list-aprobaciones"), dashboardData.aprobaciones.filter(pasaFiltro), true);
+  renderListSolicitudes(document.getElementById("list-solicitudes-mias"), dashboardData.solicitudesMias.filter(pasaFiltroSolicitud), false);
+  renderListSolicitudes(document.getElementById("list-solicitudes-aprobacion"), dashboardData.solicitudesAprobacion.filter(pasaFiltroSolicitud), true);
 }
 
 function renderStats(pendiente, aprobado, count) {
@@ -604,6 +644,46 @@ function renderList(container, rows, showEmpleado) {
     );
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
     tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalle(r.id) }, celdas));
+  });
+
+  container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+}
+
+function renderListSolicitudes(container, rows, showEmpleado) {
+  container.innerHTML = "";
+  if (!rows.length) {
+    container.appendChild(el("div", { class: "empty-state" }, [
+      el("div", { class: "icon" }, "💰"),
+      el("div", {}, "No hay solicitudes de fondos para mostrar todavía."),
+    ]));
+    return;
+  }
+
+  const columnas = ["Folio"];
+  if (showEmpleado) columnas.push("Empleado");
+  columnas.push("Empresa", "Centro de Costo", "Motivo", "Fecha", "Monto", "Estado");
+
+  const columnasCentradas = new Set(["Folio", "Fecha", "Estado"]);
+  const tabla = el("table", { class: "items-table" });
+  tabla.appendChild(el("thead", {}, [
+    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c === "Monto" ? "right" : "") }, c))),
+  ]));
+  const tbody = el("tbody");
+  tabla.appendChild(tbody);
+
+  rows.forEach((s) => {
+    const celdas = [el("td", { class: "center" }, `S-${s.folio ?? "-"}`)];
+    if (showEmpleado) celdas.push(el("td", {}, s.empleado_nombre || "-"));
+    celdas.push(
+      el("td", {}, s.empresa || "-"),
+      el("td", {}, s.centro_costo || "-"),
+      el("td", { class: "wrap" }, s.motivo || "-"),
+      el("td", { class: "center" }, fmtDate(s.created_at)),
+      el("td", { class: "monto" }, fmtCLP(s.monto_solicitado)),
+      el("td", { class: "center" }, el("span", { class: "pill " + s.estado }, s.estado)),
+    );
+    celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
+    tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalleSolicitud(s.id) }, celdas));
   });
 
   container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
@@ -824,7 +904,51 @@ function wireNuevaRendicion() {
   document.getElementById("btn-guardar-rendicion").addEventListener("click", submitRendicion);
   const empresaSelect = document.getElementById("nr-empresa");
   EMPRESAS.forEach((emp) => empresaSelect.appendChild(el("option", { value: emp }, emp)));
-  empresaSelect.addEventListener("change", actualizarCentrosCostoPorEmpresa);
+  empresaSelect.addEventListener("change", () => {
+    actualizarCentrosCostoPorEmpresa();
+    if (document.getElementById("nr-tipo").value === "FondoPorRendir") cargarSolicitudesDisponibles();
+  });
+  document.getElementById("nr-tipo").addEventListener("change", () => {
+    const esFondo = document.getElementById("nr-tipo").value === "FondoPorRendir";
+    document.getElementById("nr-fondo-wrap").style.display = esFondo ? "block" : "none";
+    if (esFondo) cargarSolicitudesDisponibles();
+  });
+}
+
+// Llena el desplegable "Fondo asociado" de Nueva rendición con las
+// solicitudes de fondos de ESTE empleado, ya Aprobadas, para la Empresa
+// elegida en el encabezado (un fondo entregado para una empresa no debe
+// rendirse contra otra). Muestra el saldo disponible de cada una -- ya
+// consumido por rendiciones Aprobadas anteriores contra ese mismo fondo --
+// aunque esté en $0 (la persona puede seguir rindiendo de más; el
+// excedente se contabiliza aparte, ver calcularSplitFondo).
+async function cargarSolicitudesDisponibles() {
+  const sel = document.getElementById("nr-fondo");
+  sel.innerHTML = "";
+  const empresa = document.getElementById("nr-empresa").value;
+  const { data: solicitudes, error } = await db
+    .from("solicitudes_fondos")
+    .select("*")
+    .eq("empleado_id", currentUser.id)
+    .eq("estado", "Aprobado")
+    .eq("empresa", empresa)
+    .order("created_at", { ascending: false });
+  if (error) { console.error("Error cargando solicitudes de fondos:", error); return; }
+  if (!solicitudes || !solicitudes.length) {
+    sel.appendChild(el("option", { value: "" }, "No tienes fondos aprobados en esta empresa"));
+    return;
+  }
+  const ids = solicitudes.map((s) => s.id);
+  const { data: rendidas } = await db.from("rendiciones").select("solicitud_fondo_id, monto_total").in("solicitud_fondo_id", ids).eq("estado", "Aprobado");
+  const rendidoPorId = {};
+  (rendidas || []).forEach((r) => { rendidoPorId[r.solicitud_fondo_id] = (rendidoPorId[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0); });
+
+  solicitudes.forEach((s) => {
+    const rendido = rendidoPorId[s.id] || 0;
+    const saldo = Math.max(0, Number(s.monto_solicitado) - rendido);
+    const label = `S-${s.folio} · Otorgado ${fmtCLP(s.monto_solicitado)} · Saldo disponible ${fmtCLP(saldo)}`;
+    sel.appendChild(el("option", { value: s.id }, label));
+  });
 }
 
 // Los ítems "Gasto directo" ya creados se arman con el Centro de Costo de la
@@ -845,6 +969,7 @@ function actualizarCentrosCostoPorEmpresa() {
 function openNuevaRendicion(pushHistory = true) {
   document.getElementById("nr-fecha").value = new Date().toISOString().slice(0, 10);
   document.getElementById("nr-tipo").value = "Reembolso";
+  document.getElementById("nr-fondo-wrap").style.display = "none";
   document.getElementById("nr-comentario").value = "";
   document.getElementById("nr-empresa").value = EMPRESAS[0];
   document.getElementById("items-container").innerHTML = "";
@@ -1278,6 +1403,12 @@ async function submitRendicion() {
 
   if (!items.length) { toast("Ingresa el monto de al menos un ítem."); return; }
 
+  let solicitudFondoId = null;
+  if (tipoRendicion === "FondoPorRendir") {
+    solicitudFondoId = document.getElementById("nr-fondo").value || null;
+    if (!solicitudFondoId) { toast("Selecciona el fondo (solicitud aprobada) que estás rindiendo."); return; }
+  }
+
   const montoTotal = items.reduce((s, i) => s + i.monto, 0);
   const btn = document.getElementById("btn-guardar-rendicion");
   btn.disabled = true;
@@ -1295,6 +1426,7 @@ async function submitRendicion() {
         monto_total: montoTotal,
         estado: "Pendiente",
         comentario,
+        solicitud_fondo_id: solicitudFondoId,
       })
       .select()
       .single();
@@ -1339,6 +1471,254 @@ async function submitRendicion() {
 }
 
 // ------------------------------------------------------------
+// Solicitudes de fondos por rendir
+// ------------------------------------------------------------
+// Paso previo a una rendición tipo "FondoPorRendir": el empleado pide que
+// se le entregue un monto (la entrega la hace Finanzas fuera de la app);
+// un aprobador/admin la aprueba o rechaza igual que una rendición. Una vez
+// Aprobada, aparece en el desplegable "Fondo asociado" de Nueva rendición
+// (ver cargarSolicitudesDisponibles) para que el empleado la vincule al
+// justificar en qué gastó ese fondo.
+function wireNuevaSolicitud() {
+  document.getElementById("btn-guardar-solicitud").addEventListener("click", submitSolicitud);
+  const empresaSelect = document.getElementById("sf-empresa");
+  EMPRESAS.forEach((emp) => empresaSelect.appendChild(el("option", { value: emp }, emp)));
+  empresaSelect.addEventListener("change", actualizarCentroCostoSolicitud);
+  const montoInput = document.getElementById("sf-monto");
+  montoInput.addEventListener("input", () => {
+    const raw = montoInput.value.replace(/\D/g, "");
+    montoInput.value = raw ? Number(raw).toLocaleString("es-CL") : "";
+  });
+}
+
+function actualizarCentroCostoSolicitud() {
+  const empresa = document.getElementById("sf-empresa").value;
+  const opciones = CENTROS_COSTO_POR_EMPRESA[empresa] || ["Casa Matriz"];
+  const sel = document.getElementById("sf-cc");
+  sel.innerHTML = "";
+  opciones.forEach((o) => sel.appendChild(el("option", { value: o }, o)));
+}
+
+function openNuevaSolicitud(pushHistory = true) {
+  document.getElementById("sf-empresa").value = EMPRESAS[0];
+  actualizarCentroCostoSolicitud();
+  document.getElementById("sf-monto").value = "";
+  document.getElementById("sf-fecha").value = "";
+  document.getElementById("sf-motivo").value = "";
+  if (pushHistory) pushView("view-nueva-solicitud"); else show("view-nueva-solicitud");
+}
+
+async function submitSolicitud() {
+  const empresa = document.getElementById("sf-empresa").value;
+  const centroCosto = document.getElementById("sf-cc").value;
+  const monto = parseMoneyValue(document.getElementById("sf-monto").value);
+  const fechaNecesaria = document.getElementById("sf-fecha").value || null;
+  const motivo = document.getElementById("sf-motivo").value.trim();
+
+  if (!monto) { toast("Ingresa el monto solicitado."); return; }
+  if (!motivo) { toast("Explica para qué es el fondo."); return; }
+
+  const btn = document.getElementById("btn-guardar-solicitud");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Enviando...';
+  try {
+    const { data: solicitud, error } = await db
+      .from("solicitudes_fondos")
+      .insert({
+        empleado_id: currentUser.id,
+        empleado_nombre: currentProfile?.nombre || currentUser.email,
+        rut_empleado: currentProfile?.rut || null,
+        empresa,
+        centro_costo: centroCosto,
+        monto_solicitado: monto,
+        motivo,
+        fecha_necesaria: fechaNecesaria,
+        estado: "Pendiente",
+      })
+      .select()
+      .single();
+    if (error) throw error;
+
+    // Mismo correo/plantilla que una rendición nueva, pero con tipo
+    // "solicitud" para que el asunto y el cuerpo hablen de un fondo.
+    db.functions.invoke("notificar-aprobador", {
+      body: {
+        tipo: "solicitud",
+        folio: solicitud.folio,
+        empleado_nombre: solicitud.empleado_nombre,
+        empresa: solicitud.empresa,
+        monto_total: solicitud.monto_solicitado,
+        comentario: solicitud.motivo,
+        rendicion_id: solicitud.id,
+      },
+    }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
+
+    toast("Solicitud de fondos enviada.");
+    replaceView("view-dashboard");
+    loadDashboard();
+  } catch (err) {
+    toast("Error: " + (err.message || "no se pudo guardar."));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Enviar solicitud";
+  }
+}
+
+async function openDetalleSolicitud(id, pushHistory = true) {
+  const { data: s } = await db.from("solicitudes_fondos").select("*").eq("id", id).single();
+  const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
+  const puedeAprobar = esAprobadorViewer && s.estado === "Pendiente";
+
+  const box = document.getElementById("detalle-solicitud-card");
+  box.innerHTML = "";
+
+  box.appendChild(el("div", { class: "detail-header" }, [
+    el("div", {}, [
+      el("h2", { style: "margin:0 0 4px" }, `S-${s.folio ?? "-"} · ${s.empresa || "-"}`),
+      el("p", { style: "margin:0;color:var(--ink-soft);font-size:0.88rem" }, `${s.empleado_nombre} · ${fmtDate(s.created_at)}`),
+    ]),
+    el("span", { class: "pill " + s.estado, style: "font-size:0.8rem" }, s.estado),
+  ]));
+
+  [
+    ["Centro de Costo", s.centro_costo || "-"],
+    ["Motivo", s.motivo || "-"],
+    ["Fecha en que se necesita", s.fecha_necesaria ? fmtDate(s.fecha_necesaria) : "-"],
+  ].forEach(([label, valor]) => {
+    box.appendChild(el("p", { style: "margin:4px 0;font-size:0.9rem" }, [
+      el("strong", {}, `${label}: `),
+      valor,
+    ]));
+  });
+
+  box.appendChild(el("div", { class: "totals-bar" }, [
+    el("span", {}, "Monto solicitado"),
+    el("span", { class: "amount" }, fmtCLP(s.monto_solicitado)),
+  ]));
+
+  if (s.estado === "Aprobado") {
+    box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:10px" },
+      `Aprobado por ${s.aprobador_nombre || "-"} el ${fmtDate(s.fecha_aprobacion)}`));
+
+    // Saldo: cuánto de este fondo ya se rindió (rendiciones Aprobadas
+    // vinculadas a esta solicitud) y cuánto queda disponible. Si el saldo
+    // es negativo, la persona gastó más de lo que se le entregó -- ese
+    // exceso se contabilizó como Rendiciones por Pagar (ver
+    // calcularSplitFondo), no como parte de este fondo.
+    const { data: rendidas } = await db
+      .from("rendiciones")
+      .select("id, folio, monto_total, estado")
+      .eq("solicitud_fondo_id", s.id)
+      .order("created_at", { ascending: true });
+    const aprobadas = (rendidas || []).filter((r) => r.estado === "Aprobado");
+    const rendido = aprobadas.reduce((sum, r) => sum + Number(r.monto_total || 0), 0);
+    const saldo = Number(s.monto_solicitado) - rendido;
+
+    box.appendChild(el("div", {
+      style: "margin-top:14px; padding:12px 14px; border-radius:8px; background:var(--bg-soft, rgba(120,120,120,0.06));",
+    }, [
+      el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" }, "Monto ya rendido (aprobado)"),
+      el("p", { style: "margin:0 0 10px;font-weight:700" }, fmtCLP(rendido)),
+      el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" },
+        saldo >= 0 ? "Saldo disponible" : "Exceso rendido (va a Rendiciones por Pagar)"),
+      el("p", { style: `margin:0;font-weight:700;color:${saldo >= 0 ? "var(--success)" : "var(--danger)"}` }, fmtCLP(Math.abs(saldo))),
+    ]));
+
+    if (rendidas && rendidas.length) {
+      box.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.9rem" }, "Rendiciones contra este fondo"));
+      const tabla = el("table", { class: "items-table" });
+      const cols = ["Rendición", "Monto", "Estado"];
+      tabla.appendChild(el("thead", {}, [el("tr", {}, cols.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]));
+      const tbody = el("tbody");
+      rendidas.forEach((r) => {
+        const celdas = [
+          el("td", {}, `N° ${r.folio ?? "-"}`),
+          el("td", { class: "monto" }, fmtCLP(r.monto_total)),
+          el("td", {}, el("span", { class: "pill " + r.estado }, r.estado)),
+        ];
+        celdas.forEach((td, i) => td.setAttribute("data-label", cols[i]));
+        tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalle(r.id) }, celdas));
+      });
+      tabla.appendChild(tbody);
+      box.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+    }
+  }
+
+  if (s.estado === "Rechazado") {
+    box.appendChild(el("div", {
+      style: "margin-top:10px; padding:12px 14px; border-radius:8px; background:var(--danger-bg); color:var(--danger);",
+    }, [
+      el("p", { style: "margin:0 0 4px; font-weight:600;" }, `Rechazado por ${s.aprobador_nombre || "-"} el ${fmtDate(s.fecha_aprobacion)}`),
+      el("p", { style: "margin:0;" }, s.motivo_rechazo || "No se dejó un motivo."),
+    ]));
+  }
+
+  if (puedeAprobar) {
+    const rechazoBox = el("div", { style: "display:none; margin-top:14px;" });
+    const rechazoInput = el("textarea", {
+      rows: "2", placeholder: "Explica brevemente por qué se rechaza (se le avisa por correo al empleado)...",
+      style: "width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:0.9rem; resize:vertical;",
+    });
+    rechazoBox.appendChild(rechazoInput);
+    rechazoBox.appendChild(el("div", { style: "display:flex; gap:10px; margin-top:8px;" }, [
+      el("button", {
+        class: "btn btn-danger", type: "button",
+        onclick: () => {
+          const motivo = rechazoInput.value.trim();
+          if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
+          aprobarSolicitud(s, "Rechazado", motivo);
+        },
+      }, "Confirmar rechazo"),
+      el("button", { class: "btn btn-ghost", type: "button", onclick: () => { rechazoBox.style.display = "none"; } }, "Cancelar"),
+    ]));
+
+    const actions = el("div", { style: "display:flex;gap:10px;margin-top:16px" }, [
+      el("button", { class: "btn btn-success", onclick: () => aprobarSolicitud(s, "Aprobado") }, "Aprobar"),
+      el("button", { class: "btn btn-danger", onclick: () => { rechazoBox.style.display = "block"; } }, "Rechazar"),
+    ]);
+    box.appendChild(actions);
+    box.appendChild(rechazoBox);
+  }
+
+  if (pushHistory) pushView("view-detalle-solicitud", { id }); else show("view-detalle-solicitud");
+}
+
+async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
+  const cambios = {
+    estado,
+    aprobador_id: currentUser.id,
+    aprobador_nombre: currentProfile?.nombre || currentUser.email,
+    fecha_aprobacion: new Date().toISOString(),
+  };
+  if (estado === "Rechazado") cambios.motivo_rechazo = motivoRechazo;
+
+  const { error } = await db.from("solicitudes_fondos").update(cambios).eq("id", solicitud.id);
+  if (error) { toast("Error al actualizar: " + error.message); return; }
+
+  toast(estado === "Aprobado" ? "Solicitud aprobada." : "Solicitud rechazada.");
+  Object.assign(solicitud, cambios);
+
+  // Igual que con las rendiciones: se le avisa por correo a quien pidió el
+  // fondo cómo quedó, con el motivo si fue rechazada.
+  db.functions.invoke("notificar-estado-rendicion", {
+    body: {
+      tipo: "solicitud",
+      folio: solicitud.folio,
+      empleado_id: solicitud.empleado_id,
+      empleado_nombre: solicitud.empleado_nombre,
+      empresa: solicitud.empresa,
+      monto_total: solicitud.monto_solicitado,
+      estado,
+      motivo_rechazo: motivoRechazo,
+      aprobador_nombre: cambios.aprobador_nombre,
+    },
+  }).catch((err) => console.error("No se pudo notificar al empleado:", err));
+
+  replaceView("view-dashboard");
+  loadDashboard();
+}
+
+// ------------------------------------------------------------
 // Detalle / aprobación
 // ------------------------------------------------------------
 async function openDetalle(id, pushHistory = true) {
@@ -1358,6 +1738,22 @@ async function openDetalle(id, pushHistory = true) {
     ]),
     el("span", { class: "pill " + r.estado, style: "font-size:0.8rem" }, r.estado),
   ]));
+
+  // Si esta rendición justifica un fondo entregado por adelantado, se
+  // muestra el vínculo con su solicitud (folio real, no el uuid) para
+  // poder ir a ver cuánto se otorgó y cuánto queda disponible.
+  if (r.tipo_rendicion === "FondoPorRendir" && r.solicitud_fondo_id) {
+    const { data: solicitud } = await db.from("solicitudes_fondos").select("folio").eq("id", r.solicitud_fondo_id).maybeSingle();
+    if (solicitud) {
+      box.appendChild(el("p", { style: "margin:0 0 14px;font-size:0.88rem" }, [
+        "Fondo asociado: ",
+        el("a", {
+          href: "#", style: "color:var(--blue);font-weight:600;",
+          onclick: (e) => { e.preventDefault(); openDetalleSolicitud(r.solicitud_fondo_id); },
+        }, `S-${solicitud.folio}`),
+      ]));
+    }
+  }
 
   const puedeEditarItems = r.estado === "Pendiente" && (esAprobadorViewer || r.empleado_id === currentUser.id);
 
@@ -1660,7 +2056,14 @@ function csvRow(fields) {
 // rendición, y sube de 1 en 1 por cada rendición nueva dentro del mismo
 // comprobante combinado. Para un comprobante de una sola rendición, es
 // simplemente 1.
-function construirFilasCSV(rendicion, items, folioTransaccion = 1) {
+// split (opcional): { dentroDelFondo, excedente } -- solo aplica a
+// rendiciones tipo FondoPorRendir vinculadas a una solicitud (ver
+// calcularSplitFondo). Cuando viene presente, la línea de contrapartida
+// única se reemplaza por hasta dos líneas: lo que cae dentro del saldo del
+// fondo entregado (cuenta "Fondo por Rendir") y, si la persona gastó más
+// de lo que se le había entregado, el excedente aparte contra "Rendiciones
+// por Pagar" -- como si esa parte fuera un reembolso normal de bolsillo.
+function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null) {
   const fecha = fmtDateSlash(rendicion.created_at) || rendicion.created_at;
   const glosa = `RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}`.replace(/\s+/g, " ").trim();
   const rows = [];
@@ -1687,18 +2090,62 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1) {
     }
   });
 
-  const contra = CUENTA_CONTRAPARTIDA[rendicion.tipo_rendicion] || CUENTA_CONTRAPARTIDA.Reembolso;
-  rows.push(csvRow([
-    "TRASPASO", "S", folioTransaccion, fecha, glosa, contra.cuenta, 0, rendicion.monto_total,
-    glosa, rendicion.rut_empleado || "", rendicion.empleado_nombre, "Otros", rendicion.folio ?? rendicion.id.slice(0, 8),
+  const folioDoc = rendicion.folio ?? rendicion.id.slice(0, 8);
+  const filaContrapartida = (cuenta, monto) => csvRow([
+    "TRASPASO", "S", folioTransaccion, fecha, glosa, cuenta, 0, monto,
+    glosa, rendicion.rut_empleado || "", rendicion.empleado_nombre, "Otros", folioDoc,
     fecha, "", "", "",
-  ]));
+  ]);
+
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && split) {
+    if (split.dentroDelFondo > 0) rows.push(filaContrapartida(CUENTA_CONTRAPARTIDA.FondoPorRendir.cuenta, split.dentroDelFondo));
+    if (split.excedente > 0) rows.push(filaContrapartida(CUENTA_CONTRAPARTIDA.Reembolso.cuenta, split.excedente));
+  } else {
+    const contra = CUENTA_CONTRAPARTIDA[rendicion.tipo_rendicion] || CUENTA_CONTRAPARTIDA.Reembolso;
+    rows.push(filaContrapartida(contra.cuenta, rendicion.monto_total));
+  }
 
   return rows;
 }
 
-function construirCSV(rendicion, items) {
-  const rows = [CSV_HEADER, ...construirFilasCSV(rendicion, items)];
+// Para rendiciones FondoPorRendir vinculadas a una solicitud, calcula
+// cuánto de cada una cae dentro del saldo del fondo entregado y cuánto
+// excede ese saldo (la persona gastó más de lo que se le había dado). El
+// saldo se consume en el orden real en que las rendiciones contra ese
+// fondo se fueron aprobando -- por eso se recalcula sobre TODO el
+// historial de rendiciones Aprobadas de la(s) solicitud(es) involucradas,
+// no solo sobre las que se están procesando en este momento.
+async function calcularSplitFondo(rendicionesFondo) {
+  const splitPorId = new Map();
+  const solicitudIds = [...new Set((rendicionesFondo || []).map((r) => r.solicitud_fondo_id).filter(Boolean))];
+  if (!solicitudIds.length) return splitPorId;
+
+  const { data: solicitudes } = await db.from("solicitudes_fondos").select("id, monto_solicitado").in("id", solicitudIds);
+  const solicitudPorId = new Map((solicitudes || []).map((s) => [s.id, s]));
+
+  const { data: historial } = await db
+    .from("rendiciones")
+    .select("id, solicitud_fondo_id, monto_total")
+    .in("solicitud_fondo_id", solicitudIds)
+    .eq("estado", "Aprobado")
+    .order("fecha_aprobacion", { ascending: true });
+
+  const consumido = new Map();
+  (historial || []).forEach((r) => {
+    const solicitud = solicitudPorId.get(r.solicitud_fondo_id);
+    if (!solicitud) return;
+    const antes = consumido.get(r.solicitud_fondo_id) || 0;
+    const saldoAntes = Math.max(0, Number(solicitud.monto_solicitado) - antes);
+    const dentroDelFondo = Math.min(Number(r.monto_total), saldoAntes);
+    const excedente = Math.max(0, Number(r.monto_total) - saldoAntes);
+    splitPorId.set(r.id, { dentroDelFondo, excedente });
+    consumido.set(r.solicitud_fondo_id, antes + Number(r.monto_total));
+  });
+  return splitPorId;
+}
+
+function construirCSV(rendicion, items, split = null) {
+  const rows = [CSV_HEADER, ...construirFilasCSV(rendicion, items, 1, split)];
   return {
     fileName: `comprobante_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}.csv`,
     content: rows.join("\r\n"),
@@ -1722,7 +2169,12 @@ async function conDatosActualesDeEmpleado(rendicion) {
 
 async function descargarCSV(rendicion, items) {
   const rendicionActualizada = await conDatosActualesDeEmpleado(rendicion);
-  const { fileName, content } = construirCSV(rendicionActualizada, items);
+  let split = null;
+  if (rendicionActualizada.tipo_rendicion === "FondoPorRendir" && rendicionActualizada.solicitud_fondo_id) {
+    const splits = await calcularSplitFondo([rendicionActualizada]);
+    split = splits.get(rendicionActualizada.id) || null;
+  }
+  const { fileName, content } = construirCSV(rendicionActualizada, items, split);
   // El BOM al inicio le indica a Excel que el archivo es UTF-8; sin esto,
   // Excel lo abre asumiendo ANSI/Windows-1252 y las tildes y el "°" salen
   // como caracteres extraños (ej. "NÂ°" en vez de "N°").
@@ -1807,13 +2259,20 @@ async function generarComprobantesPorRango(desde, hasta) {
       porEmpresa[empresa].push(r);
     });
 
+    // Split contable de fondos por rendir: se calcula sobre TODO el
+    // historial de cada solicitud involucrada (no solo el rango elegido),
+    // para que el saldo consumido sea el real aunque rendiciones previas
+    // se hayan aprobado antes del rango o en otra empresa.
+    const rendicionesFondo = rendiciones.filter((r) => r.tipo_rendicion === "FondoPorRendir" && r.solicitud_fondo_id);
+    const splitPorId = await calcularSplitFondo(rendicionesFondo);
+
     const nombreCarpeta = formatearRangoFechas(desde, hasta);
     const zip = new JSZip();
     const carpetaRaiz = zip.folder(nombreCarpeta);
 
     Object.entries(porEmpresa).forEach(([empresa, rends]) => {
       const filas = [CSV_HEADER];
-      rends.forEach((r, i) => filas.push(...construirFilasCSV(r, itemsPorRendicion[r.id] || [], i + 1)));
+      rends.forEach((r, i) => filas.push(...construirFilasCSV(r, itemsPorRendicion[r.id] || [], i + 1, splitPorId.get(r.id) || null)));
       const contenido = "﻿" + filas.join("\r\n");
       const nombreArchivo = `comprobante_${empresa.replace(/[^a-zA-Z0-9]+/g, "_")}.csv`;
       carpetaRaiz.folder(empresa).file(nombreArchivo, contenido);
@@ -1842,7 +2301,7 @@ async function exportarExcel() {
   try {
     const { data: rendiciones, error: errR } = await db
       .from("rendiciones")
-      .select("*")
+      .select("*, solicitudes_fondos(folio)")
       .order("folio", { ascending: true });
     if (errR) throw errR;
 
@@ -1852,6 +2311,23 @@ async function exportarExcel() {
       .order("rendicion_id");
     if (errI) throw errI;
 
+    const { data: solicitudes, error: errS } = await db
+      .from("solicitudes_fondos")
+      .select("*")
+      .order("folio", { ascending: true });
+    if (errS) throw errS;
+
+    const { data: rendicionesFondoAprobadas } = await db
+      .from("rendiciones")
+      .select("solicitud_fondo_id, monto_total")
+      .eq("tipo_rendicion", "FondoPorRendir")
+      .eq("estado", "Aprobado")
+      .not("solicitud_fondo_id", "is", null);
+    const rendidoPorSolicitud = {};
+    (rendicionesFondoAprobadas || []).forEach((r) => {
+      rendidoPorSolicitud[r.solicitud_fondo_id] = (rendidoPorSolicitud[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0);
+    });
+
     const resumen = (rendiciones || []).map((r) => ({
       "Folio": r.folio ?? "",
       "Fecha": fmtDate(r.created_at),
@@ -1859,12 +2335,34 @@ async function exportarExcel() {
       "RUT Empleado": r.rut_empleado || "",
       "Empresa": r.empresa || "",
       "Tipo": r.tipo_rendicion,
+      "Fondo Asociado": r.solicitudes_fondos?.folio ? `S-${r.solicitudes_fondos.folio}` : "",
       "Comentario": r.comentario || "",
       "Monto Total": Number(r.monto_total || 0),
       "Estado": r.estado,
       "Aprobador": r.aprobador_nombre || "",
       "Fecha Aprobación": r.fecha_aprobacion ? fmtDate(r.fecha_aprobacion) : "",
     }));
+
+    const solicitudesSheet = (solicitudes || []).map((s) => {
+      const rendido = rendidoPorSolicitud[s.id] || 0;
+      return {
+        "Folio": s.folio ? `S-${s.folio}` : "",
+        "Fecha": fmtDate(s.created_at),
+        "Empleado": s.empleado_nombre,
+        "RUT Empleado": s.rut_empleado || "",
+        "Empresa": s.empresa || "",
+        "Centro de Costo": s.centro_costo || "",
+        "Monto Solicitado": Number(s.monto_solicitado || 0),
+        "Motivo": s.motivo || "",
+        "Fecha Necesaria": s.fecha_necesaria ? fmtDate(s.fecha_necesaria) : "",
+        "Estado": s.estado,
+        "Monto Rendido": rendido,
+        "Saldo Disponible": s.estado === "Aprobado" ? Math.max(0, Number(s.monto_solicitado || 0) - rendido) : "",
+        "Aprobador": s.aprobador_nombre || "",
+        "Fecha Aprobación": s.fecha_aprobacion ? fmtDate(s.fecha_aprobacion) : "",
+        "Motivo Rechazo": s.motivo_rechazo || "",
+      };
+    });
 
     const detalle = (items || []).map((it) => ({
       "Folio Rendición": it.rendiciones?.folio ?? "",
@@ -1888,6 +2386,7 @@ async function exportarExcel() {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(resumen), "Resumen");
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(detalle), "Detalle");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(solicitudesSheet), "Solicitudes Fondos");
 
     const fecha = new Date().toISOString().slice(0, 10);
     XLSX.writeFile(wb, `rendiciones_${fecha}.xlsx`);

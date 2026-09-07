@@ -1,7 +1,9 @@
 // Edge Function: notificar-estado-rendicion
 // Cuando un aprobador aprueba o rechaza una rendición, le manda un correo
 // al EMPLEADO que la envió (no a los aprobadores) avisando el resultado,
-// y si fue rechazada, el motivo.
+// y si fue rechazada, el motivo. También la reutiliza la app para avisar
+// el resultado de una SOLICITUD DE FONDOS (payload con tipo: "solicitud")
+// -- mismo mecanismo, solo cambia el texto del asunto y del cuerpo.
 //
 // Secrets necesarios (Supabase Dashboard > Edge Functions > Manage secrets):
 //   RESEND_API_KEY     -> tu API key de resend.com (gratis)
@@ -32,8 +34,9 @@ Deno.serve(async (req: Request) => {
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
-    const { folio, empleado_id, empleado_nombre, empresa, monto_total, estado, motivo_rechazo, aprobador_nombre } = await req.json();
+    const { tipo, folio, empleado_id, empleado_nombre, empresa, monto_total, estado, motivo_rechazo, aprobador_nombre } = await req.json();
     if (!empleado_id) throw new Error("Falta empleado_id.");
+    const esSolicitud = tipo === "solicitud";
 
     const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
@@ -48,20 +51,23 @@ Deno.serve(async (req: Request) => {
 
     const aprobado = estado === "Aprobado";
     const montoFmt = "$" + Math.round(Number(monto_total) || 0).toLocaleString("es-CL");
-    const asunto = `Tu rendición N° ${folio} fue ${aprobado ? "aprobada" : "rechazada"}`;
+    const folioFmt = esSolicitud ? `S-${folio}` : `N° ${folio}`;
+    const sustantivo = esSolicitud ? "solicitud de fondos" : "rendición";
+    const asunto = `Tu ${sustantivo} ${folioFmt} fue ${aprobado ? "aprobada" : "rechazada"}`;
     const colorEstado = aprobado ? "#1a7a4c" : "#b3261e";
     const html = `
       <div style="font-family: Arial, sans-serif; color: #1a1f27;">
-        <h2 style="margin-bottom: 4px;">Tu rendición fue <span style="color:${colorEstado}">${aprobado ? "aprobada" : "rechazada"}</span></h2>
+        <h2 style="margin-bottom: 4px;">Tu ${sustantivo} fue <span style="color:${colorEstado}">${aprobado ? "aprobada" : "rechazada"}</span></h2>
         <p style="color: #5b6472; margin-top: 0;">RindeWellness · Grupo Wellness</p>
         <table style="border-collapse: collapse; margin: 16px 0;">
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Folio</td><td><strong>N° ${folio}</strong></td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Folio</td><td><strong>${folioFmt}</strong></td></tr>
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empleado</td><td>${empleado_nombre || "-"}</td></tr>
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empresa</td><td>${empresa || "-"}</td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Monto total</td><td><strong>${montoFmt}</strong></td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${esSolicitud ? "Monto solicitado" : "Monto total"}</td><td><strong>${montoFmt}</strong></td></tr>
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${aprobado ? "Aprobado" : "Rechazado"} por</td><td>${aprobador_nombre || "-"}</td></tr>
           ${!aprobado ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">Motivo</td><td>${motivo_rechazo || "No se indicó un motivo."}</td></tr>` : ""}
         </table>
+        ${aprobado && esSolicitud ? `<p style="color:#5b6472;">Recuerda que la entrega del fondo la gestiona Finanzas fuera de la app.</p>` : ""}
         <p>Ingresa a RindeWellness para ver el detalle.</p>
       </div>
     `;
