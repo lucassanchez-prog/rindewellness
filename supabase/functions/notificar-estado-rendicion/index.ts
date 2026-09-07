@@ -6,10 +6,19 @@
 // -- mismo mecanismo, solo cambia el texto del asunto y del cuerpo.
 //
 // Secrets necesarios (Supabase Dashboard > Edge Functions > Manage secrets):
-//   RESEND_API_KEY     -> tu API key de resend.com (gratis)
-//   RESEND_FROM_EMAIL  -> opcional. Si no lo pones, usa el remitente de
-//                         pruebas de Resend (onboarding@resend.dev), que
-//                         funciona sin verificar un dominio propio.
+//   RESEND_API_KEY       -> tu API key de resend.com (gratis)
+//   RESEND_FROM_EMAIL    -> opcional. Si no lo pones, usa el remitente de
+//                           pruebas de Resend (onboarding@resend.dev), que
+//                           funciona sin verificar un dominio propio.
+//   RESEND_FALLBACK_EMAIL -> opcional pero recomendado mientras no haya un
+//                           dominio verificado en Resend. Mientras el
+//                           remitente sea el de pruebas (onboarding@resend.dev),
+//                           Resend SOLO deja mandar correos a la cuenta dueña
+//                           de la API key -- a cualquier otro destinatario le
+//                           falla en silencio. Si se define este secret, el
+//                           correo se reenvía ahí (avisando quién era el
+//                           destinatario real) en vez de perderse. Se deja de
+//                           necesitar el día que se verifique un dominio propio.
 //
 // SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY los inyecta Supabase automático
 // en toda Edge Function -- no hay que configurarlos a mano. Se necesita el
@@ -22,6 +31,36 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 const FROM_EMAIL = Deno.env.get("RESEND_FROM_EMAIL") || "RindeWellness <onboarding@resend.dev>";
+const FALLBACK_EMAIL = Deno.env.get("RESEND_FALLBACK_EMAIL");
+
+// Manda el correo con Resend; si el remitente de pruebas rechaza el envío
+// por no ir dirigido al dueño de la cuenta ("testing emails"), y hay un
+// RESEND_FALLBACK_EMAIL configurado, reintenta mandándolo ahí para que el
+// aviso no se pierda -- avisando en el propio correo quién era el
+// destinatario real.
+async function enviarConFallback(to: string[], subject: string, html: string) {
+  const enviar = (destinatarios: string[], asuntoFinal: string, htmlFinal: string) =>
+    fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: FROM_EMAIL, to: destinatarios, subject: asuntoFinal, html: htmlFinal }),
+    });
+
+  let resp = await enviar(to, subject, html);
+  let data = await resp.json();
+  if (!resp.ok && FALLBACK_EMAIL && /only send testing emails/i.test(data?.message || "")) {
+    const htmlConAviso = `
+      <p style="background:#fff3cd;color:#7a5c00;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;">
+        ⚠ Reenviado a esta casilla porque Resend todavía no tiene un dominio verificado.
+        Destinatario real: ${to.join(", ")}
+      </p>
+      ${html}
+    `;
+    resp = await enviar([FALLBACK_EMAIL], `[Reenviado] ${subject}`, htmlConAviso);
+    data = await resp.json();
+  }
+  return { resp, data };
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -72,20 +111,7 @@ Deno.serve(async (req: Request) => {
       </div>
     `;
 
-    const resp = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: FROM_EMAIL,
-        to: [destinatario],
-        subject: asunto,
-        html,
-      }),
-    });
-    const data = await resp.json();
+    const { resp, data } = await enviarConFallback([destinatario], asunto, html);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
 
     return new Response(JSON.stringify({ ok: true, enviados: 1 }), {

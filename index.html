@@ -54,10 +54,62 @@
           <div class="login-error" id="login-error"></div>
         </form>
 
+        <div class="login-toggle" id="olvide-clave-wrap">
+          <button type="button" id="btn-olvide-clave">¿Olvidaste tu contraseña?</button>
+        </div>
+
         <div class="login-toggle">
           <span id="login-toggle-text">¿No tienes cuenta?</span>
           <button type="button" id="btn-toggle-mode">Crear una</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RECUPERAR CONTRASEÑA (pedir el link) -->
+  <div id="view-recuperar" class="view">
+    <div class="login-wrap">
+      <div class="login-card">
+        <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
+        <h1>Recuperar contraseña</h1>
+        <p class="sub">Te enviaremos un link a tu correo para crear una contraseña nueva</p>
+
+        <form id="form-recuperar">
+          <div class="field">
+            <label>Correo</label>
+            <input type="email" id="recuperar-email" required autocomplete="email" />
+          </div>
+          <button type="submit" class="btn btn-primary btn-block" id="btn-recuperar-submit">Enviar link</button>
+          <div class="login-error" id="recuperar-error"></div>
+        </form>
+
+        <div class="login-toggle">
+          <button type="button" id="btn-volver-login">&larr; Volver a Ingresar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DEFINIR NUEVA CONTRASEÑA (al volver del link del correo) -->
+  <div id="view-nueva-clave" class="view">
+    <div class="login-wrap">
+      <div class="login-card">
+        <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
+        <h1>Crea tu nueva contraseña</h1>
+        <p class="sub">Escríbela dos veces para confirmarla</p>
+
+        <form id="form-nueva-clave">
+          <div class="field">
+            <label>Nueva contraseña</label>
+            <input type="password" id="nueva-clave-1" required autocomplete="new-password" />
+          </div>
+          <div class="field">
+            <label>Confirmar contraseña</label>
+            <input type="password" id="nueva-clave-2" required autocomplete="new-password" />
+          </div>
+          <button type="submit" class="btn btn-primary btn-block" id="btn-nueva-clave-submit">Guardar contraseña</button>
+          <div class="login-error" id="nueva-clave-error"></div>
+        </form>
       </div>
     </div>
   </div>
@@ -251,6 +303,6 @@
   <div class="toast" id="toast"></div>
 
   <script src="config.js"></script>
-  <script src="app.js?v=31"></script>
+  <script src="app.js?v=32"></script>
 </body>
 </html>

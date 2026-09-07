@@ -296,23 +296,34 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   wireLoginForm();
+  wireRecuperarClave();
   wireDashboard();
   wireNuevaRendicion();
   wireNuevaSolicitud();
 
-  const { data } = await db.auth.getSession();
-  if (data.session) {
-    await onLoggedIn(data.session.user);
-  }
-
+  // Si la persona llegó desde el link de recuperación de contraseña del
+  // correo, Supabase arma una sesión temporal y dispara "PASSWORD_RECOVERY"
+  // -- hay que registrar este listener ANTES de chequear la sesión manual de
+  // abajo, porque supabase-js reproduce ese evento apenas alguien se
+  // suscribe. Si no lo interceptamos acá, el chequeo de sesión de abajo la
+  // metería directo al dashboard en vez de dejarla definir su clave nueva.
+  let esRecuperacionClave = false;
   db.auth.onAuthStateChange((event, session) => {
-    if (event === "SIGNED_OUT") {
+    if (event === "PASSWORD_RECOVERY") {
+      esRecuperacionClave = true;
+      show("view-nueva-clave");
+    } else if (event === "SIGNED_OUT") {
       currentUser = null;
       currentProfile = null;
       document.getElementById("app-shell").style.display = "none";
       show("view-login");
     }
   });
+
+  const { data } = await db.auth.getSession();
+  if (data.session && !esRecuperacionClave) {
+    await onLoggedIn(data.session.user);
+  }
 });
 
 // ------------------------------------------------------------
@@ -416,6 +427,79 @@ function wireLoginForm() {
 
   document.getElementById("btn-logout").addEventListener("click", async () => {
     await db.auth.signOut();
+  });
+
+  // El link "¿Olvidaste tu contraseña?" solo tiene sentido para entrar a una
+  // cuenta que ya existe, no al crear una nueva.
+  document.getElementById("btn-toggle-mode").addEventListener("click", () => {
+    document.getElementById("olvide-clave-wrap").style.display = signupMode ? "none" : "block";
+  });
+}
+
+// ------------------------------------------------------------
+// Recuperar / cambiar contraseña olvidada
+// ------------------------------------------------------------
+function wireRecuperarClave() {
+  document.getElementById("btn-olvide-clave").addEventListener("click", () => {
+    document.getElementById("recuperar-email").value = document.getElementById("login-email").value.trim();
+    document.getElementById("recuperar-error").textContent = "";
+    show("view-recuperar");
+  });
+
+  document.getElementById("btn-volver-login").addEventListener("click", () => show("view-login"));
+
+  document.getElementById("form-recuperar").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = document.getElementById("recuperar-email").value.trim();
+    const errBox = document.getElementById("recuperar-error");
+    errBox.style.color = "var(--danger)";
+    errBox.textContent = "";
+    const btn = document.getElementById("btn-recuperar-submit");
+    btn.disabled = true;
+    try {
+      // redirectTo apunta a la propia app: cuando la persona hace clic en el
+      // link del correo, Supabase la trae de vuelta acá con una sesión
+      // temporal de recuperación, que detectamos más abajo (evento
+      // PASSWORD_RECOVERY) para mostrarle el formulario de nueva contraseña.
+      const { error } = await db.auth.resetPasswordForEmail(email, {
+        redirectTo: window.location.origin + window.location.pathname,
+      });
+      if (error) throw error;
+      errBox.style.color = "var(--success)";
+      errBox.textContent = "Listo. Revisa tu correo (y spam) y sigue el link para crear una contraseña nueva.";
+    } catch (err) {
+      errBox.style.color = "var(--danger)";
+      errBox.textContent = err.message || "No se pudo enviar el correo de recuperación.";
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("form-nueva-clave").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const clave1 = document.getElementById("nueva-clave-1").value;
+    const clave2 = document.getElementById("nueva-clave-2").value;
+    const errBox = document.getElementById("nueva-clave-error");
+    errBox.style.color = "var(--danger)";
+    errBox.textContent = "";
+    if (clave1.length < 6) { errBox.textContent = "La contraseña debe tener al menos 6 caracteres."; return; }
+    if (clave1 !== clave2) { errBox.textContent = "Las contraseñas no coinciden."; return; }
+
+    const btn = document.getElementById("btn-nueva-clave-submit");
+    btn.disabled = true;
+    try {
+      const { data, error } = await db.auth.updateUser({ password: clave1 });
+      if (error) throw error;
+      toast("Contraseña actualizada.");
+      // El link de recuperación ya dejó a la persona con una sesión activa
+      // -- la mandamos directo adentro en vez de pedirle que inicie sesión
+      // de nuevo con la clave que recién creó.
+      await onLoggedIn(data.user);
+    } catch (err) {
+      errBox.textContent = err.message || "No se pudo actualizar la contraseña.";
+    } finally {
+      btn.disabled = false;
+    }
   });
 }
 
