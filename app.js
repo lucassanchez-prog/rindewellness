@@ -989,7 +989,7 @@ function wireNuevaRendicion() {
   const empresaSelect = document.getElementById("nr-empresa");
   EMPRESAS.forEach((emp) => empresaSelect.appendChild(el("option", { value: emp }, emp)));
   empresaSelect.addEventListener("change", () => {
-    actualizarCentrosCostoPorEmpresa();
+    actualizarCentroCostoRendicion();
     if (document.getElementById("nr-tipo").value === "FondoPorRendir") cargarSolicitudesDisponibles();
   });
   document.getElementById("nr-tipo").addEventListener("change", () => {
@@ -1035,18 +1035,30 @@ async function cargarSolicitudesDisponibles() {
   });
 }
 
-// Los ítems "Gasto directo" ya creados se arman con el Centro de Costo de la
-// empresa vigente en ese momento. Si la persona cambia la Empresa del
-// encabezado después de agregar ítems, hay que refrescar esos desplegables
-// -- si no, quedan mostrando los centros de costo de la empresa anterior.
-function actualizarCentrosCostoPorEmpresa() {
+// El Centro de Costo se elige UNA vez a nivel de encabezado (igual que la
+// Empresa) y se aplica a todos los ítems de la rendición, sean "Documento
+// electrónico" o "Boleta" -- toda factura/boleta necesita saber dónde se
+// contabiliza, no solo las boletas de gasto directo. Si la persona cambia
+// la Empresa, hay que refrescar las opciones (cada empresa tiene sus
+// propios Centros de Costo).
+function actualizarCentroCostoRendicion() {
   const empresa = document.getElementById("nr-empresa").value;
   const opciones = CENTROS_COSTO_POR_EMPRESA[empresa] || ["Casa Matriz"];
-  document.querySelectorAll('.sin-documento select[id$="-cc"]').forEach((sel) => {
-    const valorActual = sel.value;
-    sel.innerHTML = "";
-    opciones.forEach((o) => sel.appendChild(el("option", { value: o }, o)));
-    sel.value = opciones.includes(valorActual) ? valorActual : opciones[0];
+  const sel = document.getElementById("nr-cc");
+  const valorActual = sel.value;
+  sel.innerHTML = "";
+  opciones.forEach((o) => sel.appendChild(el("option", { value: o }, o)));
+  sel.value = opciones.includes(valorActual) ? valorActual : opciones[0];
+
+  // Los ítems "Boleta" ya cargados también se refrescan: si su Centro de
+  // Costo actual sigue siendo válido para la nueva empresa se mantiene, si
+  // no, se cae al del encabezado (que la persona igual puede volver a
+  // cambiar por ítem).
+  document.querySelectorAll('.sin-documento select[id$="-cc"]').forEach((itemSel) => {
+    const valorItem = itemSel.value;
+    itemSel.innerHTML = "";
+    opciones.forEach((o) => itemSel.appendChild(el("option", { value: o }, o)));
+    itemSel.value = opciones.includes(valorItem) ? valorItem : sel.value;
   });
 }
 
@@ -1056,6 +1068,7 @@ function openNuevaRendicion(pushHistory = true) {
   document.getElementById("nr-fondo-wrap").style.display = "none";
   document.getElementById("nr-comentario").value = "";
   document.getElementById("nr-empresa").value = EMPRESAS[0];
+  actualizarCentroCostoRendicion();
   document.getElementById("items-container").innerHTML = "";
   itemSeq = 0;
   addItemRow();
@@ -1242,12 +1255,18 @@ function buildSinDocumentoFields(id) {
     fieldSelectCategoria(`${id}-categoria`),
     fieldInput(`${id}-cuenta`, "Cuenta contable", "text", "4.01.03.xx"),
   ]);
+  // El Centro de Costo por defecto es el que se eligió en el encabezado de
+  // la rendición (campo "nr-cc"), pero queda editable por ítem: una misma
+  // empresa puede tener boletas de sedes distintas dentro de una misma
+  // rendición (ej. bencina en Chicureo y materiales en Mall Sport).
   const empresaActual = document.getElementById("nr-empresa")?.value || EMPRESAS[0];
   const opcionesCC = CENTROS_COSTO_POR_EMPRESA[empresaActual] || ["Casa Matriz"];
+  const ccHeaderActual = document.getElementById("nr-cc")?.value;
   const row2 = el("div", { class: "field-row" }, [
     fieldSelect(`${id}-cc`, "Centro de Costo (Unidad de Negocio)", opcionesCC),
     fieldInputMoney(`${id}-monto2`, "Monto"),
   ]);
+  row2.querySelector("select").value = opcionesCC.includes(ccHeaderActual) ? ccHeaderActual : opcionesCC[0];
   const row3 = el("div", { class: "field-row" }, [
     fieldInput(`${id}-desc2`, "Descripción", "text"),
   ]);
@@ -1428,6 +1447,7 @@ async function submitRendicion() {
   const tipoRendicion = document.getElementById("nr-tipo").value;
   const comentario = document.getElementById("nr-comentario").value.trim();
   const empresaRendicion = document.getElementById("nr-empresa").value;
+  const centroCostoRendicion = document.getElementById("nr-cc").value;
 
   const items = [];
   for (const [idx, card] of cards.entries()) {
@@ -1455,6 +1475,7 @@ async function submitRendicion() {
         comprobante_contable_encontrado: null,
         existe_en_contabilidad: null,
         empresa: empresaRendicion,
+        centro_costo: centroCostoRendicion,
         categoria: null,
         monto,
         descripcion: document.getElementById(`${id}-desc`).value.trim(),
@@ -1476,7 +1497,7 @@ async function submitRendicion() {
         fecha_vencimiento: null,
         cuenta_contable: document.getElementById(`${id}-cuenta`).value.trim(),
         empresa: empresaRendicion,
-        centro_costo: document.getElementById(`${id}-cc`).value.trim() || empresaRendicion,
+        centro_costo: document.getElementById(`${id}-cc`).value.trim() || centroCostoRendicion,
         categoria: document.getElementById(`${id}-categoria`).value,
         monto,
         descripcion: document.getElementById(`${id}-desc2`).value.trim(),
@@ -1867,7 +1888,7 @@ async function openDetalle(id, pushHistory = true) {
       else if (it.existe_en_contabilidad === false) cuentaTxt += " ✘";
       celdas.push(el("td", { class: "wrap" }, cuentaTxt));
     }
-    celdas.push(el("td", { class: "wrap" }, esCon ? "-" : (it.centro_costo || it.empresa || "-")));
+    celdas.push(el("td", { class: "wrap" }, it.centro_costo || "-"));
     celdas.push(el("td", { class: "wrap" }, it.descripcion || "-"));
     celdas.push(el("td", { class: "monto" }, fmtCLP(it.monto)));
     // En celular la tabla se apila como tarjetas (ver CSS) -- cada celda
@@ -2009,6 +2030,11 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
       cuenta.appendChild(nombreHint);
       campos.push(el("div", { class: "field-row" }, [cuenta]));
     }
+    const opcionesCCDoc = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
+    if (it.centro_costo && !opcionesCCDoc.includes(it.centro_costo)) opcionesCCDoc.unshift(it.centro_costo);
+    const ccDoc = fieldSelect("edit-cc", "Centro de Costo (Unidad de Negocio)", opcionesCCDoc);
+    ccDoc.querySelector("select").value = it.centro_costo || opcionesCCDoc[0];
+    campos.push(el("div", { class: "field-row" }, [ccDoc]));
   } else {
     const catSelect = fieldSelectCategoria("edit-categoria");
     const sel = catSelect.querySelector("select");
@@ -2048,6 +2074,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           cambios.nombre_proveedor = lineWrap.querySelector("#edit-nombreprov").value.trim();
           cambios.rut_proveedor = formatearRut(lineWrap.querySelector("#edit-rut").value.trim());
           if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector("#edit-cuenta").value.trim();
+          cambios.centro_costo = lineWrap.querySelector("#edit-cc").value.trim();
         } else {
           cambios.categoria = lineWrap.querySelector("#edit-categoria").value;
           cambios.cuenta_contable = lineWrap.querySelector("#edit-cuenta").value.trim();
@@ -2157,6 +2184,9 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
   // el mismo glosa se repite en cada línea de una misma transacción).
   (items || []).forEach((it) => {
     if (it.tipo_item === "ConDocumento") {
+      // El Centro de Costo de un "Documento electrónico" es solo para uso
+      // interno de la app (reportes, Excel) -- no se manda en el
+      // comprobante de Kame para este tipo de ítem.
       rows.push(csvRow([
         "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
         glosa, it.rut_proveedor, it.nombre_proveedor || "", it.tipo_documento, it.nro_documento,
