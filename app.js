@@ -71,7 +71,7 @@ const CENTROS_COSTO_POR_EMPRESA = {
   "Dmoov Zona Sur SpA": ["Casa Matriz"],
   "Dmoov PT Zona Sur SpA": ["Casa Matriz"],
   "Tactiq SpA": ["Casa Matriz"],
-  "Neo Gym Chile SpA": ["Casa Matriz", "NEO GYM", "NEO INDEPENDENCIA", "NEO LA FLORIDA"],
+  "Neo Gym Chile SpA": ["Casa Matriz", "NEO APP", "NEO GYM", "NEO LA FLORIDA", "NEO INDEPENDENCIA", "NEO PLAZA OESTE", "NEO MALL PLAZA NORTE", "NEO MALL PLAZA SUR", "MALL PLAZA ALAMEDA"],
   "Neo App SpA": ["Casa Matriz", "NEO APP"],
   "RFA SpA": ["Casa Matriz"],
   "Centros Deportivos SpA": ["Casa Matriz"],
