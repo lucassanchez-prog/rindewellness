@@ -1881,7 +1881,7 @@ async function openDetalle(id, pushHistory = true) {
 
   const columnas = ["Tipo", "Proveedor / Categoría", "RUT", "Documento", "Fecha Venc."];
   if (esAprobadorViewer) columnas.push("Cuenta Contable");
-  columnas.push("Centro de Costo", "Descripción", "Monto", "Estado", "Acciones");
+  columnas.push("Centro de Costo", "Descripción", "Monto", "Estado");
 
   const tabla = el("table", { class: "items-table" });
   const thead = el("thead", {}, [el("tr", {}, columnas.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]);
@@ -1917,7 +1917,11 @@ async function openDetalle(id, pushHistory = true) {
     const extraCell = el("td", { colspan: String(columnas.length) });
     filaExtra.appendChild(extraCell);
 
-    const accionesCell = el("td", { class: "acciones-cell", "data-label": "Acciones" });
+    // OJO: el flex va en un <div> ADENTRO del <td>, no en el <td> mismo --
+    // ponerle display:flex directo a una celda con colspan hace que algunos
+    // navegadores dejen de sumarle el ancho de las columnas que abarca (se
+    // achica a el ancho de una sola columna en vez de todas).
+    const accionesCell = el("div", { class: "acciones-cell" });
     if (it.adjunto_url) {
       accionesCell.appendChild(el("button", { class: "btn btn-sm", type: "button", onclick: () => verComprobante(it) }, "Ver"));
     }
@@ -1953,11 +1957,11 @@ async function openDetalle(id, pushHistory = true) {
     // rechazo general de la rendición.
     if (puedeAprobar) {
       accionesCell.appendChild(el("button", {
-        class: "btn btn-sm", type: "button",
+        class: "btn btn-success btn-sm", type: "button",
         onclick: () => aprobarItem(it, r, "Aprobado"),
       }, "Aprobar ítem"));
       accionesCell.appendChild(el("button", {
-        class: "btn btn-sm", type: "button",
+        class: "btn btn-danger btn-sm", type: "button",
         onclick: () => {
           filaExtra.style.display = "table-row";
           extraCell.innerHTML = "";
@@ -1980,9 +1984,8 @@ async function openDetalle(id, pushHistory = true) {
         },
       }, "Rechazar ítem"));
     }
-    celdas.push(accionesCell);
-
     tbody.appendChild(el("tr", {}, celdas));
+    tbody.appendChild(el("tr", { class: "acciones-row" }, [el("td", { colspan: String(columnas.length) }, [accionesCell])]));
     tbody.appendChild(filaExtra);
   });
 

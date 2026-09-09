@@ -482,8 +482,24 @@ button {
 .items-table td.center { text-align: center; }
 .items-table th.center { text-align: center; }
 .items-table th.right { text-align: right; }
-.items-table th:last-child, .items-table td.acciones-cell { width: 160px; }
-.items-table .acciones-cell { display: flex; gap: 8px 10px; flex-wrap: wrap; align-content: flex-start; }
+/* Los botones de acción (Ver/Editar/Verificar/Aprobar/Rechazar) ya no son
+   una columna más de la tabla -- ocupan su propia fila completa debajo de
+   cada ítem, para que quepan en una sola línea horizontal en vez de
+   apilarse verticalmente en una columna angosta. El flex va en el <div>
+   de adentro, no en el <td>: ponerlo directo en una celda con colspan
+   hace que algunos navegadores ignoren el ancho de las columnas que
+   abarca y la achican a el ancho de una sola.
+*/
+.items-table tr.acciones-row td {
+  padding: 8px 10px 14px;
+  background: var(--bg-soft, rgba(120,120,120,0.03));
+}
+.items-table .acciones-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
 .items-table .btn-sm { white-space: nowrap; }
 .items-table .item-extra-row td { background: var(--bg-soft, rgba(120,120,120,0.04)); }
 .items-table tbody tr.row-clickable { cursor: pointer; }
@@ -499,16 +515,32 @@ button {
     width: 100%;
   }
   .items-table thead { display: none; }
-  .items-table tbody tr {
+  /* Cada ítem son 2-3 <tr> seguidos (datos, acciones, y a veces el panel de
+     editar/verificar) que deben verse como UNA sola tarjeta -- la fila de
+     datos pone el borde/fondo/esquinas de arriba, la de acciones cierra
+     abajo, y el panel extra (cuando se abre) se estira entre medio. */
+  .items-table tbody tr:not(.acciones-row):not(.item-extra-row) {
     border: 1px solid var(--line);
-    border-radius: var(--radius);
+    border-bottom: none;
+    border-radius: var(--radius) var(--radius) 0 0;
+    margin-bottom: 0;
+    padding: 6px 10px 0;
+    background: var(--card);
+  }
+  .items-table tbody tr.acciones-row {
+    border: 1px solid var(--line);
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
     margin-bottom: 10px;
-    padding: 6px 10px;
+    padding: 0;
     background: var(--card);
   }
   .items-table tbody tr.item-extra-row {
-    border: none; margin: -6px 0 10px; padding: 0 10px 10px;
-    background: transparent;
+    border: 1px solid var(--line);
+    border-top: none; border-bottom: none;
+    margin: -10px 0 10px;
+    padding: 0 10px 10px;
+    background: var(--card);
   }
   .items-table td {
     display: block;
@@ -516,7 +548,6 @@ button {
     border-bottom: 1px dashed var(--line);
     padding: 7px 0;
   }
-  .items-table tr:last-child td:not(.acciones-cell) { border-bottom: 1px dashed var(--line); }
   .items-table td:last-of-type { border-bottom: none; }
   .items-table td[data-label]::before {
     content: attr(data-label);
@@ -529,7 +560,7 @@ button {
   }
   .items-table td.monto { text-align: left; }
   .items-table td.center { text-align: left; }
-  .items-table .acciones-cell { border-bottom: none; padding-top: 10px; }
+  .items-table tr.acciones-row td { padding: 10px; background: transparent; }
 }
 
 .btn-sm {
