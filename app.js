@@ -1233,10 +1233,22 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     if (error) throw error;
     if (data?.error) throw new Error(data.error);
 
+    if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
     if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
     if (data.monto) {
       const montoInput = document.getElementById(`${id}-monto2`);
       montoInput.value = Number(data.monto).toLocaleString("es-CL");
+    }
+    // La categoría sugerida solo se aplica si existe tal cual en el
+    // desplegable (puede estar filtrado por las cuentas permitidas del
+    // usuario) -- el campo queda igual visible y editable para que la
+    // persona la confirme o la cambie, nunca se oculta.
+    if (data.categoria_sugerida) {
+      const catSelect = document.getElementById(`${id}-categoria`);
+      if ([...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+        catSelect.value = data.categoria_sugerida;
+        catSelect.dispatchEvent(new Event("change"));
+      }
     }
     recalcTotal();
 
@@ -1251,6 +1263,9 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
 
 function buildSinDocumentoFields(id) {
   const box = el("div", { class: "sin-documento" });
+  const rowProv = el("div", { class: "field-row" }, [
+    fieldInput(`${id}-nombreprov2`, "Proveedor / Local", "text"),
+  ]);
   const row1 = el("div", { class: "field-row" }, [
     fieldSelectCategoria(`${id}-categoria`),
     fieldInput(`${id}-cuenta`, "Cuenta contable", "text", "4.01.03.xx"),
@@ -1274,6 +1289,7 @@ function buildSinDocumentoFields(id) {
   const ocrStatus = el("p", { class: "ocr-status", id: `${id}-ocr-status2` });
   foto.appendChild(ocrStatus);
 
+  box.appendChild(rowProv);
   box.appendChild(row1);
   box.appendChild(row2);
   box.appendChild(row3);
@@ -1491,6 +1507,7 @@ async function submitRendicion() {
       }
       items.push({
         tipo_item: "SinDocumento",
+        nombre_proveedor: document.getElementById(`${id}-nombreprov2`).value.trim() || null,
         rut_proveedor: null,
         tipo_documento: null,
         nro_documento: null,
@@ -1864,7 +1881,7 @@ async function openDetalle(id, pushHistory = true) {
 
   const columnas = ["Tipo", "Proveedor / Categoría", "RUT", "Documento", "Fecha Venc."];
   if (esAprobadorViewer) columnas.push("Cuenta Contable");
-  columnas.push("Centro de Costo", "Descripción", "Monto", "Acciones");
+  columnas.push("Centro de Costo", "Descripción", "Monto", "Estado", "Acciones");
 
   const tabla = el("table", { class: "items-table" });
   const thead = el("thead", {}, [el("tr", {}, columnas.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]);
@@ -1877,7 +1894,7 @@ async function openDetalle(id, pushHistory = true) {
 
     const celdas = [
       el("td", {}, esCon ? "Documento electrónico" : "Boleta"),
-      el("td", { class: "wrap" }, esCon ? (it.nombre_proveedor || "-") : (it.categoria || "-")),
+      el("td", { class: "wrap" }, esCon ? (it.nombre_proveedor || "-") : [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
       el("td", {}, esCon ? (it.rut_proveedor || "-") : "-"),
       el("td", {}, esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-"),
       el("td", {}, esCon && it.fecha_vencimiento ? fmtDate(it.fecha_vencimiento) : "-"),
@@ -1891,6 +1908,7 @@ async function openDetalle(id, pushHistory = true) {
     celdas.push(el("td", { class: "wrap" }, it.centro_costo || "-"));
     celdas.push(el("td", { class: "wrap" }, it.descripcion || "-"));
     celdas.push(el("td", { class: "monto" }, fmtCLP(it.monto)));
+    celdas.push(el("td", { class: "center" }, el("span", { class: "pill " + (it.estado || "Pendiente"), style: "font-size:0.72rem" }, it.estado || "Pendiente")));
     // En celular la tabla se apila como tarjetas (ver CSS) -- cada celda
     // necesita saber el nombre de su columna para mostrarlo como etiqueta.
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
@@ -1928,6 +1946,40 @@ async function openDetalle(id, pushHistory = true) {
         },
       }, "Verificar"));
     }
+    // Aprobación por ítem: mientras la rendición siga Pendiente, el
+    // aprobador puede aceptar o rechazar cada gasto por separado (y
+    // cambiar de opinión las veces que quiera antes de "Finalizar
+    // aprobación"). Un ítem Rechazado necesita un motivo, igual que el
+    // rechazo general de la rendición.
+    if (puedeAprobar) {
+      accionesCell.appendChild(el("button", {
+        class: "btn btn-sm", type: "button",
+        onclick: () => aprobarItem(it, r, "Aprobado"),
+      }, "Aprobar ítem"));
+      accionesCell.appendChild(el("button", {
+        class: "btn btn-sm", type: "button",
+        onclick: () => {
+          filaExtra.style.display = "table-row";
+          extraCell.innerHTML = "";
+          const motivoInput = el("textarea", {
+            rows: "2", placeholder: "Motivo del rechazo de este ítem (se le avisa por correo al empleado)...",
+            style: "width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:0.85rem; resize:vertical;",
+          });
+          extraCell.appendChild(motivoInput);
+          extraCell.appendChild(el("div", { style: "display:flex; gap:8px; margin-top:8px;" }, [
+            el("button", {
+              class: "btn btn-danger btn-sm", type: "button",
+              onclick: () => {
+                const motivo = motivoInput.value.trim();
+                if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
+                aprobarItem(it, r, "Rechazado", motivo);
+              },
+            }, "Confirmar rechazo del ítem"),
+            el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: () => { filaExtra.style.display = "none"; } }, "Cancelar"),
+          ]));
+        },
+      }, "Rechazar ítem"));
+    }
     celdas.push(accionesCell);
 
     tbody.appendChild(el("tr", {}, celdas));
@@ -1957,33 +2009,91 @@ async function openDetalle(id, pushHistory = true) {
   }
 
   if (puedeAprobar) {
-    const rechazoBox = el("div", { style: "display:none; margin-top:14px;" });
-    const rechazoInput = el("textarea", {
-      rows: "2", placeholder: "Explica brevemente por qué se rechaza (se le avisa por correo al empleado)...",
-      style: "width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:0.9rem; resize:vertical;",
-    });
-    rechazoBox.appendChild(rechazoInput);
-    rechazoBox.appendChild(el("div", { style: "display:flex; gap:10px; margin-top:8px;" }, [
-      el("button", {
-        class: "btn btn-danger", type: "button",
-        onclick: () => {
-          const motivo = rechazoInput.value.trim();
-          if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
-          aprobarRendicion(r, items, "Rechazado", motivo);
-        },
-      }, "Confirmar rechazo"),
-      el("button", { class: "btn btn-ghost", type: "button", onclick: () => { rechazoBox.style.display = "none"; } }, "Cancelar"),
-    ]));
-
-    const actions = el("div", { style: "display:flex;gap:10px;margin-top:16px" }, [
-      el("button", { class: "btn btn-success", onclick: () => aprobarRendicion(r, items, "Aprobado") }, "Aprobar"),
-      el("button", { class: "btn btn-danger", onclick: () => { rechazoBox.style.display = "block"; } }, "Rechazar"),
-    ]);
-    box.appendChild(actions);
-    box.appendChild(rechazoBox);
+    const pendientes = (items || []).filter((it) => (it.estado || "Pendiente") === "Pendiente").length;
+    if (pendientes > 0) {
+      box.appendChild(el("p", { style: "color:var(--warn);font-size:0.85rem;margin-top:16px" },
+        `Faltan ${pendientes} ítem(s) por revisar (Aprobar ítem / Rechazar ítem, en la tabla de arriba) antes de poder finalizar la aprobación.`));
+    } else {
+      const aprobados = (items || []).filter((it) => it.estado === "Aprobado").length;
+      const rechazados = (items || []).filter((it) => it.estado === "Rechazado").length;
+      box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:16px" },
+        `${aprobados} ítem(s) aprobado(s), ${rechazados} rechazado(s). Al finalizar, los rechazados quedan fuera del monto y del comprobante.`));
+      box.appendChild(el("button", {
+        class: "btn btn-primary", style: "margin-top:8px;",
+        onclick: () => finalizarAprobacionRendicion(r, items),
+      }, "Finalizar aprobación"));
+    }
   }
 
+  box.appendChild(el("button", {
+    class: "btn btn-secondary", style: "margin-top:16px;",
+    onclick: () => generarInformePDF(r, items),
+  }, "Descargar informe PDF"));
+
   if (pushHistory) pushView("view-detalle", { id }); else show("view-detalle");
+}
+
+// Marca un ítem individual Aprobado/Rechazado (el aprobador puede cambiar
+// de opinión las veces que quiera mientras la rendición siga Pendiente) y
+// vuelve a pintar el detalle para que se actualice el pill de estado y la
+// disponibilidad del botón "Finalizar aprobación".
+async function aprobarItem(item, rendicion, estado, motivo = null) {
+  const cambios = { estado, motivo_rechazo: estado === "Rechazado" ? motivo : null };
+  const { error } = await db.from("rendicion_items").update(cambios).eq("id", item.id);
+  if (error) { toast("No se pudo actualizar el ítem: " + error.message); return; }
+  Object.assign(item, cambios);
+  toast(estado === "Aprobado" ? "Ítem aprobado." : "Ítem rechazado.");
+  openDetalle(rendicion.id, false);
+}
+
+// "Aprobación general": solo se puede llamar cuando ningún ítem quedó
+// Pendiente. Los ítems Rechazados se excluyen del monto_total y del
+// comprobante Kame; si quedó al menos un ítem Aprobado, la rendición pasa
+// a Aprobado (con el monto recalculado); si todos fueron rechazados, pasa
+// a Rechazado.
+async function finalizarAprobacionRendicion(rendicion, items) {
+  const aprobados = items.filter((it) => it.estado === "Aprobado");
+  const rechazados = items.filter((it) => it.estado === "Rechazado");
+  const estado = aprobados.length > 0 ? "Aprobado" : "Rechazado";
+  const montoTotal = aprobados.reduce((s, it) => s + Number(it.monto || 0), 0);
+
+  const cambios = {
+    estado,
+    monto_total: montoTotal,
+    aprobador_id: currentUser.id,
+    aprobador_nombre: currentProfile?.nombre || currentUser.email,
+    fecha_aprobacion: new Date().toISOString(),
+  };
+  if (estado === "Rechazado") {
+    cambios.motivo_rechazo = rechazados.map((it) => it.motivo_rechazo).filter(Boolean).join(" | ") || "Todos los ítems fueron rechazados.";
+  }
+
+  const { error } = await db.from("rendiciones").update(cambios).eq("id", rendicion.id);
+  if (error) { toast("Error al actualizar: " + error.message); return; }
+
+  toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
+  Object.assign(rendicion, cambios);
+
+  const itemsExcluidos = rechazados.map((it) => it.descripcion || it.nombre_proveedor || "ítem").join(", ");
+  db.functions.invoke("notificar-estado-rendicion", {
+    body: {
+      folio: rendicion.folio,
+      empleado_id: rendicion.empleado_id,
+      empleado_nombre: rendicion.empleado_nombre,
+      empresa: rendicion.empresa,
+      monto_total: rendicion.monto_total,
+      estado,
+      motivo_rechazo: cambios.motivo_rechazo || null,
+      aprobador_nombre: cambios.aprobador_nombre,
+      items_excluidos: itemsExcluidos || null,
+    },
+  }).catch((err) => console.error("No se pudo notificar al empleado:", err));
+
+  if (estado === "Aprobado") {
+    await descargarCSV(rendicion, aprobados);
+  }
+  replaceView("view-dashboard");
+  loadDashboard();
 }
 
 // El bucket "comprobantes" es privado: para ver la foto/PDF hay que pedir una
@@ -2036,6 +2146,10 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
     ccDoc.querySelector("select").value = it.centro_costo || opcionesCCDoc[0];
     campos.push(el("div", { class: "field-row" }, [ccDoc]));
   } else {
+    const nombreProv2 = fieldInput("edit-nombreprov2", "Proveedor / Local", "text");
+    nombreProv2.querySelector("input").value = it.nombre_proveedor || "";
+    campos.push(el("div", { class: "field-row" }, [nombreProv2]));
+
     const catSelect = fieldSelectCategoria("edit-categoria");
     const sel = catSelect.querySelector("select");
     if ([...sel.options].some((o) => o.value === it.categoria)) sel.value = it.categoria;
@@ -2076,6 +2190,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector("#edit-cuenta").value.trim();
           cambios.centro_costo = lineWrap.querySelector("#edit-cc").value.trim();
         } else {
+          cambios.nombre_proveedor = lineWrap.querySelector("#edit-nombreprov2").value.trim();
           cambios.categoria = lineWrap.querySelector("#edit-categoria").value;
           cambios.cuenta_contable = lineWrap.querySelector("#edit-cuenta").value.trim();
           cambios.centro_costo = lineWrap.querySelector("#edit-cc").value.trim();
@@ -2107,43 +2222,6 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
     }, "Cancelar"),
   ]);
   lineWrap.appendChild(acciones);
-}
-
-async function aprobarRendicion(rendicion, items, estado, motivoRechazo = null) {
-  const cambios = {
-    estado,
-    aprobador_id: currentUser.id,
-    aprobador_nombre: currentProfile?.nombre || currentUser.email,
-    fecha_aprobacion: new Date().toISOString(),
-  };
-  if (estado === "Rechazado") cambios.motivo_rechazo = motivoRechazo;
-
-  const { error } = await db.from("rendiciones").update(cambios).eq("id", rendicion.id);
-  if (error) { toast("Error al actualizar: " + error.message); return; }
-
-  toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
-  Object.assign(rendicion, cambios);
-
-  // Le avisamos por correo a quien envió la rendición cómo quedó -- no
-  // bloqueamos el flujo si el correo falla, la actualización ya se guardó.
-  db.functions.invoke("notificar-estado-rendicion", {
-    body: {
-      folio: rendicion.folio,
-      empleado_id: rendicion.empleado_id,
-      empleado_nombre: rendicion.empleado_nombre,
-      empresa: rendicion.empresa,
-      monto_total: rendicion.monto_total,
-      estado,
-      motivo_rechazo: motivoRechazo,
-      aprobador_nombre: cambios.aprobador_nombre,
-    },
-  }).catch((err) => console.error("No se pudo notificar al empleado:", err));
-
-  if (estado === "Aprobado") {
-    await descargarCSV(rendicion, items);
-  }
-  replaceView("view-dashboard");
-  loadDashboard();
 }
 
 // ------------------------------------------------------------
@@ -2297,6 +2375,138 @@ async function descargarCSV(rendicion, items) {
   a.href = URL.createObjectURL(blob);
   a.download = fileName;
   a.click();
+}
+
+// ------------------------------------------------------------
+// Informe PDF de una rendición (con los comprobantes adjuntos)
+// ------------------------------------------------------------
+// Descarga el archivo del bucket privado (vía URL firmada, igual que
+// "Ver") y lo devuelve como imagen lista para insertar en el PDF. Si el
+// adjunto original es una foto (jpg/png) se usa tal cual; si es un PDF, se
+// renderiza su primera página con pdf.js y esa imagen es la que se
+// incrusta -- jsPDF no sabe insertar páginas de OTRO pdf directamente.
+async function obtenerImagenDeAdjunto(path) {
+  try {
+    const { data: signed, error } = await db.storage.from("comprobantes").createSignedUrl(path, 120);
+    if (error || !signed?.signedUrl) return null;
+    const resp = await fetch(signed.signedUrl);
+    const blob = await resp.blob();
+
+    if (blob.type === "application/pdf" || path.toLowerCase().endsWith(".pdf")) {
+      const buf = await blob.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      const page = await pdf.getPage(1);
+      const viewport = page.getViewport({ scale: 2 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      return canvas.toDataURL("image/png");
+    }
+
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  } catch (err) {
+    console.error("No se pudo preparar el adjunto para el PDF:", err);
+    return null;
+  }
+}
+
+// Informe completo de una rendición: encabezado, tabla de ítems, y una
+// página por cada comprobante adjunto (para que quede todo -- rendición y
+// respaldos -- en un solo archivo). Sirve para cualquier estado
+// (Pendiente/Aprobado/Rechazado), no solo para las ya aprobadas.
+async function generarInformePDF(rendicion, items) {
+  toast("Generando PDF...");
+  try {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+
+    doc.setFontSize(15);
+    doc.text(`RindeWellness · Informe de rendición N° ${rendicion.folio ?? "-"}`, 14, 16);
+    doc.setFontSize(10);
+    doc.setTextColor(90);
+    let y = 24;
+    const linea = (label, valor) => {
+      doc.setTextColor(90);
+      doc.text(`${label}:`, 14, y);
+      doc.setTextColor(20);
+      doc.text(String(valor ?? "-"), 55, y);
+      y += 6;
+    };
+    linea("Empleado", rendicion.empleado_nombre);
+    linea("RUT", rendicion.rut_empleado);
+    linea("Empresa", rendicion.empresa);
+    linea("Fecha", fmtDate(rendicion.created_at));
+    linea("Tipo", rendicion.tipo_rendicion === "FondoPorRendir" ? "Rendición de fondo por rendir" : "Reembolso");
+    linea("Estado", rendicion.estado);
+    if (rendicion.comentario) linea("Comentario", rendicion.comentario);
+    if (rendicion.estado === "Aprobado") {
+      linea("Aprobado por", rendicion.aprobador_nombre);
+      linea("Fecha aprobación", fmtDate(rendicion.fecha_aprobacion));
+    }
+    if (rendicion.estado === "Rechazado") {
+      linea("Rechazado por", rendicion.aprobador_nombre);
+      linea("Motivo", rendicion.motivo_rechazo || "No se dejó un motivo.");
+    }
+    linea("Monto total", fmtCLP(rendicion.monto_total));
+    y += 4;
+
+    doc.autoTable({
+      startY: y,
+      head: [["#", "Tipo", "Proveedor / Categoría", "RUT", "Documento", "C. Costo", "Descripción", "Monto", "Estado"]],
+      body: (items || []).map((it, i) => {
+        const esCon = it.tipo_item === "ConDocumento";
+        return [
+          i + 1,
+          esCon ? "Documento electrónico" : "Boleta",
+          esCon ? (it.nombre_proveedor || "-") : ([it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
+          esCon ? (it.rut_proveedor || "-") : "-",
+          esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-",
+          it.centro_costo || "-",
+          it.descripcion || "-",
+          fmtCLP(it.monto),
+          it.estado || "Pendiente",
+        ];
+      }),
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: [21, 156, 142] },
+      columnStyles: { 7: { halign: "right" } },
+    });
+
+    // Una página por cada comprobante adjunto, para que el informe quede
+    // completo (rendición + respaldos) en un solo PDF descargable.
+    for (const [i, it] of (items || []).entries()) {
+      if (!it.adjunto_url) continue;
+      const img = await obtenerImagenDeAdjunto(it.adjunto_url);
+      if (!img) continue;
+      doc.addPage();
+      doc.setFontSize(11);
+      doc.setTextColor(20);
+      const titulo = `Comprobante · Ítem ${i + 1}${it.nombre_proveedor ? " · " + it.nombre_proveedor : it.categoria ? " · " + it.categoria : ""}`;
+      doc.text(titulo, 14, 16);
+      const propiedades = doc.getImageProperties(img);
+      const pageWidth = doc.internal.pageSize.getWidth() - 20;
+      const pageHeight = doc.internal.pageSize.getHeight() - 30;
+      let w = pageWidth;
+      let h = (propiedades.height * w) / propiedades.width;
+      if (h > pageHeight) {
+        h = pageHeight;
+        w = (propiedades.width * h) / propiedades.height;
+      }
+      doc.addImage(img, "PNG", 10, 24, w, h);
+    }
+
+    doc.save(`informe_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}.pdf`);
+    toast("PDF generado.");
+  } catch (err) {
+    console.error("Error generando el PDF:", err);
+    toast("No se pudo generar el PDF: " + (err.message || ""));
+  }
 }
 
 const MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",

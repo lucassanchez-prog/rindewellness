@@ -92,6 +92,22 @@ alter table public.rendicion_items drop constraint if exists rendicion_items_tip
 -- Motivo del rechazo, para avisarle al empleado por qué se rechazó su rendición.
 alter table public.rendiciones add column if not exists motivo_rechazo text;
 
+-- Aprobación por ítem: el aprobador puede aceptar o rechazar cada gasto por
+-- separado (ej. una boleta ilegible) sin tener que rechazar toda la
+-- rendición. Los ítems Rechazados quedan fuera del monto_total y del
+-- comprobante Kame; la "Aprobación general" (ver aprobarRendicion/
+-- finalizarAprobacionRendicion en app.js) recién se puede cerrar cuando
+-- ningún ítem queda en Pendiente.
+alter table public.rendicion_items add column if not exists estado text not null default 'Pendiente' check (estado in ('Pendiente','Aprobado','Rechazado'));
+alter table public.rendicion_items add column if not exists motivo_rechazo text;
+-- Backfill: las rendiciones que ya estaban Aprobadas/Rechazadas antes de
+-- este cambio dejan sus ítems reflejando el mismo estado final (si no,
+-- quedarían mostrando "Pendiente" para siempre sin poder cambiarlo).
+update public.rendicion_items ri
+set estado = r.estado
+from public.rendiciones r
+where r.id = ri.rendicion_id and r.estado in ('Aprobado', 'Rechazado') and ri.estado = 'Pendiente';
+
 create index if not exists idx_rendicion_items_rendicion_id on public.rendicion_items(rendicion_id);
 create index if not exists idx_rendiciones_empleado on public.rendiciones(empleado_id);
 create index if not exists idx_rendiciones_estado on public.rendiciones(estado);

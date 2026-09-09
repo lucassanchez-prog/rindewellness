@@ -73,7 +73,7 @@ Deno.serve(async (req: Request) => {
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
-    const { tipo, folio, empleado_id, empleado_nombre, empresa, monto_total, estado, motivo_rechazo, aprobador_nombre } = await req.json();
+    const { tipo, folio, empleado_id, empleado_nombre, empresa, monto_total, estado, motivo_rechazo, aprobador_nombre, items_excluidos } = await req.json();
     if (!empleado_id) throw new Error("Falta empleado_id.");
     const esSolicitud = tipo === "solicitud";
 
@@ -106,6 +106,7 @@ Deno.serve(async (req: Request) => {
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${aprobado ? "Aprobado" : "Rechazado"} por</td><td>${aprobador_nombre || "-"}</td></tr>
           ${!aprobado ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">Motivo</td><td>${motivo_rechazo || "No se indicó un motivo."}</td></tr>` : ""}
         </table>
+        ${aprobado && !esSolicitud && items_excluidos ? `<p style="background:#fbf1e2;color:#7a5c00;padding:10px 14px;border-radius:6px;">Se excluyeron estos ítems por no cumplir los requisitos: <strong>${items_excluidos}</strong>. El monto total ya refleja solo lo aprobado.</p>` : ""}
         ${aprobado && esSolicitud ? `<p style="color:#5b6472;">La entrega del fondo corresponde a que la gestione Finanzas, fuera de la app.</p>` : ""}
         <p>Ingresa a RindeWellness para ver el detalle.</p>
       </div>

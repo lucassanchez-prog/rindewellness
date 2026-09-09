@@ -8,6 +8,17 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  // El PDF de un comprobante (no las fotos, que son imágenes normales) se
+  // renderiza con pdf.js para poder incrustarlo como imagen en el informe;
+  // pdf.js necesita saber dónde está su "worker" (mismo CDN, misma versión).
+  if (window.pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  }
+</script>
 <script>
   // Aplicar el tema guardado antes de pintar la página, para que no "parpadee".
   try {
@@ -309,6 +320,6 @@
   <div class="toast" id="toast"></div>
 
   <script src="config.js"></script>
-  <script src="app.js?v=33"></script>
+  <script src="app.js?v=35"></script>
 </body>
 </html>

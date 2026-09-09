@@ -17,21 +17,40 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+// Mismo listado de categorías de gasto directo que CATEGORIAS_GASTO en
+// app.js (sin la opción "Otro", que es solo para elegir cuenta a mano) --
+// se le pasa a Gemini para que elija la más parecida, en vez de inventar
+// una categoría que no existe en la app.
+const CATEGORIAS = [
+  "Gerenciamiento", "Arriendo Instalaciones", "Arriendo Instalaciones Variables", "Gastos Comunes",
+  "Telefonía e Internet", "Electricidad", "Gas", "Agua", "Servicios Informaticos", "Servicio de Seguridad",
+  "Implementos Gimnasio", "Servicios en Streaming", "Gasto Fee de Ventas y Marketing", "Patentes Comerciales",
+  "Fletes", "Combustibles", "Arriendo de Vehiculos", "Estacionamiento", "Seguros", "Materiales",
+  "Materiales de Aseo y Oficina", "Gastos Cafeteria", "Servicios Computacionales", "Donaciones",
+  "Gastos de Administración", "Mantenciones Generales", "Mantenciones Extraordinarias", "Gastos de Representacion",
+  "Prevencion de Riesgos", "Publicidad y Marketing", "Publicidad After Dmoov", "Publicidad en RRSS",
+  "Licencias SCD", "Fitmewise", "Informatica y Licencias", "Gastos RFA", "Asesoria Legal", "Asesoria Tributaria",
+  "Otras Asesorias", "Beneficios del Personal", "Traslados del Personal", "Viaticos del Personal",
+  "Capacitaciones al Personal", "Honorarios Profesionales", "Honorarios Sin Retención",
+];
+
 const PROMPT = `Eres un asistente que extrae datos de comprobantes de compra chilenos
 (facturas electrónicas, boletas electrónicas o boletas de honorarios).
 Analiza la imagen adjunta y devuelve SOLO un JSON válido, sin texto adicional
 ni explicaciones, con exactamente esta forma:
 {
-  "nombre_proveedor": "razón social o nombre del proveedor" o null,
+  "nombre_proveedor": "razón social o nombre del proveedor/local" o null,
   "rut_proveedor": "12.345.678-9" o null,
   "tipo_documento": "Factura Electrónica" | "Factura Exenta Electrónica" | "Boleta de Honorario" | "Boleta Electrónica" | null,
   "nro_documento": "string" o null,
   "fecha": "YYYY-MM-DD" o null,
   "monto": number o null,
-  "descripcion": "breve descripción del gasto, ej: Almuerzo equipo ventas" o null
+  "descripcion": "breve descripción del gasto, ej: Almuerzo equipo ventas" o null,
+  "categoria_sugerida": una de estas opciones EXACTAS: ${CATEGORIAS.map((c) => `"${c}"`).join(", ")} -- la que mejor calce con el gasto, o null si ninguna calza bien
 }
 Si no puedes leer un dato con certeza, usa null en ese campo. No inventes datos.
-El monto debe ser el total final del documento, sin puntos ni signos, solo el número.`;
+El monto debe ser el total final del documento, sin puntos ni signos, solo el número.
+Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la lista (respetando tildes y mayúsculas), nunca inventes una categoría nueva.`;
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
