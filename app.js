@@ -2388,6 +2388,28 @@ async function descargarCSV(rendicion, items) {
 // adjunto original es una foto (jpg/png) se usa tal cual; si es un PDF, se
 // renderiza su primera página con pdf.js y esa imagen es la que se
 // incrusta -- jsPDF no sabe insertar páginas de OTRO pdf directamente.
+// Tamaño máximo (lado más largo, en px) al que se reescala cualquier
+// comprobante antes de meterlo al PDF. Las fotos de celular vienen a
+// resolución completa de cámara (3000x4000 o más, varios MB cada una) --
+// para un informe que se ve en pantalla o se imprime esa resolución sobra,
+// y sin reescalar el PDF de una rendición con un par de fotos pesaba
+// varios MB (uno de prueba real llegó a 7+ MB con solo 2 fotos).
+const PDF_IMG_MAX_DIM = 1400;
+const PDF_IMG_CALIDAD = 0.72;
+
+function canvasAJpegRedimensionado(canvasOrigen) {
+  let { width, height } = canvasOrigen;
+  if (width <= PDF_IMG_MAX_DIM && height <= PDF_IMG_MAX_DIM) {
+    return canvasOrigen.toDataURL("image/jpeg", PDF_IMG_CALIDAD);
+  }
+  const factor = PDF_IMG_MAX_DIM / Math.max(width, height);
+  const chico = document.createElement("canvas");
+  chico.width = Math.round(width * factor);
+  chico.height = Math.round(height * factor);
+  chico.getContext("2d").drawImage(canvasOrigen, 0, 0, chico.width, chico.height);
+  return chico.toDataURL("image/jpeg", PDF_IMG_CALIDAD);
+}
+
 async function obtenerImagenDeAdjunto(path) {
   try {
     const { data: signed, error } = await db.storage.from("comprobantes").createSignedUrl(path, 120);
@@ -2404,15 +2426,18 @@ async function obtenerImagenDeAdjunto(path) {
       canvas.width = viewport.width;
       canvas.height = viewport.height;
       await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-      return canvas.toDataURL("image/png");
+      return canvasAJpegRedimensionado(canvas);
     }
 
-    return await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
+    // Foto normal (jpg/png del celular): la pasamos por un canvas igual,
+    // así se reescala/comprime como cualquier otro adjunto en vez de
+    // meterse íntegra al PDF.
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0);
+    return canvasAJpegRedimensionado(canvas);
   } catch (err) {
     console.error("No se pudo preparar el adjunto para el PDF:", err);
     return null;
@@ -2501,7 +2526,7 @@ async function generarInformePDF(rendicion, items) {
         h = pageHeight;
         w = (propiedades.width * h) / propiedades.height;
       }
-      doc.addImage(img, "PNG", 10, 24, w, h);
+      doc.addImage(img, "JPEG", 10, 24, w, h);
     }
 
     // Nombre de archivo con quién rinde, para poder identificarlo de un
