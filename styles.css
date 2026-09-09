@@ -471,7 +471,7 @@ button {
   overflow-wrap: break-word;
 }
 .items-table td {
-  padding: 7px 10px;
+  padding: 12px 10px;
   border-bottom: 1px solid var(--line);
   white-space: normal;
   overflow-wrap: break-word;
@@ -482,7 +482,8 @@ button {
 .items-table td.center { text-align: center; }
 .items-table th.center { text-align: center; }
 .items-table th.right { text-align: right; }
-.items-table .acciones-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+.items-table th:last-child, .items-table td.acciones-cell { width: 160px; }
+.items-table .acciones-cell { display: flex; gap: 8px 10px; flex-wrap: wrap; align-content: flex-start; }
 .items-table .btn-sm { white-space: nowrap; }
 .items-table .item-extra-row td { background: var(--bg-soft, rgba(120,120,120,0.04)); }
 .items-table tbody tr.row-clickable { cursor: pointer; }
@@ -532,7 +533,7 @@ button {
 }
 
 .btn-sm {
-  padding: 5px 10px;
+  padding: 6px 12px;
   font-size: 0.78rem;
   border: 1px solid var(--line);
   border-radius: 6px;
