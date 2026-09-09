@@ -572,6 +572,11 @@ button {
   color: var(--ink);
 }
 .btn-sm:hover { border-color: var(--blue); color: var(--blue); }
+/* .btn-sm y .btn-success/.btn-danger tienen la misma prioridad CSS (una
+   sola clase cada una) -- sin esto, .btn-sm gana solo por venir después en
+   el archivo y tapa el verde/rojo en botones como "Aprobar ítem". */
+.btn-sm.btn-success { background: var(--success-bg); color: var(--success); border-color: transparent; }
+.btn-sm.btn-danger { background: var(--danger-bg); color: var(--danger); border-color: transparent; }
 
 .back-link {
   display: inline-flex; align-items: center; gap: 6px;
