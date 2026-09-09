@@ -2501,7 +2501,12 @@ async function generarInformePDF(rendicion, items) {
       doc.addImage(img, "PNG", 10, 24, w, h);
     }
 
-    doc.save(`informe_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}.pdf`);
+    // Nombre de archivo con quién rinde, para poder identificarlo de un
+    // vistazo entre varios PDFs descargados (ej. "informe_rendicion_1_nataly_alvarez.pdf").
+    const nombreArchivo = (rendicion.empleado_nombre || "")
+      .normalize("NFD").replace(/[̀-ͯ]/g, "") // saca tildes
+      .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    doc.save(`informe_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}${nombreArchivo ? "_" + nombreArchivo : ""}.pdf`);
     toast("PDF generado.");
   } catch (err) {
     console.error("Error generando el PDF:", err);
