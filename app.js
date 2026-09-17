@@ -238,6 +238,20 @@ function toast(msg) {
   t.classList.add("show");
   setTimeout(() => t.classList.remove("show"), 2600);
 }
+
+// Traduce los errores técnicos más comunes de Supabase/Postgres a un
+// mensaje que una persona sin conocimientos técnicos pueda entender. Los
+// mensajes que la base ya redacta en español (los "raise exception" de
+// nuestros propios triggers, ej. "ya fue procesada...") se muestran tal
+// cual porque ya están pensados para el usuario final.
+function mensajeErrorAmigable(err) {
+  const msg = err?.message || String(err || "");
+  if (/ya fue procesad/i.test(msg) || /no está habilitada para tu perfil/i.test(msg) || /No autorizado/i.test(msg)) return msg;
+  if (/Failed to fetch|NetworkError|network/i.test(msg)) return "Sin conexión a internet. Revisa tu conexión e inténtalo de nuevo.";
+  if (/JWT|session|not authenticated|auth/i.test(msg)) return "Tu sesión expiró. Vuelve a iniciar sesión.";
+  if (/permission denied|RLS|row-level security/i.test(msg)) return "No tienes permiso para hacer esta acción.";
+  return msg || "Ocurrió un error inesperado.";
+}
 function el(tag, attrs = {}, children = []) {
   const e = document.createElement(tag);
   Object.entries(attrs).forEach(([k, v]) => {
@@ -813,6 +827,10 @@ async function openAdminUsuarios(pushHistory = true) {
     select.value = u.rol;
     select.addEventListener("change", async () => {
       const nuevoRol = select.value;
+      if (nuevoRol === "admin" && !confirm(`¿Dar permisos de administrador a ${u.nombre}? Podrá ver y aprobar todo, y cambiar el rol de cualquier persona.`)) {
+        select.value = u.rol;
+        return;
+      }
       const { error: updErr } = await db.from("profiles").update({ rol: nuevoRol }).eq("id", u.id);
       if (updErr) { toast("No se pudo actualizar: " + updErr.message); select.value = u.rol; }
       else { toast(`${u.nombre} ahora es ${nuevoRol}.`); u.rol = nuevoRol; }
@@ -1165,22 +1183,30 @@ function buildConDocumentoFields(id) {
 // servidor) y autocompleta los campos del ítem con lo que logre leer.
 // Si algo falla, simplemente no autocompleta nada: el empleado sigue
 // pudiendo cargar el gasto a mano.
+// Común a "Con documento" y "Gasto directo": lee el archivo, se lo manda a
+// la Edge Function ocr-recibo y devuelve los datos extraídos. Cada caller
+// mapea el resultado a sus propios campos (son formularios distintos).
+async function llamarOcrRecibo(file) {
+  const imageBase64 = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+  const { data, error } = await db.functions.invoke("ocr-recibo", {
+    body: { imageBase64, mimeType: file.type || "image/jpeg" },
+  });
+  if (error) throw error;
+  if (data?.error) throw new Error(data.error);
+  return data;
+}
+
 async function analizarComprobante(id, file, statusEl) {
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
-    const imageBase64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-
-    const { data, error } = await db.functions.invoke("ocr-recibo", {
-      body: { imageBase64, mimeType: file.type || "image/jpeg" },
-    });
-    if (error) throw error;
-    if (data?.error) throw new Error(data.error);
+    const data = await llamarOcrRecibo(file);
 
     if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
     if (data.rut_proveedor) {
@@ -1220,18 +1246,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
-    const imageBase64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-
-    const { data, error } = await db.functions.invoke("ocr-recibo", {
-      body: { imageBase64, mimeType: file.type || "image/jpeg" },
-    });
-    if (error) throw error;
-    if (data?.error) throw new Error(data.error);
+    const data = await llamarOcrRecibo(file);
 
     if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
     if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
@@ -1471,17 +1486,29 @@ async function submitRendicion() {
     const isCon = card.querySelector(`[data-tipo="ConDocumento"]`).classList.contains("active");
     if (isCon) {
       const monto = parseMoneyValue(document.getElementById(`${id}-monto`).value);
-      if (!monto) continue;
       const tipoDoc = document.getElementById(`${id}-tipodoc`).value;
       const fotoInput = document.getElementById(`${id}-foto`);
+      if (!monto) {
+        // Una tarjeta de ítem completamente vacía (sin monto ni comprobante)
+        // se ignora en silencio -- es solo un ítem extra que la persona no
+        // llegó a usar. Pero si ya adjuntó el comprobante y dejó el monto en
+        // blanco, avisamos en vez de descartar el ítem sin que se entere.
+        if (fotoInput.files.length) { toast(`Falta el monto del Ítem ${idx + 1}.`); return; }
+        continue;
+      }
       if (!fotoInput.files.length) {
         toast(`Falta adjuntar el comprobante del Ítem ${idx + 1}.`);
+        return;
+      }
+      const rutProveedor = document.getElementById(`${id}-rut`).value.trim();
+      if (rutProveedor && !validarRut(rutProveedor)) {
+        toast(`El RUT del proveedor del Ítem ${idx + 1} no es válido.`);
         return;
       }
       items.push({
         tipo_item: "ConDocumento",
         nombre_proveedor: document.getElementById(`${id}-nombreprov`).value.trim(),
-        rut_proveedor: document.getElementById(`${id}-rut`).value.trim(),
+        rut_proveedor: rutProveedor,
         tipo_documento: tipoDoc,
         nro_documento: document.getElementById(`${id}-folio`).value.trim(),
         fecha_vencimiento: document.getElementById(`${id}-venc`).value || null,
@@ -1499,8 +1526,11 @@ async function submitRendicion() {
       });
     } else {
       const monto = parseMoneyValue(document.getElementById(`${id}-monto2`).value);
-      if (!monto) continue;
       const fotoInput2 = document.getElementById(`${id}-foto2`);
+      if (!monto) {
+        if (fotoInput2.files.length) { toast(`Falta el monto del Ítem ${idx + 1}.`); return; }
+        continue;
+      }
       if (!fotoInput2.files.length) {
         toast(`Falta adjuntar el comprobante del Ítem ${idx + 1}.`);
         return;
@@ -1554,31 +1584,57 @@ async function submitRendicion() {
       .single();
     if (errR) throw errR;
 
-    for (const item of items) {
+    // Se recalcula el total según lo que REALMENTE queda guardado -- si
+    // falla la subida de un comprobante o el insert de un ítem, ese ítem
+    // se descarta (nunca se guarda "aprobable" sin su respaldo obligatorio)
+    // y el monto_total no debe incluirlo.
+    let montoRealGuardado = 0;
+    let itemsGuardados = 0;
+    const erroresItems = [];
+    for (const [idx, item] of items.entries()) {
       let adjuntoUrl = null;
       const file = item._fotoInput?.files?.[0];
       if (file) {
         const path = `${currentUser.id}/${rendicion.id}-${Date.now()}-${file.name}`;
         const { error: upErr } = await db.storage.from("comprobantes").upload(path, file);
-        if (!upErr) adjuntoUrl = path;
+        if (upErr) {
+          console.error("Error subiendo comprobante:", upErr);
+          erroresItems.push(`Ítem ${idx + 1}: no se pudo subir el comprobante (${upErr.message}).`);
+          continue;
+        }
+        adjuntoUrl = path;
       }
       delete item._fotoInput;
       const { error: itemErr } = await db.from("rendicion_items").insert({ ...item, rendicion_id: rendicion.id, adjunto_url: adjuntoUrl });
-      if (itemErr) { console.error("Error guardando ítem:", itemErr); toast("No se pudo guardar un ítem: " + itemErr.message); }
+      if (itemErr) {
+        console.error("Error guardando ítem:", itemErr);
+        erroresItems.push(`Ítem ${idx + 1}: no se pudo guardar (${itemErr.message}).`);
+        continue;
+      }
+      montoRealGuardado += item.monto;
+      itemsGuardados++;
+    }
+
+    if (montoRealGuardado !== montoTotal) {
+      await db.from("rendiciones").update({ monto_total: montoRealGuardado }).eq("id", rendicion.id);
+    }
+
+    if (erroresItems.length) {
+      toast(`Se guardaron ${itemsGuardados} de ${items.length} ítems. Revisa la rendición y vuelve a cargar los que fallaron:\n${erroresItems.join(" · ")}`);
+    }
+
+    if (!itemsGuardados) {
+      btn.disabled = false;
+      btn.textContent = "Guardar rendición";
+      replaceView("view-dashboard");
+      return;
     }
 
     // No bloqueamos el envío si el correo falla (ej. secret de Resend sin
     // configurar todavía): la rendición ya quedó guardada, que es lo que
     // importa. El aprobador igual la va a ver al entrar al dashboard.
     db.functions.invoke("notificar-aprobador", {
-      body: {
-        folio: rendicion.folio,
-        empleado_nombre: rendicion.empleado_nombre,
-        empresa: rendicion.empresa,
-        monto_total: rendicion.monto_total,
-        comentario: rendicion.comentario,
-        rendicion_id: rendicion.id,
-      },
+      body: { rendicion_id: rendicion.id },
     }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
 
     toast("Rendición enviada a aprobación.");
@@ -1664,15 +1720,7 @@ async function submitSolicitud() {
     // Mismo correo/plantilla que una rendición nueva, pero con tipo
     // "solicitud" para que el asunto y el cuerpo hablen de un fondo.
     db.functions.invoke("notificar-aprobador", {
-      body: {
-        tipo: "solicitud",
-        folio: solicitud.folio,
-        empleado_nombre: solicitud.empleado_nombre,
-        empresa: solicitud.empresa,
-        monto_total: solicitud.monto_solicitado,
-        comentario: solicitud.motivo,
-        rendicion_id: solicitud.id,
-      },
+      body: { tipo: "solicitud", rendicion_id: solicitud.id },
     }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
 
     toast("Solicitud de fondos enviada.");
@@ -1687,7 +1735,15 @@ async function submitSolicitud() {
 }
 
 async function openDetalleSolicitud(id, pushHistory = true) {
-  const { data: s } = await db.from("solicitudes_fondos").select("*").eq("id", id).single();
+  const box0 = document.getElementById("detalle-solicitud-card");
+  box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
+
+  const { data: s, error: errS } = await db.from("solicitudes_fondos").select("*").eq("id", id).maybeSingle();
+  if (errS || !s) {
+    toast("No se pudo abrir esa solicitud (puede que ya no exista o no tengas permiso).");
+    replaceView("view-dashboard");
+    return;
+  }
   const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
   const puedeAprobar = esAprobadorViewer && s.estado === "Pendiente";
 
@@ -1815,7 +1871,11 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
   if (estado === "Rechazado") cambios.motivo_rechazo = motivoRechazo;
 
   const { error } = await db.from("solicitudes_fondos").update(cambios).eq("id", solicitud.id);
-  if (error) { toast("Error al actualizar: " + error.message); return; }
+  if (error) {
+    toast(mensajeErrorAmigable(error));
+    if (/ya fue procesad/i.test(error.message || "")) openDetalleSolicitud(solicitud.id, false);
+    return;
+  }
 
   toast(estado === "Aprobado" ? "Solicitud aprobada." : "Solicitud rechazada.");
   Object.assign(solicitud, cambios);
@@ -1823,17 +1883,7 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
   // Igual que con las rendiciones: se le avisa por correo a quien pidió el
   // fondo cómo quedó, con el motivo si fue rechazada.
   db.functions.invoke("notificar-estado-rendicion", {
-    body: {
-      tipo: "solicitud",
-      folio: solicitud.folio,
-      empleado_id: solicitud.empleado_id,
-      empleado_nombre: solicitud.empleado_nombre,
-      empresa: solicitud.empresa,
-      monto_total: solicitud.monto_solicitado,
-      estado,
-      motivo_rechazo: motivoRechazo,
-      aprobador_nombre: cambios.aprobador_nombre,
-    },
+    body: { tipo: "solicitud", rendicion_id: solicitud.id },
   }).catch((err) => console.error("No se pudo notificar al empleado:", err));
 
   replaceView("view-dashboard");
@@ -1844,7 +1894,15 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
 // Detalle / aprobación
 // ------------------------------------------------------------
 async function openDetalle(id, pushHistory = true) {
-  const { data: r } = await db.from("rendiciones").select("*").eq("id", id).single();
+  const box0 = document.getElementById("detalle-card");
+  box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
+
+  const { data: r, error: errR } = await db.from("rendiciones").select("*").eq("id", id).maybeSingle();
+  if (errR || !r) {
+    toast("No se pudo abrir esa rendición (puede que ya no exista o no tengas permiso).");
+    replaceView("view-dashboard");
+    return;
+  }
   const { data: items } = await db.from("rendicion_items").select("*").eq("rendicion_id", id);
 
   const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
@@ -2043,7 +2101,7 @@ async function openDetalle(id, pushHistory = true) {
 async function aprobarItem(item, rendicion, estado, motivo = null) {
   const cambios = { estado, motivo_rechazo: estado === "Rechazado" ? motivo : null };
   const { error } = await db.from("rendicion_items").update(cambios).eq("id", item.id);
-  if (error) { toast("No se pudo actualizar el ítem: " + error.message); return; }
+  if (error) { toast(mensajeErrorAmigable(error)); return; }
   Object.assign(item, cambios);
   toast(estado === "Aprobado" ? "Ítem aprobado." : "Ítem rechazado.");
   openDetalle(rendicion.id, false);
@@ -2072,24 +2130,17 @@ async function finalizarAprobacionRendicion(rendicion, items) {
   }
 
   const { error } = await db.from("rendiciones").update(cambios).eq("id", rendicion.id);
-  if (error) { toast("Error al actualizar: " + error.message); return; }
+  if (error) {
+    toast(mensajeErrorAmigable(error));
+    if (/ya fue procesad/i.test(error.message || "")) openDetalle(rendicion.id, false);
+    return;
+  }
 
   toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
   Object.assign(rendicion, cambios);
 
-  const itemsExcluidos = rechazados.map((it) => it.descripcion || it.nombre_proveedor || "ítem").join(", ");
   db.functions.invoke("notificar-estado-rendicion", {
-    body: {
-      folio: rendicion.folio,
-      empleado_id: rendicion.empleado_id,
-      empleado_nombre: rendicion.empleado_nombre,
-      empresa: rendicion.empresa,
-      monto_total: rendicion.monto_total,
-      estado,
-      motivo_rechazo: cambios.motivo_rechazo || null,
-      aprobador_nombre: cambios.aprobador_nombre,
-      items_excluidos: itemsExcluidos || null,
-    },
+    body: { rendicion_id: rendicion.id },
   }).catch((err) => console.error("No se pudo notificar al empleado:", err));
 
   if (estado === "Aprobado") {
@@ -2126,37 +2177,40 @@ async function registrarCambio(item, rendicionId, campo, valorAnterior, valorNue
 function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   lineWrap.innerHTML = "";
   const campos = [];
+  // Prefijado con el id del ítem: sin esto, editar dos ítems de la misma
+  // rendición al mismo tiempo dejaba dos elementos con el mismo id en el DOM.
+  const pfx = `edit-${it.id}-`;
 
   if (it.tipo_item === "ConDocumento") {
-    const nombreProv = fieldInput("edit-nombreprov", "Nombre del proveedor", "text");
+    const nombreProv = fieldInput(`${pfx}nombreprov`, "Nombre del proveedor", "text");
     nombreProv.querySelector("input").value = it.nombre_proveedor || "";
-    const rutProv = fieldInput("edit-rut", "RUT del proveedor", "text");
+    const rutProv = fieldInput(`${pfx}rut`, "RUT del proveedor", "text");
     rutProv.querySelector("input").value = it.rut_proveedor || "";
     campos.push(el("div", { class: "field-row" }, [nombreProv, rutProv]));
 
     if (esAprobadorViewer) {
-      const cuenta = fieldInput("edit-cuenta", "Cuenta contable", "text");
+      const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
       const cuentaInput = cuenta.querySelector("input");
       cuentaInput.value = it.cuenta_contable || "";
-      const nombreHint = el("p", { class: "ocr-status show", id: "edit-cuenta-nombre" }, nombreCuenta(cuentaInput.value));
+      const nombreHint = el("p", { class: "ocr-status show", id: `${pfx}cuenta-nombre` }, nombreCuenta(cuentaInput.value));
       cuentaInput.addEventListener("input", () => { nombreHint.textContent = nombreCuenta(cuentaInput.value) || "Cuenta no reconocida"; });
       cuenta.appendChild(nombreHint);
       campos.push(el("div", { class: "field-row" }, [cuenta]));
     }
     const opcionesCCDoc = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
     if (it.centro_costo && !opcionesCCDoc.includes(it.centro_costo)) opcionesCCDoc.unshift(it.centro_costo);
-    const ccDoc = fieldSelect("edit-cc", "Centro de Costo (Unidad de Negocio)", opcionesCCDoc);
+    const ccDoc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCCDoc);
     ccDoc.querySelector("select").value = it.centro_costo || opcionesCCDoc[0];
     campos.push(el("div", { class: "field-row" }, [ccDoc]));
   } else {
-    const nombreProv2 = fieldInput("edit-nombreprov2", "Proveedor / Local", "text");
+    const nombreProv2 = fieldInput(`${pfx}nombreprov2`, "Proveedor / Local", "text");
     nombreProv2.querySelector("input").value = it.nombre_proveedor || "";
     campos.push(el("div", { class: "field-row" }, [nombreProv2]));
 
-    const catSelect = fieldSelectCategoria("edit-categoria");
+    const catSelect = fieldSelectCategoria(`${pfx}categoria`);
     const sel = catSelect.querySelector("select");
     if ([...sel.options].some((o) => o.value === it.categoria)) sel.value = it.categoria;
-    const cuenta = fieldInput("edit-cuenta", "Cuenta contable", "text");
+    const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
     cuenta.querySelector("input").value = it.cuenta_contable || "";
     cuenta.querySelector("input").readOnly = true;
     sel.addEventListener("change", () => {
@@ -2166,14 +2220,14 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
     campos.push(el("div", { class: "field-row" }, [catSelect, cuenta]));
     const opcionesCC = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
     if (it.centro_costo && !opcionesCC.includes(it.centro_costo)) opcionesCC.unshift(it.centro_costo);
-    const cc = fieldSelect("edit-cc", "Centro de Costo (Unidad de Negocio)", opcionesCC);
+    const cc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCC);
     cc.querySelector("select").value = it.centro_costo || opcionesCC[0];
     campos.push(el("div", { class: "field-row" }, [cc]));
   }
 
-  const monto = fieldInputMoney("edit-monto", "Monto");
+  const monto = fieldInputMoney(`${pfx}monto`, "Monto");
   monto.querySelector("input").value = Number(it.monto || 0).toLocaleString("es-CL");
-  const desc = fieldInput("edit-desc", "Descripción", "text");
+  const desc = fieldInput(`${pfx}desc`, "Descripción", "text");
   desc.querySelector("input").value = it.descripcion || "";
   campos.push(el("div", { class: "field-row" }, [monto, desc]));
 
@@ -2184,19 +2238,21 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
       class: "btn btn-primary", type: "button",
       onclick: async () => {
         const cambios = {
-          monto: parseMoneyValue(lineWrap.querySelector("#edit-monto").value),
-          descripcion: lineWrap.querySelector("#edit-desc").value.trim(),
+          monto: parseMoneyValue(lineWrap.querySelector(`#${pfx}monto`).value),
+          descripcion: lineWrap.querySelector(`#${pfx}desc`).value.trim(),
         };
         if (it.tipo_item === "ConDocumento") {
-          cambios.nombre_proveedor = lineWrap.querySelector("#edit-nombreprov").value.trim();
-          cambios.rut_proveedor = formatearRut(lineWrap.querySelector("#edit-rut").value.trim());
-          if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector("#edit-cuenta").value.trim();
-          cambios.centro_costo = lineWrap.querySelector("#edit-cc").value.trim();
+          const rutEditado = formatearRut(lineWrap.querySelector(`#${pfx}rut`).value.trim());
+          if (rutEditado && !validarRut(rutEditado)) { toast("Ese RUT de proveedor no es válido."); return; }
+          cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov`).value.trim();
+          cambios.rut_proveedor = rutEditado;
+          if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
+          cambios.centro_costo = lineWrap.querySelector(`#${pfx}cc`).value.trim();
         } else {
-          cambios.nombre_proveedor = lineWrap.querySelector("#edit-nombreprov2").value.trim();
-          cambios.categoria = lineWrap.querySelector("#edit-categoria").value;
-          cambios.cuenta_contable = lineWrap.querySelector("#edit-cuenta").value.trim();
-          cambios.centro_costo = lineWrap.querySelector("#edit-cc").value.trim();
+          cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov2`).value.trim();
+          cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`).value;
+          cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
+          cambios.centro_costo = lineWrap.querySelector(`#${pfx}cc`).value.trim();
         }
 
         const { error } = await db.from("rendicion_items").update(cambios).eq("id", it.id);
@@ -2507,15 +2563,21 @@ async function generarInformePDF(rendicion, items) {
     });
 
     // Una página por cada comprobante adjunto, para que el informe quede
-    // completo (rendición + respaldos) en un solo PDF descargable.
-    for (const [i, it] of (items || []).entries()) {
-      if (!it.adjunto_url) continue;
-      const img = await obtenerImagenDeAdjunto(it.adjunto_url);
+    // completo (rendición + respaldos) en un solo PDF descargable. Las
+    // imágenes se piden todas en paralelo (antes era una por una, una
+    // rendición con varios ítems tardaba varios segundos de más); las
+    // páginas igual se agregan en orden al PDF.
+    const itemsConAdjunto = (items || [])
+      .map((it, indiceOriginal) => ({ it, indiceOriginal }))
+      .filter(({ it }) => it.adjunto_url);
+    const imagenes = await Promise.all(itemsConAdjunto.map(({ it }) => obtenerImagenDeAdjunto(it.adjunto_url)));
+    for (const [i, { it, indiceOriginal }] of itemsConAdjunto.entries()) {
+      const img = imagenes[i];
       if (!img) continue;
       doc.addPage();
       doc.setFontSize(11);
       doc.setTextColor(20);
-      const titulo = `Comprobante · Ítem ${i + 1}${it.nombre_proveedor ? " · " + it.nombre_proveedor : it.categoria ? " · " + it.categoria : ""}`;
+      const titulo = `Comprobante · Ítem ${indiceOriginal + 1}${it.nombre_proveedor ? " · " + it.nombre_proveedor : it.categoria ? " · " + it.categoria : ""}`;
       doc.text(titulo, 14, 16);
       const propiedades = doc.getImageProperties(img);
       const pageWidth = doc.internal.pageSize.getWidth() - 20;

@@ -5,6 +5,13 @@
 // el resultado de una SOLICITUD DE FONDOS (payload con tipo: "solicitud")
 // -- mismo mecanismo, solo cambia el texto del asunto y del cuerpo.
 //
+// Exige que quien llama sea aprobador/admin: sin este chequeo cualquiera
+// con la anon key podía mandarle a cualquier empleado un correo "tu
+// rendición fue rechazada" con motivo/aprobador inventados (vector de
+// phishing interno). El folio/monto/estado/motivo del correo SIEMPRE se
+// relee de la base a partir de rendicion_id -- nunca se confía en lo que
+// venga en el body.
+//
 // Secrets necesarios (Supabase Dashboard > Edge Functions > Manage secrets):
 //   RESEND_API_KEY       -> tu API key de resend.com (gratis)
 //   RESEND_FROM_EMAIL    -> opcional. Si no lo pones, usa el remitente de
@@ -20,18 +27,47 @@
 //                           destinatario real) en vez de perderse. Se deja de
 //                           necesitar el día que se verifique un dominio propio.
 //
-// SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY los inyecta Supabase automático
-// en toda Edge Function -- no hay que configurarlos a mano. Se necesita el
-// service role acá (no el anon) porque hay que leer el email real del
-// empleado desde auth.users, cosa que la app normal no puede hacer.
+// SUPABASE_URL, SUPABASE_ANON_KEY y SUPABASE_SERVICE_ROLE_KEY los inyecta
+// Supabase automático en toda Edge Function -- no hay que configurarlos a
+// mano. Se necesita el service role acá (no el anon) porque hay que leer
+// el email real del empleado desde auth.users, cosa que la app normal no
+// puede hacer.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 const FROM_EMAIL = Deno.env.get("RESEND_FROM_EMAIL") || "RindeWellness <onboarding@resend.dev>";
 const FALLBACK_EMAIL = Deno.env.get("RESEND_FALLBACK_EMAIL");
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+function escapeHtml(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function requireProfile(req: Request, admin: ReturnType<typeof createClient>) {
+  const authHeader = req.headers.get("Authorization") || "";
+  const jwt = authHeader.replace(/^Bearer\s+/i, "");
+  if (!jwt) throw new Error("No autenticado.");
+  const anon = createClient(SUPABASE_URL, ANON_KEY);
+  const { data: userRes, error: userErr } = await anon.auth.getUser(jwt);
+  if (userErr || !userRes?.user) throw new Error("Sesión inválida o expirada.");
+  const { data: profile } = await admin.from("profiles").select("id, nombre, rol").eq("id", userRes.user.id).maybeSingle();
+  if (!profile) throw new Error("Perfil no encontrado.");
+  return profile;
+}
 
 // Manda el correo con Resend; si el remitente de pruebas rechaza el envío
 // por no ir dirigido al dueño de la cuenta ("testing emails"), y hay un
@@ -52,7 +88,7 @@ async function enviarConFallback(to: string[], subject: string, html: string) {
     const htmlConAviso = `
       <p style="background:#fff3cd;color:#7a5c00;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;">
         ⚠ Reenviado a esta casilla porque Resend todavía no tiene un dominio verificado.
-        Destinatario real: ${to.join(", ")}
+        Destinatario real: ${escapeHtml(to.join(", "))}
       </p>
       ${html}
     `;
@@ -62,30 +98,54 @@ async function enviarConFallback(to: string[], subject: string, html: string) {
   return { resp, data };
 }
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
-    const { tipo, folio, empleado_id, empleado_nombre, empresa, monto_total, estado, motivo_rechazo, aprobador_nombre, items_excluidos } = await req.json();
-    if (!empleado_id) throw new Error("Falta empleado_id.");
+    const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+    const caller = await requireProfile(req, admin);
+    if (!["admin", "aprobador"].includes(caller.rol)) {
+      throw new Error("Solo un aprobador o admin puede notificar el resultado de una rendición/solicitud.");
+    }
+
+    const { tipo, rendicion_id } = await req.json();
+    if (!rendicion_id) throw new Error("Falta rendicion_id.");
     const esSolicitud = tipo === "solicitud";
 
-    const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+    const tabla = esSolicitud ? "solicitudes_fondos" : "rendiciones";
+    const { data: row, error: errRow } = await admin.from(tabla).select("*").eq("id", rendicion_id).maybeSingle();
+    if (errRow || !row) throw new Error("No se encontró la rendición/solicitud.");
 
-    const { data: userData, error: errUser } = await admin.auth.admin.getUserById(empleado_id);
+    const { data: userData, error: errUser } = await admin.auth.admin.getUserById(row.empleado_id);
     if (errUser) throw errUser;
     const destinatario = userData?.user?.email;
     if (!destinatario) {
       return new Response(JSON.stringify({ ok: true, enviados: 0, nota: "No se encontró el email del empleado." }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
+    }
+
+    const folio = row.folio;
+    const empleado_nombre = row.empleado_nombre;
+    const empresa = row.empresa;
+    const monto_total = esSolicitud ? row.monto_solicitado : row.monto_total;
+    const estado = row.estado;
+    const motivo_rechazo = row.motivo_rechazo;
+    const aprobador_nombre = row.aprobador_nombre;
+
+    // Los ítems excluidos se recalculan acá (no se confía en el body): son
+    // los que quedaron Rechazados dentro de una rendición que en general
+    // terminó Aprobada.
+    let items_excluidos: string | null = null;
+    if (!esSolicitud && estado === "Aprobado") {
+      const { data: rechazados } = await admin
+        .from("rendicion_items")
+        .select("descripcion, nombre_proveedor")
+        .eq("rendicion_id", rendicion_id)
+        .eq("estado", "Rechazado");
+      items_excluidos = (rechazados || []).map((it) => it.descripcion || it.nombre_proveedor || "ítem").join(", ") || null;
     }
 
     const aprobado = estado === "Aprobado";
@@ -99,14 +159,14 @@ Deno.serve(async (req: Request) => {
         <h2 style="margin-bottom: 4px;">Tu ${sustantivo} fue <span style="color:${colorEstado}">${aprobado ? "aprobada" : "rechazada"}</span></h2>
         <p style="color: #5b6472; margin-top: 0;">RindeWellness · Grupo Wellness</p>
         <table style="border-collapse: collapse; margin: 16px 0;">
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Folio</td><td><strong>${folioFmt}</strong></td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empleado</td><td>${empleado_nombre || "-"}</td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empresa</td><td>${empresa || "-"}</td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Folio</td><td><strong>${escapeHtml(folioFmt)}</strong></td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empleado</td><td>${escapeHtml(empleado_nombre || "-")}</td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empresa</td><td>${escapeHtml(empresa || "-")}</td></tr>
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${esSolicitud ? "Monto solicitado" : "Monto total"}</td><td><strong>${montoFmt}</strong></td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${aprobado ? "Aprobado" : "Rechazado"} por</td><td>${aprobador_nombre || "-"}</td></tr>
-          ${!aprobado ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">Motivo</td><td>${motivo_rechazo || "No se indicó un motivo."}</td></tr>` : ""}
+          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${aprobado ? "Aprobado" : "Rechazado"} por</td><td>${escapeHtml(aprobador_nombre || "-")}</td></tr>
+          ${!aprobado ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">Motivo</td><td>${escapeHtml(motivo_rechazo || "No se indicó un motivo.")}</td></tr>` : ""}
         </table>
-        ${aprobado && !esSolicitud && items_excluidos ? `<p style="background:#fbf1e2;color:#7a5c00;padding:10px 14px;border-radius:6px;">Se excluyeron estos ítems por no cumplir los requisitos: <strong>${items_excluidos}</strong>. El monto total ya refleja solo lo aprobado.</p>` : ""}
+        ${aprobado && !esSolicitud && items_excluidos ? `<p style="background:#fbf1e2;color:#7a5c00;padding:10px 14px;border-radius:6px;">Se excluyeron estos ítems por no cumplir los requisitos: <strong>${escapeHtml(items_excluidos)}</strong>. El monto total ya refleja solo lo aprobado.</p>` : ""}
         ${aprobado && esSolicitud ? `<p style="color:#5b6472;">La entrega del fondo corresponde a que la gestione Finanzas, fuera de la app.</p>` : ""}
         <p>Ingresa a RindeWellness para ver el detalle.</p>
       </div>

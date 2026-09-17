@@ -4,8 +4,27 @@
 // Gemini vive SOLO acá (variable de entorno del proyecto), nunca en el
 // frontend.
 //
+// Exige una sesión válida: sin este chequeo, cualquiera con la anon key
+// pública (visible en config.js) podía llamar a esta función sin estar
+// logueado y consumir la cuota/el costo de Gemini del proyecto.
+//
 // Deploy: supabase functions deploy ocr-recibo
 // Secret:  supabase secrets set GEMINI_API_KEY=tu-api-key
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
+
+async function requireUser(req: Request) {
+  const authHeader = req.headers.get("Authorization") || "";
+  const jwt = authHeader.replace(/^Bearer\s+/i, "");
+  if (!jwt) throw new Error("No autenticado.");
+  const anon = createClient(SUPABASE_URL, ANON_KEY);
+  const { data, error } = await anon.auth.getUser(jwt);
+  if (error || !data?.user) throw new Error("Sesión inválida o expirada.");
+  return data.user;
+}
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 const GEMINI_MODEL = "gemini-3.6-flash";
@@ -56,6 +75,7 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
+    await requireUser(req);
     if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
 
     const { imageBase64, mimeType } = await req.json();
@@ -98,8 +118,22 @@ Deno.serve(async (req: Request) => {
       await new Promise((r) => setTimeout(r, espera));
     }
 
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      // Gemini puede responder 200 OK sin "candidates" (ej. filtro de
+      // seguridad bloqueó la imagen) -- antes esto se devolvía como "{}"
+      // silencioso y el formulario quedaba vacío sin ninguna pista de por qué.
+      const motivo = data?.promptFeedback?.blockReason || "Gemini no devolvió resultado para esta imagen.";
+      throw new Error(motivo);
+    }
     const parsed = JSON.parse(text);
+
+    // El prompt le pide a Gemini un valor EXACTO de CATEGORIAS, pero un LLM
+    // puede no respetarlo -- si no calza con el catálogo cerrado que usa la
+    // app, se descarta en vez de guardar una categoría inexistente.
+    if (parsed.categoria_sugerida && !CATEGORIAS.includes(parsed.categoria_sugerida)) {
+      parsed.categoria_sugerida = null;
+    }
 
     return new Response(JSON.stringify(parsed), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
