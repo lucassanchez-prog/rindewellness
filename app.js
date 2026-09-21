@@ -2429,6 +2429,29 @@ async function openDetalle(id, pushHistory = true) {
     ]));
   }
 
+  // El aviso por correo al empleado se manda una sola vez, al momento de
+  // aprobar/rechazar (ver finalizarAprobacionRendicion) -- si falló ahí
+  // (ej. Resend mal configurado, o la sesión de quien aprobó estaba
+  // desactualizada) no hay reintento automático. Este botón repite
+  // exactamente esa misma llamada, a mano, sin tener que recurrir a la
+  // consola del navegador.
+  if (esAprobadorViewer && (r.estado === "Aprobado" || r.estado === "Rechazado")) {
+    const btnReenviar = el("button", { class: "btn btn-ghost btn-sm", style: "margin-top:8px;", type: "button" }, "Reenviar notificación por correo");
+    btnReenviar.addEventListener("click", async () => {
+      btnReenviar.disabled = true;
+      btnReenviar.textContent = "Enviando...";
+      const { data, error } = await db.functions.invoke("notificar-estado-rendicion", { body: { rendicion_id: r.id } });
+      if (error || !data?.ok) {
+        toast("No se pudo enviar: " + (error?.message || "revisa los logs de la función en Supabase."));
+      } else {
+        toast("Notificación reenviada.");
+      }
+      btnReenviar.disabled = false;
+      btnReenviar.textContent = "Reenviar notificación por correo";
+    });
+    box.appendChild(btnReenviar);
+  }
+
   if (puedeAprobar) {
     const pendientes = (items || []).filter((it) => (it.estado || "Pendiente") === "Pendiente").length;
     if (pendientes > 0) {
