@@ -84,6 +84,10 @@ const CENTROS_COSTO_POR_EMPRESA = {
 // igual que cualquier otro gasto directo, con foto obligatoria igual.
 const TIPOS_DOCUMENTO = ["Factura Electrónica", "Factura Exenta Electrónica", "Boleta de Honorario"];
 
+function tipoItemLabel(tipoItem) {
+  return tipoItem === "ConDocumento" ? "Documento electrónico" : "Boleta";
+}
+
 const CUENTA_POR_TIPO_DOC = {
   "Factura Electrónica": "2.01.07.01",
   "Factura Exenta Electrónica": "2.01.07.01",
@@ -207,6 +211,7 @@ function estadoDesdeHash() {
   if (base === "detalle" && param) return { viewId: "view-detalle", params: { id: param } };
   if (base === "detalle-solicitud" && param) return { viewId: "view-detalle-solicitud", params: { id: param } };
   if (base === "admin") return { viewId: "view-admin", params: {} };
+  if (base === "plantillas") return { viewId: "view-plantillas", params: {} };
   if (base === "nueva") return { viewId: "view-nueva", params: {} };
   if (base === "nueva-solicitud") return { viewId: "view-nueva-solicitud", params: {} };
   return { viewId: "view-dashboard", params: {} };
@@ -226,6 +231,7 @@ function renderRoute(state) {
   if (viewId === "view-detalle" && params.id) { openDetalle(params.id, false); return; }
   if (viewId === "view-detalle-solicitud" && params.id) { openDetalleSolicitud(params.id, false); return; }
   if (viewId === "view-admin") { openAdminUsuarios(false); return; }
+  if (viewId === "view-plantillas") { openAdminPlantillas(false); return; }
   if (viewId === "view-nueva") { openNuevaRendicion(false); return; }
   if (viewId === "view-nueva-solicitud") { openNuevaSolicitud(false); return; }
   show("view-dashboard");
@@ -535,6 +541,18 @@ async function onLoggedIn(user) {
     if (insError) { console.error("Error creando perfil:", insError); toast("No se pudo crear tu perfil: " + insError.message); }
     profile = created;
   }
+  // Desactivada en vez de eliminada (ver "Desactivar" en Usuarios): no se
+  // borra su historial, pero no puede volver a entrar. No usamos throw acá
+  // porque onLoggedIn se llama desde tres lugares distintos (login normal,
+  // registro con sesión inmediata, restauración de sesión al cargar la
+  // página) y no todos están en un try/catch con su propio cuadro de error.
+  if (profile && profile.activo === false) {
+    await db.auth.signOut();
+    currentUser = null;
+    const errBox = document.getElementById("login-error");
+    if (errBox) errBox.textContent = "Tu cuenta fue desactivada. Contacta a un administrador.";
+    return;
+  }
   currentProfile = profile;
 
   document.getElementById("user-name").textContent = `${profile?.nombre || user.email} · ${profile?.rol || "empleado"}`;
@@ -544,6 +562,8 @@ async function onLoggedIn(user) {
   document.getElementById("tab-solicitudes-aprobacion").style.display =
     profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
   document.getElementById("btn-admin-usuarios").style.display =
+    profile && profile.rol === "admin" ? "inline-block" : "none";
+  document.getElementById("btn-admin-plantillas").style.display =
     profile && profile.rol === "admin" ? "inline-block" : "none";
   document.getElementById("btn-exportar-excel").style.display =
     profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
@@ -556,7 +576,8 @@ async function onLoggedIn(user) {
   // rendición o "Usuarios", te dejamos en esa misma pantalla en vez de
   // mandarte siempre al dashboard -- el hash de la URL sobrevive la recarga.
   const estadoInicial = estadoDesdeHash();
-  if (estadoInicial.viewId === "view-admin" && profile?.rol !== "admin") {
+  const esVistaSoloAdmin = estadoInicial.viewId === "view-admin" || estadoInicial.viewId === "view-plantillas";
+  if (esVistaSoloAdmin && profile?.rol !== "admin") {
     replaceView("view-dashboard");
     await loadDashboard();
   } else {
@@ -564,10 +585,21 @@ async function onLoggedIn(user) {
   }
 }
 
+// Las cuentas permitidas de la persona son la unión de sus cuentas
+// individuales (perfil_cuentas) + las de su plantilla asignada, si tiene una
+// (ver migracion_plantillas_perfil.sql) -- una no reemplaza a la otra.
 async function cargarCuentasPermitidas() {
-  const { data, error } = await db.from("perfil_cuentas").select("cuenta_cod").eq("profile_id", currentUser.id);
-  if (error) { console.error("Error cargando cuentas permitidas:", error); cuentasPermitidas = null; return; }
-  cuentasPermitidas = (data && data.length) ? new Set(data.map((d) => d.cuenta_cod)) : null;
+  const consultas = [db.from("perfil_cuentas").select("cuenta_cod").eq("profile_id", currentUser.id)];
+  if (currentProfile?.plantilla_id) {
+    consultas.push(db.from("plantilla_cuentas").select("cuenta_cod").eq("plantilla_id", currentProfile.plantilla_id));
+  }
+  const resultados = await Promise.all(consultas);
+  const codigos = new Set();
+  resultados.forEach(({ data, error }) => {
+    if (error) { console.error("Error cargando cuentas permitidas:", error); return; }
+    (data || []).forEach((d) => codigos.add(d.cuenta_cod));
+  });
+  cuentasPermitidas = codigos.size ? codigos : null;
 }
 
 // ------------------------------------------------------------
@@ -578,6 +610,7 @@ function wireDashboard() {
   document.getElementById("btn-solicitar-fondos").addEventListener("click", () => openNuevaSolicitud());
   document.getElementById("btn-admin-usuarios").addEventListener("click", () => openAdminUsuarios());
   document.getElementById("btn-exportar-excel").addEventListener("click", exportarExcel);
+  document.getElementById("btn-admin-plantillas").addEventListener("click", () => openAdminPlantillas());
   document.getElementById("btn-comprobante-rango").addEventListener("click", () => {
     document.getElementById("panel-rango").style.display = "block";
   });
@@ -797,16 +830,21 @@ async function openAdminUsuarios(pushHistory = true) {
   const list = document.getElementById("list-usuarios");
   list.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
 
-  const { data: usuarios, error } = await db.from("profiles").select("*").order("nombre");
+  const [{ data: usuarios, error }, { data: permisos, error: permError }, { data: plantillas, error: plantError }] = await Promise.all([
+    db.from("profiles").select("*").order("nombre"),
+    db.from("perfil_cuentas").select("*"),
+    db.from("perfil_plantillas").select("*").order("nombre"),
+  ]);
   if (error) { list.innerHTML = ""; toast("Error cargando usuarios: " + error.message); return; }
-
-  const { data: permisos, error: permError } = await db.from("perfil_cuentas").select("*");
   if (permError) console.error("Error cargando cuentas permitidas:", permError);
+  if (plantError) console.error("Error cargando plantillas de perfil:", plantError);
+
   const permisosPorUsuario = {};
   (permisos || []).forEach((p) => {
     if (!permisosPorUsuario[p.profile_id]) permisosPorUsuario[p.profile_id] = new Set();
     permisosPorUsuario[p.profile_id].add(p.cuenta_cod);
   });
+  const listaPlantillas = plantillas || [];
 
   list.innerHTML = "";
 
@@ -815,66 +853,127 @@ async function openAdminUsuarios(pushHistory = true) {
     return;
   }
 
-  const tabla = el("table", { class: "items-table" });
-  tabla.appendChild(el("thead", {}, [
-    el("tr", {}, ["Nombre", "RUT", "Rol", "Cuentas permitidas"].map((c) => el("th", {}, c))),
-  ]));
-  const tbody = el("tbody");
-  tabla.appendChild(tbody);
+  const filtroRol = document.getElementById("filtro-usuarios-rol");
+  const filtroTexto = document.getElementById("filtro-usuarios-texto");
+  filtroRol.value = "";
+  filtroTexto.value = "";
 
-  usuarios.forEach((u) => {
-    const select = el("select", { style: "width:auto" }, ROLES.map((r) => el("option", { value: r }, r)));
-    select.value = u.rol;
-    select.addEventListener("change", async () => {
-      const nuevoRol = select.value;
-      if (nuevoRol === "admin" && !confirm(`¿Dar permisos de administrador a ${u.nombre}? Podrá ver y aprobar todo, y cambiar el rol de cualquier persona.`)) {
-        select.value = u.rol;
-        return;
-      }
-      const { error: updErr } = await db.from("profiles").update({ rol: nuevoRol }).eq("id", u.id);
-      if (updErr) { toast("No se pudo actualizar: " + updErr.message); select.value = u.rol; }
-      else { toast(`${u.nombre} ahora es ${nuevoRol}.`); u.rol = nuevoRol; }
-    });
+  const tablaBox = el("div", { class: "table-scroll" });
+  list.appendChild(tablaBox);
 
-    const filaExtra = el("tr", { class: "item-extra-row", style: "display:none;" });
-    const extraCell = el("td", { colspan: "4" });
-    filaExtra.appendChild(extraCell);
+  function renderTabla() {
+    const rol = filtroRol.value;
+    const texto = filtroTexto.value.trim().toLowerCase();
+    const filtrados = usuarios.filter((u) =>
+      (!rol || u.rol === rol) &&
+      (!texto || (u.nombre || "").toLowerCase().includes(texto) || (u.rut || "").toLowerCase().includes(texto))
+    );
 
-    const nombreCell = el("td", {}, u.nombre || "(sin nombre)");
+    tablaBox.innerHTML = "";
+    if (!filtrados.length) {
+      tablaBox.appendChild(el("div", { class: "empty-state" }, "Ningún usuario coincide con el filtro."));
+      return;
+    }
 
-    // Un solo panel expandible por fila, que se reutiliza para "Cuentas
-    // permitidas" o "Editar perfil" según qué botón se apretó.
-    const mostrarPanel = (tipo, render) => {
-      const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
-      if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
-      filaExtra.style.display = "table-row";
-      extraCell.dataset.tipo = tipo;
-      render(extraCell);
-    };
-
-    const btnCuentas = el("button", { class: "btn btn-sm", type: "button" }, "Cuentas permitidas");
-    btnCuentas.addEventListener("click", () => {
-      mostrarPanel("cuentas", (cell) =>
-        renderCuentasPanel(cell, u, permisosPorUsuario[u.id] || new Set(), usuarios, permisosPorUsuario)
-      );
-    });
-
-    const btnEditar = el("button", { class: "btn btn-sm", type: "button" }, "Editar perfil");
-    btnEditar.addEventListener("click", () => {
-      mostrarPanel("perfil", (cell) => renderEditarPerfilPanel(cell, u, nombreCell));
-    });
-
-    nombreCell.setAttribute("data-label", "Nombre");
-    tbody.appendChild(el("tr", {}, [
-      nombreCell,
-      el("td", { "data-label": "RUT" }, u.rut || "-"),
-      el("td", { "data-label": "Rol" }, select),
-      el("td", { class: "acciones-cell", "data-label": "Acciones" }, [btnEditar, btnCuentas]),
+    const tabla = el("table", { class: "items-table" });
+    tabla.appendChild(el("thead", {}, [
+      el("tr", {}, ["Nombre", "RUT", "Rol", "Perfil", "Acciones"].map((c) => el("th", {}, c))),
     ]));
-    tbody.appendChild(filaExtra);
-  });
+    const tbody = el("tbody");
+    tabla.appendChild(tbody);
 
-  list.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+    filtrados.forEach((u) => {
+      const select = el("select", { style: "width:auto" }, ROLES.map((r) => el("option", { value: r }, r)));
+      select.value = u.rol;
+      select.addEventListener("change", async () => {
+        const nuevoRol = select.value;
+        if (nuevoRol === "admin" && !confirm(`¿Dar permisos de administrador a ${u.nombre}? Podrá ver y aprobar todo, y cambiar el rol de cualquier persona.`)) {
+          select.value = u.rol;
+          return;
+        }
+        const { error: updErr } = await db.from("profiles").update({ rol: nuevoRol }).eq("id", u.id);
+        if (updErr) { toast("No se pudo actualizar: " + updErr.message); select.value = u.rol; }
+        else { toast(`${u.nombre} ahora es ${nuevoRol}.`); u.rol = nuevoRol; }
+      });
+
+      // "Sin plantilla" + una opción por plantilla existente. Las cuentas
+      // permitidas de la persona son la plantilla (si elige una) MÁS sus
+      // cuentas individuales -- una no reemplaza a la otra.
+      const selectPlantilla = el("select", { style: "width:auto" }, [
+        el("option", { value: "" }, "Sin plantilla"),
+        ...listaPlantillas.map((p) => el("option", { value: p.id }, p.nombre)),
+      ]);
+      selectPlantilla.value = u.plantilla_id || "";
+      selectPlantilla.addEventListener("change", async () => {
+        const nuevaPlantillaId = selectPlantilla.value || null;
+        const { error: updErr } = await db.from("profiles").update({ plantilla_id: nuevaPlantillaId }).eq("id", u.id);
+        if (updErr) { toast("No se pudo actualizar: " + updErr.message); selectPlantilla.value = u.plantilla_id || ""; return; }
+        u.plantilla_id = nuevaPlantillaId;
+        toast(`Perfil de ${u.nombre} actualizado.`);
+      });
+
+      const filaExtra = el("tr", { class: "item-extra-row", style: "display:none;" });
+      const extraCell = el("td", { colspan: "5" });
+      filaExtra.appendChild(extraCell);
+
+      const nombreCell = el("td", {}, u.nombre || "(sin nombre)");
+
+      // Un solo panel expandible por fila, que se reutiliza para "Cuentas
+      // permitidas" o "Editar perfil" según qué botón se apretó.
+      const mostrarPanel = (tipo, render) => {
+        const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
+        if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
+        filaExtra.style.display = "table-row";
+        extraCell.dataset.tipo = tipo;
+        render(extraCell);
+      };
+
+      const btnCuentas = el("button", { class: "btn btn-sm", type: "button" }, "Cuentas permitidas");
+      btnCuentas.addEventListener("click", () => {
+        mostrarPanel("cuentas", (cell) =>
+          renderCuentasPanel(cell, u, permisosPorUsuario[u.id] || new Set(), usuarios, permisosPorUsuario, listaPlantillas)
+        );
+      });
+
+      const btnEditar = el("button", { class: "btn btn-sm", type: "button" }, "Editar perfil");
+      btnEditar.addEventListener("click", () => {
+        mostrarPanel("perfil", (cell) => renderEditarPerfilPanel(cell, u, nombreCell));
+      });
+
+      // Ni elimina ni deja entrar de nuevo, pero mantiene intacto todo lo que
+      // esa persona ya rindió o aprobó (ver comentario en la migración).
+      const btnActivo = el("button", { class: "btn btn-sm", type: "button" }, u.activo === false ? "Reactivar" : "Desactivar");
+      btnActivo.addEventListener("click", async () => {
+        const nuevoActivo = u.activo === false;
+        const mensaje = nuevoActivo
+          ? `¿Reactivar a ${u.nombre}? Podrá volver a iniciar sesión.`
+          : `¿Desactivar a ${u.nombre}? No podrá volver a iniciar sesión hasta que la reactives. Su historial de rendiciones no se toca.`;
+        if (!confirm(mensaje)) return;
+        const { error: updErr } = await db.from("profiles").update({ activo: nuevoActivo }).eq("id", u.id);
+        if (updErr) { toast("No se pudo actualizar: " + updErr.message); return; }
+        u.activo = nuevoActivo;
+        btnActivo.textContent = nuevoActivo ? "Desactivar" : "Reactivar";
+        toast(`${u.nombre} ${nuevoActivo ? "reactivado" : "desactivado"}.`);
+      });
+
+      nombreCell.setAttribute("data-label", "Nombre");
+      if (u.activo === false) nombreCell.appendChild(el("span", { class: "pill Rechazado", style: "margin-left:8px;font-size:0.7rem;" }, "Desactivado"));
+      tbody.appendChild(el("tr", {}, [
+        nombreCell,
+        el("td", { "data-label": "RUT" }, u.rut || "-"),
+        el("td", { "data-label": "Rol" }, select),
+        el("td", { "data-label": "Perfil" }, selectPlantilla),
+        el("td", { class: "acciones-cell", "data-label": "Acciones" }, [btnEditar, btnCuentas, btnActivo]),
+      ]));
+      tbody.appendChild(filaExtra);
+    });
+
+    tablaBox.appendChild(tabla);
+  }
+
+  filtroRol.onchange = renderTabla;
+  filtroTexto.oninput = renderTabla;
+  renderTabla();
 }
 
 function renderEditarPerfilPanel(cell, usuario, nombreCell) {
@@ -922,15 +1021,46 @@ function renderEditarPerfilPanel(cell, usuario, nombreCell) {
   cell.appendChild(el("div", { style: "display:flex; gap:8px; margin-top:8px;" }, [guardar, cancelar]));
 }
 
-function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = [], permisosPorUsuario = {}) {
+function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = [], permisosPorUsuario = {}, listaPlantillas = []) {
   panel.innerHTML = "";
   const ficha = el("div", { class: "cuentas-ficha" });
+
+  // Si tiene una plantilla asignada, esas cuentas se suman a las
+  // individuales de abajo (no las reemplazan) -- se muestran aparte, de
+  // solo lectura, porque se editan desde "Plantillas de perfil", no acá.
+  const plantilla = listaPlantillas.find((p) => p.id === usuario.plantilla_id);
+  const plantillaBox = el("div");
+  ficha.appendChild(plantillaBox);
+  if (plantilla) {
+    plantillaBox.appendChild(el("p", { class: "ocr-status show" }, `Cargando cuentas de la plantilla "${plantilla.nombre}"...`));
+    db.from("plantilla_cuentas").select("cuenta_cod, cuenta_nombre").eq("plantilla_id", plantilla.id).then(({ data, error }) => {
+      plantillaBox.innerHTML = "";
+      if (error) {
+        plantillaBox.appendChild(el("p", { class: "ocr-status show err" }, "No se pudieron cargar las cuentas de la plantilla."));
+        return;
+      }
+      if (!data || !data.length) {
+        plantillaBox.appendChild(el("p", { style: "margin:0 0 10px;color:var(--ink-soft);font-size:0.85rem" },
+          `La plantilla "${plantilla.nombre}" todavía no tiene cuentas asignadas.`));
+        return;
+      }
+      plantillaBox.appendChild(el("div", { style: "margin-bottom:10px;" }, [
+        el("p", { style: "margin:0 0 6px;font-size:0.85rem;color:var(--ink-soft);" },
+          `Incluidas por la plantilla "${plantilla.nombre}" (se editan en "Plantillas de perfil", no acá):`),
+        el("div", { style: "display:flex;flex-wrap:wrap;gap:6px;" },
+          data.map((c) => el("span", { class: "pill Pendiente", style: "font-size:0.72rem;" }, `${c.cuenta_cod} · ${c.cuenta_nombre || c.cuenta_cod}`))
+        ),
+      ]));
+    });
+  }
 
   const contador = el("span", { class: "cuentas-ficha-contador" }, `${cuentasActuales.size} seleccionadas`);
   const buscador = el("input", { type: "text", class: "cuentas-buscar", placeholder: "Buscar cuenta..." });
   ficha.appendChild(el("div", { class: "cuentas-ficha-header" }, [
     el("p", { class: "cuentas-panel-hint", style: "margin:0;" },
-      "Cuentas de \"gasto directo\" que puede usar. Si no marcas ninguna, puede usar todas."),
+      plantilla
+        ? "Cuentas individuales adicionales a las de su plantilla (arriba). Si ni la plantilla ni acá tienen nada marcado, puede usar todas."
+        : "Cuentas de \"gasto directo\" que puede usar. Si no marcas ninguna, puede usar todas."),
     contador,
   ]));
   ficha.appendChild(el("div", { style: "margin-bottom:10px;" }, [buscador]));
@@ -959,7 +1089,7 @@ function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = 
       cuentasActuales.clear();
       cuentasOrigen.forEach((c) => cuentasActuales.add(c));
       permisosPorUsuario[usuario.id] = cuentasActuales;
-      renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios, permisosPorUsuario);
+      renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios, permisosPorUsuario, listaPlantillas);
       toast("Cuentas copiadas.");
     });
     ficha.appendChild(el("div", { style: "display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;" }, [selectCopiar, btnCopiar]));
@@ -983,6 +1113,206 @@ function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = 
         cuentasActuales.delete(c.cuenta);
       }
       contador.textContent = `${cuentasActuales.size} seleccionadas`;
+    });
+    const label = el("label", { class: "cuenta-check" }, [checkbox, el("span", {}, `${c.cuenta} · ${c.nombre}`)]);
+    filas.push({ label, texto: `${c.cuenta} ${c.nombre}`.toLowerCase() });
+    grid.appendChild(label);
+  });
+
+  buscador.addEventListener("input", () => {
+    const q = buscador.value.trim().toLowerCase();
+    filas.forEach(({ label, texto }) => label.classList.toggle("oculto", !texto.includes(q)));
+  });
+
+  ficha.appendChild(grid);
+  panel.appendChild(ficha);
+}
+
+// ------------------------------------------------------------
+// Plantillas de perfil (solo admin) -- ver migracion_plantillas_perfil.sql.
+// Un grupo de cuentas (ej. "Analista") que se le asigna a varias personas a
+// la vez desde la columna "Perfil" en Usuarios, en vez de marcarles las
+// cuentas una por una.
+// ------------------------------------------------------------
+async function openAdminPlantillas(pushHistory = true) {
+  if (pushHistory) pushView("view-plantillas"); else show("view-plantillas");
+  const list = document.getElementById("list-plantillas");
+  list.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
+
+  const [{ data: plantillas, error }, { data: cuentas, error: cuentasError }, { data: usuarios, error: usuariosError }] = await Promise.all([
+    db.from("perfil_plantillas").select("*").order("nombre"),
+    db.from("plantilla_cuentas").select("*"),
+    db.from("profiles").select("id, plantilla_id"),
+  ]);
+  if (error) { list.innerHTML = ""; toast("Error cargando plantillas: " + error.message); return; }
+  if (cuentasError) console.error("Error cargando cuentas de plantillas:", cuentasError);
+  if (usuariosError) console.error("Error cargando usuarios:", usuariosError);
+
+  const cuentasPorPlantilla = {};
+  (cuentas || []).forEach((c) => {
+    if (!cuentasPorPlantilla[c.plantilla_id]) cuentasPorPlantilla[c.plantilla_id] = new Set();
+    cuentasPorPlantilla[c.plantilla_id].add(c.cuenta_cod);
+  });
+  const personasPorPlantilla = {};
+  (usuarios || []).forEach((u) => {
+    if (!u.plantilla_id) return;
+    personasPorPlantilla[u.plantilla_id] = (personasPorPlantilla[u.plantilla_id] || 0) + 1;
+  });
+
+  list.innerHTML = "";
+
+  // Panel para crear una plantilla nueva, oculto hasta que se aprieta el
+  // botón "Nueva plantilla" del encabezado (ver index.html) -- mismo patrón
+  // de formulario inline que el resto de la app, sin prompt() nativo.
+  const nuevaBox = el("div", { class: "card", style: "display:none; margin-bottom:16px;" });
+  const nombreNueva = fieldInput("nueva-plantilla-nombre", "Nombre de la plantilla", "text", "Analista, Comercial RFA...");
+  nuevaBox.appendChild(nombreNueva);
+  nuevaBox.appendChild(el("div", { style: "display:flex; gap:8px;" }, [
+    el("button", {
+      class: "btn btn-primary btn-sm", type: "button",
+      onclick: async () => {
+        const nombre = nombreNueva.querySelector("input").value.trim();
+        if (!nombre) { toast("Ponle un nombre a la plantilla."); return; }
+        const { error: insErr } = await db.from("perfil_plantillas").insert({ nombre });
+        if (insErr) { toast("No se pudo crear: " + insErr.message); return; }
+        toast("Plantilla creada.");
+        openAdminPlantillas(false);
+      },
+    }, "Crear"),
+    el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: () => { nuevaBox.style.display = "none"; } }, "Cancelar"),
+  ]));
+  list.appendChild(nuevaBox);
+
+  document.getElementById("btn-nueva-plantilla").onclick = () => {
+    nuevaBox.style.display = nuevaBox.style.display === "none" ? "block" : "none";
+    if (nuevaBox.style.display === "block") nombreNueva.querySelector("input").focus();
+  };
+
+  if (!plantillas || !plantillas.length) {
+    list.appendChild(el("div", { class: "empty-state" }, "No hay plantillas creadas todavía."));
+    return;
+  }
+
+  const tabla = el("table", { class: "items-table" });
+  tabla.appendChild(el("thead", {}, [
+    el("tr", {}, ["Nombre", "Cuentas", "Personas", "Acciones"].map((c) => el("th", {}, c))),
+  ]));
+  const tbody = el("tbody");
+  tabla.appendChild(tbody);
+
+  plantillas.forEach((p) => {
+    const cuentasSet = cuentasPorPlantilla[p.id] || new Set();
+    const personas = personasPorPlantilla[p.id] || 0;
+
+    const nombreCell = el("td", { "data-label": "Nombre" }, p.nombre);
+
+    const filaExtra = el("tr", { class: "item-extra-row", style: "display:none;" });
+    const extraCell = el("td", { colspan: "4" });
+    filaExtra.appendChild(extraCell);
+
+    // Un solo panel expandible por fila, reutilizado para "Cuentas de la
+    // plantilla" o "Renombrar" según qué botón se apretó -- mismo patrón que
+    // openAdminUsuarios.
+    const mostrarPanel = (tipo, render) => {
+      const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
+      if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
+      filaExtra.style.display = "table-row";
+      extraCell.dataset.tipo = tipo;
+      render(extraCell);
+    };
+
+    const cuentasCountCell = el("td", { "data-label": "Cuentas" }, String(cuentasSet.size));
+
+    const btnCuentas = el("button", { class: "btn btn-sm", type: "button" }, "Cuentas de la plantilla");
+    btnCuentas.addEventListener("click", () => {
+      mostrarPanel("cuentas", (cell) => renderPlantillaCuentasPanel(cell, p, cuentasSet, cuentasCountCell));
+    });
+
+    const btnRenombrar = el("button", { class: "btn btn-sm", type: "button" }, "Renombrar");
+    btnRenombrar.addEventListener("click", () => {
+      mostrarPanel("renombrar", (cell) => {
+        cell.innerHTML = "";
+        const campo = fieldInput("renombrar-plantilla", "Nombre", "text");
+        campo.querySelector("input").value = p.nombre;
+        cell.appendChild(campo);
+        cell.appendChild(el("div", { style: "display:flex; gap:8px;" }, [
+          el("button", {
+            class: "btn btn-primary btn-sm", type: "button",
+            onclick: async () => {
+              const nuevoNombre = campo.querySelector("input").value.trim();
+              if (!nuevoNombre) { toast("El nombre no puede quedar vacío."); return; }
+              const { error: updErr } = await db.from("perfil_plantillas").update({ nombre: nuevoNombre }).eq("id", p.id);
+              if (updErr) { toast("No se pudo renombrar: " + updErr.message); return; }
+              p.nombre = nuevoNombre;
+              nombreCell.textContent = nuevoNombre;
+              filaExtra.style.display = "none";
+              toast("Plantilla renombrada.");
+            },
+          }, "Guardar"),
+          el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: () => { filaExtra.style.display = "none"; } }, "Cancelar"),
+        ]));
+      });
+    });
+
+    const btnEliminar = el("button", { class: "btn btn-sm btn-danger", type: "button" }, "Eliminar");
+    btnEliminar.addEventListener("click", async () => {
+      const aviso = personas > 0
+        ? `¿Eliminar "${p.nombre}"? ${personas} persona(s) la tienen asignada y perderían esas cuentas (conservan sus cuentas individuales, si tienen). No se puede deshacer.`
+        : `¿Eliminar "${p.nombre}"? No se puede deshacer.`;
+      if (!confirm(aviso)) return;
+      const { error: delErr } = await db.from("perfil_plantillas").delete().eq("id", p.id);
+      if (delErr) { toast("No se pudo eliminar: " + delErr.message); return; }
+      toast("Plantilla eliminada.");
+      openAdminPlantillas(false);
+    });
+
+    tbody.appendChild(el("tr", {}, [
+      nombreCell,
+      cuentasCountCell,
+      el("td", { "data-label": "Personas" }, String(personas)),
+      el("td", { class: "acciones-cell", "data-label": "Acciones" }, [btnCuentas, btnRenombrar, btnEliminar]),
+    ]));
+    tbody.appendChild(filaExtra);
+  });
+
+  list.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+}
+
+function renderPlantillaCuentasPanel(panel, plantilla, cuentasActuales, cuentasCountCell = null) {
+  panel.innerHTML = "";
+  const ficha = el("div", { class: "cuentas-ficha" });
+
+  const contador = el("span", { class: "cuentas-ficha-contador" }, `${cuentasActuales.size} seleccionadas`);
+  const buscador = el("input", { type: "text", class: "cuentas-buscar", placeholder: "Buscar cuenta..." });
+  ficha.appendChild(el("div", { class: "cuentas-ficha-header" }, [
+    el("p", { class: "cuentas-panel-hint", style: "margin:0;" },
+      `Cuentas que otorga la plantilla "${plantilla.nombre}" a quien la tenga asignada (además de sus cuentas individuales, si tiene).`),
+    contador,
+  ]));
+  ficha.appendChild(el("div", { style: "margin-bottom:10px;" }, [buscador]));
+
+  const grid = el("div", { class: "cuentas-grid" });
+  const filas = [];
+  CATEGORIAS_GASTO.filter((c) => c.cuenta).forEach((c) => {
+    const checkbox = el("input", { type: "checkbox" });
+    checkbox.checked = cuentasActuales.has(c.cuenta);
+    checkbox.addEventListener("change", async () => {
+      if (checkbox.checked) {
+        const { error } = await db.from("plantilla_cuentas")
+          .insert({ plantilla_id: plantilla.id, cuenta_cod: c.cuenta, cuenta_nombre: c.nombre });
+        if (error) { toast("No se pudo asignar: " + error.message); checkbox.checked = false; return; }
+        cuentasActuales.add(c.cuenta);
+      } else {
+        const { error } = await db.from("plantilla_cuentas")
+          .delete().eq("plantilla_id", plantilla.id).eq("cuenta_cod", c.cuenta);
+        if (error) { toast("No se pudo quitar: " + error.message); checkbox.checked = true; return; }
+        cuentasActuales.delete(c.cuenta);
+      }
+      contador.textContent = `${cuentasActuales.size} seleccionadas`;
+      // La celda "Cuentas" de la fila en la tabla de arriba es texto
+      // estático pintado una sola vez -- sin esto quedaba mostrando el
+      // conteo viejo hasta recargar toda la pantalla de Plantillas.
+      if (cuentasCountCell) cuentasCountCell.textContent = String(cuentasActuales.size);
     });
     const label = el("label", { class: "cuenta-check" }, [checkbox, el("span", {}, `${c.cuenta} · ${c.nombre}`)]);
     filas.push({ label, texto: `${c.cuenta} ${c.nombre}`.toLowerCase() });
@@ -1619,22 +1949,39 @@ async function submitRendicion() {
       await db.from("rendiciones").update({ monto_total: montoRealGuardado }).eq("id", rendicion.id);
     }
 
-    if (erroresItems.length) {
-      toast(`Se guardaron ${itemsGuardados} de ${items.length} ítems. Revisa la rendición y vuelve a cargar los que fallaron:\n${erroresItems.join(" · ")}`);
-    }
-
     if (!itemsGuardados) {
+      // Ningún ítem se pudo guardar (falló la subida del comprobante o el
+      // insert): no dejar una rendición fantasma sin ítems dando vueltas en
+      // la cola de aprobación con $0 -- antes quedaba creada igual, con
+      // nada que aprobar y sin ningún aviso claro de que algo había fallado.
+      // .select() para confirmar que el borrado realmente afectó la fila
+      // (requiere la policy "rendiciones_delete_propia_vacia") y no decirle
+      // a la persona que se borró cuando en realidad quedó ahí, bloqueada
+      // en silencio por RLS -- el mismo caso que ya nos mordió con
+      // aprobarItem antes de que existiera updateChecked().
+      const { data: borrada } = await db.from("rendiciones").delete().eq("id", rendicion.id).select();
+      const mensajeBase = `No se pudo guardar ningún ítem. ${erroresItems.join(" · ")}`;
+      toast(borrada && borrada.length
+        ? `${mensajeBase} La rendición no quedó creada.`
+        : `${mensajeBase} La rendición quedó guardada vacía -- avisa a un admin para que la revise.`);
       btn.disabled = false;
       btn.textContent = "Guardar rendición";
-      replaceView("view-dashboard");
       return;
+    }
+
+    if (erroresItems.length) {
+      toast(`Se guardaron ${itemsGuardados} de ${items.length} ítems. Revisa la rendición y vuelve a cargar los que fallaron:\n${erroresItems.join(" · ")}`);
     }
 
     // No bloqueamos el envío si el correo falla (ej. secret de Resend sin
     // configurar todavía): la rendición ya quedó guardada, que es lo que
     // importa. El aprobador igual la va a ver al entrar al dashboard.
+    // Ver el comentario sobre .then(({error}) ...) en
+    // finalizarAprobacionRendicion -- mismo motivo acá.
     db.functions.invoke("notificar-aprobador", {
       body: { rendicion_id: rendicion.id },
+    }).then(({ error }) => {
+      if (error) console.error("No se pudo notificar al aprobador:", error);
     }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
 
     toast("Rendición enviada a aprobación.");
@@ -1721,6 +2068,8 @@ async function submitSolicitud() {
     // "solicitud" para que el asunto y el cuerpo hablen de un fondo.
     db.functions.invoke("notificar-aprobador", {
       body: { tipo: "solicitud", rendicion_id: solicitud.id },
+    }).then(({ error }) => {
+      if (error) console.error("No se pudo notificar al aprobador:", error);
     }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
 
     toast("Solicitud de fondos enviada.");
@@ -1881,9 +2230,13 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
   Object.assign(solicitud, cambios);
 
   // Igual que con las rendiciones: se le avisa por correo a quien pidió el
-  // fondo cómo quedó, con el motivo si fue rechazada.
+  // fondo cómo quedó, con el motivo si fue rechazada. Ver el comentario en
+  // aprobarSolicitud/finalizarAprobacionRendicion sobre por qué hace falta
+  // el .then(({error}) ...) además del .catch().
   db.functions.invoke("notificar-estado-rendicion", {
     body: { tipo: "solicitud", rendicion_id: solicitud.id },
+  }).then(({ error }) => {
+    if (error) console.error("No se pudo notificar al empleado:", error);
   }).catch((err) => console.error("No se pudo notificar al empleado:", err));
 
   replaceView("view-dashboard");
@@ -1903,7 +2256,14 @@ async function openDetalle(id, pushHistory = true) {
     replaceView("view-dashboard");
     return;
   }
-  const { data: items } = await db.from("rendicion_items").select("*").eq("rendicion_id", id);
+  // Las dos consultas solo dependen de "id", no una de la otra -- se piden
+  // en paralelo en vez de esperar la primera para recién pedir la segunda.
+  // historialCount es solo para saber si hay algo que mostrar -- el botón de
+  // historial ni aparece si la rendición nunca tuvo un cambio registrado.
+  const [{ data: items }, { count: historialCount }] = await Promise.all([
+    db.from("rendicion_items").select("*").eq("rendicion_id", id),
+    db.from("rendicion_items_historial").select("id", { count: "exact", head: true }).eq("rendicion_id", id),
+  ]);
 
   const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
   const puedeAprobar = esAprobadorViewer && r.estado === "Pendiente";
@@ -1951,7 +2311,7 @@ async function openDetalle(id, pushHistory = true) {
     const esCon = it.tipo_item === "ConDocumento";
 
     const celdas = [
-      el("td", {}, esCon ? "Documento electrónico" : "Boleta"),
+      el("td", {}, tipoItemLabel(it.tipo_item)),
       el("td", { class: "wrap" }, esCon ? (it.nombre_proveedor || "-") : [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
       el("td", {}, esCon ? (it.rut_proveedor || "-") : "-"),
       el("td", {}, esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-"),
@@ -2091,6 +2451,19 @@ async function openDetalle(id, pushHistory = true) {
     onclick: () => generarInformePDF(r, items),
   }, "Descargar informe PDF"));
 
+  // Quién cambió qué y cuándo, para todos los ítems de esta rendición (no
+  // solo el más reciente) -- abajo del todo porque es información de
+  // auditoría, no algo que se consulte en el flujo normal de aprobar/editar.
+  // Ni el botón aparece si la rendición nunca tuvo un cambio registrado.
+  if (historialCount && historialCount > 0) {
+    const historialBox = el("div", { style: "margin-top:10px;" });
+    box.appendChild(el("button", {
+      class: "btn btn-ghost btn-sm", style: "margin-top:16px;",
+      onclick: () => mostrarHistorialRendicion(r.id, historialBox),
+    }, "Ver historial de cambios"));
+    box.appendChild(historialBox);
+  }
+
   if (pushHistory) pushView("view-detalle", { id }); else show("view-detalle");
 }
 
@@ -2098,10 +2471,23 @@ async function openDetalle(id, pushHistory = true) {
 // de opinión las veces que quiera mientras la rendición siga Pendiente) y
 // vuelve a pintar el detalle para que se actualice el pill de estado y la
 // disponibilidad del botón "Finalizar aprobación".
+// .select() es necesario para detectar el caso en que RLS bloquea la fila
+// silenciosamente (sin llegar a disparar un trigger que devolvería un error
+// real): sin él, Postgrest devuelve error:null aunque hayan sido 0 las filas
+// modificadas, y un toast de éxito miente mientras el dato se queda pegado en
+// su valor anterior. Usar esto en vez de un .update() directo en cualquier
+// lugar donde un falso "funcionó" sería grave (cambios de estado/aprobación).
+async function updateChecked(table, id, cambios) {
+  const { data, error } = await db.from(table).update(cambios).eq("id", id).select();
+  if (error) return { ok: false, mensaje: mensajeErrorAmigable(error) };
+  if (!data || data.length === 0) return { ok: false, mensaje: "No tienes permiso para actualizar este ítem." };
+  return { ok: true, data };
+}
+
 async function aprobarItem(item, rendicion, estado, motivo = null) {
   const cambios = { estado, motivo_rechazo: estado === "Rechazado" ? motivo : null };
-  const { error } = await db.from("rendicion_items").update(cambios).eq("id", item.id);
-  if (error) { toast(mensajeErrorAmigable(error)); return; }
+  const res = await updateChecked("rendicion_items", item.id, cambios);
+  if (!res.ok) { toast(res.mensaje); return; }
   Object.assign(item, cambios);
   toast(estado === "Aprobado" ? "Ítem aprobado." : "Ítem rechazado.");
   openDetalle(rendicion.id, false);
@@ -2139,8 +2525,16 @@ async function finalizarAprobacionRendicion(rendicion, items) {
   toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
   Object.assign(rendicion, cambios);
 
+  // db.functions.invoke() NO rechaza la promesa cuando la función responde
+  // con un error propio (ej. falta RESEND_API_KEY, o Resend rechaza el
+  // envío) -- resuelve igual, con { error } adentro. Con solo un .catch()
+  // ese caso pasaba completamente desapercibido: la rendición quedaba
+  // aprobada pero el aviso por correo fallaba en silencio, sin ni un
+  // console.error que lo delatara.
   db.functions.invoke("notificar-estado-rendicion", {
     body: { rendicion_id: rendicion.id },
+  }).then(({ error }) => {
+    if (error) console.error("No se pudo notificar al empleado:", error);
   }).catch((err) => console.error("No se pudo notificar al empleado:", err));
 
   if (estado === "Aprobado") {
@@ -2174,89 +2568,288 @@ async function registrarCambio(item, rendicionId, campo, valorAnterior, valorNue
   });
 }
 
+// Nombres de campo legibles para el historial (ver mostrarHistorialRendicion).
+const NOMBRE_CAMPO_HISTORIAL = {
+  tipo_item: "Tipo",
+  estado: "Estado",
+  monto: "Monto",
+  descripcion: "Descripción",
+  nombre_proveedor: "Proveedor / Local",
+  rut_proveedor: "RUT proveedor",
+  categoria: "Categoría",
+  cuenta_contable: "Cuenta contable",
+  centro_costo: "Centro de Costo",
+  tipo_documento: "Tipo de documento",
+  nro_documento: "N° de documento",
+  fecha_vencimiento: "Fecha del documento",
+  existe_en_contabilidad: "Existe en contabilidad",
+  comprobante_contable_encontrado: "Comprobante contable encontrado",
+  motivo_rechazo: "Motivo de rechazo",
+};
+
+// Algunos valores guardados son códigos internos (tipo_item, monto) que
+// conviene mostrar en el mismo formato que ve la persona en el resto de la
+// app, no el valor crudo de la base.
+function valorLegibleHistorial(campo, valor) {
+  if (valor === null || valor === undefined || valor === "") return "(vacío)";
+  if (campo === "tipo_item") return tipoItemLabel(valor);
+  if (campo === "monto") return fmtCLP(Number(valor));
+  if (campo === "cuenta_contable") {
+    const nombre = nombreCuenta(valor);
+    return `${valor}${nombre ? " · " + nombre : ""}`;
+  }
+  if (campo === "existe_en_contabilidad" || campo === "comprobante_contable_encontrado") {
+    return valor === "true" ? "Sí" : valor === "false" ? "No" : valor;
+  }
+  return valor;
+}
+
+// Muestra, para TODA la rendición (todos sus ítems, no uno solo), quién
+// cambió qué y cuándo (tabla rendicion_items_historial, alimentada por
+// registrarCambio() y por el trigger de auditoría de cambio de estado).
+// Va al final del detalle, detrás de un botón -- es información de
+// auditoría, no algo que se consulte en el flujo normal de aprobar/editar.
+// Cualquiera que pueda ver la rendición puede ver su historial (misma regla
+// de visibilidad -- RLS -- que para los ítems mismos).
+async function mostrarHistorialRendicion(rendicionId, box) {
+  if (box.dataset.open === "true") { box.innerHTML = ""; box.dataset.open = "false"; return; }
+  box.dataset.open = "true";
+
+  box.innerHTML = "";
+  box.appendChild(el("p", { class: "ocr-status show" }, "Cargando historial..."));
+
+  const { data: historial, error } = await db
+    .from("rendicion_items_historial")
+    .select("*, rendicion_items(descripcion, nombre_proveedor)")
+    .eq("rendicion_id", rendicionId)
+    .order("created_at", { ascending: false });
+
+  // Si en el tiempo que tardó la consulta la persona volvió a hacer clic y
+  // cerró el panel, no lo pisamos -- sin este chequeo el contenido
+  // reaparecía solo después de haberlo cerrado.
+  if (box.dataset.open !== "true") return;
+
+  box.innerHTML = "";
+  if (error) {
+    box.appendChild(el("p", { class: "ocr-status show err" }, mensajeErrorAmigable(error)));
+    return;
+  }
+  if (!historial || !historial.length) {
+    box.appendChild(el("p", { style: "margin:0;color:var(--ink-soft);font-size:0.85rem" }, "Esta rendición no tiene cambios registrados."));
+    return;
+  }
+  box.appendChild(el("div", { style: "display:flex; flex-direction:column; gap:10px;" },
+    historial.map((h) => {
+      const item = h.rendicion_items;
+      const itemLabel = item ? (item.descripcion || item.nombre_proveedor || "Ítem sin descripción") : "Ítem eliminado";
+      return el("div", {
+        style: "border-left:3px solid var(--line); padding-left:10px; font-size:0.82rem; line-height:1.5;",
+      }, [
+        el("p", { style: "margin:0 0 2px; font-weight:600;" }, itemLabel),
+        el("p", { style: "margin:0;" }, [
+          `${NOMBRE_CAMPO_HISTORIAL[h.campo] || h.campo}: `,
+          el("span", { style: "color:var(--ink-soft);" }, valorLegibleHistorial(h.campo, h.valor_anterior)),
+          " → ",
+          valorLegibleHistorial(h.campo, h.valor_nuevo),
+        ]),
+        el("p", { style: "margin:2px 0 0;color:var(--ink-soft);font-size:0.78rem;" },
+          `${h.usuario_nombre || "-"} · ${new Date(h.created_at).toLocaleString("es-CL")}`),
+      ]);
+    })
+  ));
+}
+
 function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   lineWrap.innerHTML = "";
-  const campos = [];
   // Prefijado con el id del ítem: sin esto, editar dos ítems de la misma
   // rendición al mismo tiempo dejaba dos elementos con el mismo id en el DOM.
   const pfx = `edit-${it.id}-`;
+  // El tipo se puede cambiar mientras se edita (ej. se cargó por error como
+  // "Documento electrónico" y en realidad es una "Boleta"): el toggle de
+  // abajo reconstruye los campos de tipo-específico cada vez que cambia,
+  // sin tocar monto/descripción que son comunes a ambos tipos.
+  let tipoEditado = it.tipo_item;
+  // Cambiar el tipo (Documento electrónico <-> Boleta) es una corrección de
+  // clasificación contable, no algo que un empleado deba poder hacer sobre
+  // su propio gasto -- solo aprobador/admin ven el selector.
+  const puedeCambiarTipo = esAprobadorViewer;
 
-  if (it.tipo_item === "ConDocumento") {
-    const nombreProv = fieldInput(`${pfx}nombreprov`, "Nombre del proveedor", "text");
-    nombreProv.querySelector("input").value = it.nombre_proveedor || "";
-    const rutProv = fieldInput(`${pfx}rut`, "RUT del proveedor", "text");
-    rutProv.querySelector("input").value = it.rut_proveedor || "";
-    campos.push(el("div", { class: "field-row" }, [nombreProv, rutProv]));
+  // Un borrador por tipo, sembrado desde el ítem original: así, si alguien
+  // alterna entre pestañas varias veces antes de guardar, lo que haya
+  // tecleado en una no se pierde al mirar la otra y volver (antes se releía
+  // siempre desde el ítem original, tirando a la basura cualquier edición
+  // sin guardar). Documento electrónico también guarda ahora tipo/N°/fecha
+  // de documento -- antes "Editar" nunca los mostraba, así que al volver de
+  // "Boleta" a "Documento electrónico" quedaban perdidos para siempre (el
+  // ítem quedaba con tipo_documento null sin ninguna forma de corregirlo).
+  const draftCon = {
+    nombreProveedor: it.tipo_item === "ConDocumento" ? (it.nombre_proveedor || "") : "",
+    rutProveedor: it.tipo_item === "ConDocumento" ? (it.rut_proveedor || "") : "",
+    cuentaContable: it.tipo_item === "ConDocumento" ? (it.cuenta_contable || "") : "",
+    tipoDocumento: it.tipo_item === "ConDocumento" && it.tipo_documento ? it.tipo_documento : TIPOS_DOCUMENTO[0],
+    nroDocumento: it.tipo_item === "ConDocumento" ? (it.nro_documento || "") : "",
+    fechaVencimiento: it.tipo_item === "ConDocumento" ? (it.fecha_vencimiento || "") : "",
+  };
+  const draftSin = {
+    nombreProveedor: it.tipo_item === "SinDocumento" ? (it.nombre_proveedor || "") : "",
+    categoria: it.tipo_item === "SinDocumento" ? it.categoria : null,
+    cuentaContable: it.tipo_item === "SinDocumento" ? (it.cuenta_contable || "") : "",
+  };
+  // El Centro de Costo es la misma unidad de negocio física sea cual sea el
+  // tipo, así que se comparte en vez de duplicarse por borrador.
+  let centroCostoDraft = it.centro_costo || "";
 
-    if (esAprobadorViewer) {
-      const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
-      const cuentaInput = cuenta.querySelector("input");
-      cuentaInput.value = it.cuenta_contable || "";
-      const nombreHint = el("p", { class: "ocr-status show", id: `${pfx}cuenta-nombre` }, nombreCuenta(cuentaInput.value));
-      cuentaInput.addEventListener("input", () => { nombreHint.textContent = nombreCuenta(cuentaInput.value) || "Cuenta no reconocida"; });
-      cuenta.appendChild(nombreHint);
-      campos.push(el("div", { class: "field-row" }, [cuenta]));
+  const toggle = puedeCambiarTipo
+    ? el("div", { class: "toggle-group" }, [
+        el("button", { type: "button", "data-tipo": "ConDocumento" }, "Documento electrónico"),
+        el("button", { type: "button", "data-tipo": "SinDocumento" }, "Boleta"),
+      ])
+    : null;
+  const camposTipo = el("div");
+
+  // Vuelca lo que haya en pantalla al borrador del tipo que se está dejando,
+  // antes de reconstruir los campos con el otro tipo.
+  function guardarDraftActual() {
+    const ccInput = lineWrap.querySelector(`#${pfx}cc`);
+    if (ccInput) centroCostoDraft = ccInput.value;
+    if (tipoEditado === "ConDocumento") {
+      const v = (sel) => lineWrap.querySelector(sel)?.value;
+      draftCon.nombreProveedor = v(`#${pfx}nombreprov`)?.trim() ?? draftCon.nombreProveedor;
+      draftCon.rutProveedor = v(`#${pfx}rut`)?.trim() ?? draftCon.rutProveedor;
+      if (esAprobadorViewer) draftCon.cuentaContable = v(`#${pfx}cuenta`)?.trim() ?? draftCon.cuentaContable;
+      draftCon.tipoDocumento = v(`#${pfx}tipodoc`) ?? draftCon.tipoDocumento;
+      draftCon.nroDocumento = v(`#${pfx}nrodoc`)?.trim() ?? draftCon.nroDocumento;
+      draftCon.fechaVencimiento = v(`#${pfx}venc`) ?? draftCon.fechaVencimiento;
+    } else {
+      const v = (sel) => lineWrap.querySelector(sel)?.value;
+      draftSin.nombreProveedor = v(`#${pfx}nombreprov2`)?.trim() ?? draftSin.nombreProveedor;
+      draftSin.categoria = v(`#${pfx}categoria`) ?? draftSin.categoria;
+      draftSin.cuentaContable = v(`#${pfx}cuenta`)?.trim() ?? draftSin.cuentaContable;
     }
-    const opcionesCCDoc = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
-    if (it.centro_costo && !opcionesCCDoc.includes(it.centro_costo)) opcionesCCDoc.unshift(it.centro_costo);
-    const ccDoc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCCDoc);
-    ccDoc.querySelector("select").value = it.centro_costo || opcionesCCDoc[0];
-    campos.push(el("div", { class: "field-row" }, [ccDoc]));
-  } else {
-    const nombreProv2 = fieldInput(`${pfx}nombreprov2`, "Proveedor / Local", "text");
-    nombreProv2.querySelector("input").value = it.nombre_proveedor || "";
-    campos.push(el("div", { class: "field-row" }, [nombreProv2]));
-
-    const catSelect = fieldSelectCategoria(`${pfx}categoria`);
-    const sel = catSelect.querySelector("select");
-    if ([...sel.options].some((o) => o.value === it.categoria)) sel.value = it.categoria;
-    const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
-    cuenta.querySelector("input").value = it.cuenta_contable || "";
-    cuenta.querySelector("input").readOnly = true;
-    sel.addEventListener("change", () => {
-      const found = CATEGORIAS_GASTO.find((c) => c.nombre === sel.value);
-      cuenta.querySelector("input").value = found ? found.cuenta : "";
-    });
-    campos.push(el("div", { class: "field-row" }, [catSelect, cuenta]));
-    const opcionesCC = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
-    if (it.centro_costo && !opcionesCC.includes(it.centro_costo)) opcionesCC.unshift(it.centro_costo);
-    const cc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCC);
-    cc.querySelector("select").value = it.centro_costo || opcionesCC[0];
-    campos.push(el("div", { class: "field-row" }, [cc]));
   }
+
+  function renderCamposTipo() {
+    camposTipo.innerHTML = "";
+    if (toggle) toggle.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.tipo === tipoEditado));
+
+    const opcionesCC = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
+    if (centroCostoDraft && !opcionesCC.includes(centroCostoDraft)) opcionesCC.unshift(centroCostoDraft);
+
+    if (tipoEditado === "ConDocumento") {
+      const nombreProv = fieldInput(`${pfx}nombreprov`, "Nombre del proveedor", "text");
+      nombreProv.querySelector("input").value = draftCon.nombreProveedor;
+      const rutProv = fieldInput(`${pfx}rut`, "RUT del proveedor", "text");
+      rutProv.querySelector("input").value = draftCon.rutProveedor;
+      camposTipo.appendChild(el("div", { class: "field-row" }, [nombreProv, rutProv]));
+
+      const tipoDoc = fieldSelect(`${pfx}tipodoc`, "Tipo de documento", TIPOS_DOCUMENTO);
+      tipoDoc.querySelector("select").value = draftCon.tipoDocumento;
+      const nroDoc = fieldInput(`${pfx}nrodoc`, "N° de documento", "text");
+      nroDoc.querySelector("input").value = draftCon.nroDocumento;
+      camposTipo.appendChild(el("div", { class: "field-row" }, [tipoDoc, nroDoc]));
+
+      const venc = fieldInput(`${pfx}venc`, "Fecha del documento", "date");
+      venc.querySelector("input").value = draftCon.fechaVencimiento || "";
+
+      if (esAprobadorViewer) {
+        const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
+        const cuentaInput = cuenta.querySelector("input");
+        cuentaInput.value = draftCon.cuentaContable;
+        const nombreHint = el("p", { class: "ocr-status show", id: `${pfx}cuenta-nombre` }, nombreCuenta(cuentaInput.value));
+        cuentaInput.addEventListener("input", () => { nombreHint.textContent = nombreCuenta(cuentaInput.value) || "Cuenta no reconocida"; });
+        cuenta.appendChild(nombreHint);
+        camposTipo.appendChild(el("div", { class: "field-row" }, [venc, cuenta]));
+      } else {
+        camposTipo.appendChild(el("div", { class: "field-row" }, [venc]));
+      }
+      const ccDoc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCC);
+      ccDoc.querySelector("select").value = centroCostoDraft || opcionesCC[0];
+      camposTipo.appendChild(el("div", { class: "field-row" }, [ccDoc]));
+    } else {
+      const nombreProv2 = fieldInput(`${pfx}nombreprov2`, "Proveedor / Local", "text");
+      nombreProv2.querySelector("input").value = draftSin.nombreProveedor;
+      camposTipo.appendChild(el("div", { class: "field-row" }, [nombreProv2]));
+
+      const catSelect = fieldSelectCategoria(`${pfx}categoria`);
+      const sel = catSelect.querySelector("select");
+      const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
+      if (draftSin.categoria && [...sel.options].some((o) => o.value === draftSin.categoria)) {
+        sel.value = draftSin.categoria;
+        cuenta.querySelector("input").value = draftSin.cuentaContable || "";
+      } else {
+        const found = CATEGORIAS_GASTO.find((c) => c.nombre === sel.value);
+        cuenta.querySelector("input").value = found ? found.cuenta : "";
+      }
+      cuenta.querySelector("input").readOnly = true;
+      sel.addEventListener("change", () => {
+        const found = CATEGORIAS_GASTO.find((c) => c.nombre === sel.value);
+        cuenta.querySelector("input").value = found ? found.cuenta : "";
+      });
+      camposTipo.appendChild(el("div", { class: "field-row" }, [catSelect, cuenta]));
+      const cc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCC);
+      cc.querySelector("select").value = centroCostoDraft || opcionesCC[0];
+      camposTipo.appendChild(el("div", { class: "field-row" }, [cc]));
+    }
+  }
+
+  if (toggle) {
+    toggle.querySelectorAll("button").forEach((b) => {
+      b.addEventListener("click", () => {
+        if (b.dataset.tipo === tipoEditado) return;
+        guardarDraftActual();
+        tipoEditado = b.dataset.tipo;
+        renderCamposTipo();
+      });
+    });
+  }
+  renderCamposTipo();
 
   const monto = fieldInputMoney(`${pfx}monto`, "Monto");
   monto.querySelector("input").value = Number(it.monto || 0).toLocaleString("es-CL");
   const desc = fieldInput(`${pfx}desc`, "Descripción", "text");
   desc.querySelector("input").value = it.descripcion || "";
-  campos.push(el("div", { class: "field-row" }, [monto, desc]));
 
-  campos.forEach((c) => lineWrap.appendChild(c));
+  if (toggle) lineWrap.appendChild(toggle);
+  lineWrap.appendChild(camposTipo);
+  lineWrap.appendChild(el("div", { class: "field-row" }, [monto, desc]));
 
   const acciones = el("div", { style: "display:flex; gap:8px;" }, [
     el("button", {
       class: "btn btn-primary", type: "button",
       onclick: async () => {
         const cambios = {
+          tipo_item: tipoEditado,
           monto: parseMoneyValue(lineWrap.querySelector(`#${pfx}monto`).value),
           descripcion: lineWrap.querySelector(`#${pfx}desc`).value.trim(),
+          centro_costo: lineWrap.querySelector(`#${pfx}cc`).value.trim(),
         };
-        if (it.tipo_item === "ConDocumento") {
+        if (tipoEditado === "ConDocumento") {
           const rutEditado = formatearRut(lineWrap.querySelector(`#${pfx}rut`).value.trim());
           if (rutEditado && !validarRut(rutEditado)) { toast("Ese RUT de proveedor no es válido."); return; }
           cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov`).value.trim();
           cambios.rut_proveedor = rutEditado;
+          cambios.tipo_documento = lineWrap.querySelector(`#${pfx}tipodoc`).value;
+          cambios.nro_documento = lineWrap.querySelector(`#${pfx}nrodoc`).value.trim();
+          cambios.fecha_vencimiento = lineWrap.querySelector(`#${pfx}venc`).value || null;
           if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
-          cambios.centro_costo = lineWrap.querySelector(`#${pfx}cc`).value.trim();
+          // Sale de "Boleta": la categoría ya no aplica.
+          cambios.categoria = null;
         } else {
           cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov2`).value.trim();
           cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`).value;
           cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
-          cambios.centro_costo = lineWrap.querySelector(`#${pfx}cc`).value.trim();
+          // Sale de "Documento electrónico": estos campos ya no aplican y no
+          // deben quedar reflejando un tipo de documento que ya no es este ítem.
+          cambios.rut_proveedor = null;
+          cambios.tipo_documento = null;
+          cambios.nro_documento = null;
+          cambios.fecha_vencimiento = null;
+          cambios.existe_en_contabilidad = null;
+          cambios.comprobante_contable_encontrado = null;
         }
 
-        const { error } = await db.from("rendicion_items").update(cambios).eq("id", it.id);
-        if (error) { toast("No se pudo guardar: " + error.message); return; }
+        const res = await updateChecked("rendicion_items", it.id, cambios);
+        if (!res.ok) { toast(res.mensaje); return; }
 
         // Solo se audita lo que realmente formaba parte del formulario editado
         // (p.ej. un empleado no puede tocar cuenta_contable, así que no debe
@@ -2547,7 +3140,7 @@ async function generarInformePDF(rendicion, items) {
         const esCon = it.tipo_item === "ConDocumento";
         return [
           i + 1,
-          esCon ? "Documento electrónico" : "Boleta",
+          tipoItemLabel(it.tipo_item),
           esCon ? (it.nombre_proveedor || "-") : ([it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
           esCon ? (it.rut_proveedor || "-") : "-",
           esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-",

@@ -132,6 +132,7 @@
       <div class="user">
         <span id="user-name"></span>
         <button class="btn btn-ghost" id="btn-admin-usuarios" style="display:none">Usuarios</button>
+        <button class="btn btn-ghost" id="btn-admin-plantillas" style="display:none">Plantillas</button>
         <button class="btn btn-ghost" id="btn-theme-toggle" title="Cambiar tema" type="button">🌙</button>
         <button class="btn btn-ghost" id="btn-logout">Salir</button>
       </div>
@@ -311,7 +312,32 @@
       <div id="view-admin" class="view">
         <button class="back-link" data-back="dashboard">&larr; Volver</button>
         <div class="hero-row"><div><h1>Usuarios</h1><p>Administra los permisos de cada persona del grupo</p></div></div>
+        <div class="filter-bar" id="filter-bar-usuarios">
+          <div class="field">
+            <label>Rol</label>
+            <select id="filtro-usuarios-rol">
+              <option value="">Todos</option>
+              <option value="empleado">empleado</option>
+              <option value="aprobador">aprobador</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Buscar</label>
+            <input type="text" id="filtro-usuarios-texto" placeholder="Nombre o RUT..." />
+          </div>
+        </div>
         <div class="card-list" id="list-usuarios"></div>
+      </div>
+
+      <!-- ADMINISTRACION DE PLANTILLAS DE PERFIL -->
+      <div id="view-plantillas" class="view">
+        <button class="back-link" data-back="admin">&larr; Volver</button>
+        <div class="hero-row">
+          <div><h1>Plantillas de perfil</h1><p>Grupos de cuentas contables (ej. Analista, Comercial RFA) para asignar a varias personas a la vez</p></div>
+          <button class="btn btn-primary" id="btn-nueva-plantilla" type="button">Nueva plantilla</button>
+        </div>
+        <div class="card-list" id="list-plantillas"></div>
       </div>
 
     </div>
