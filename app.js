@@ -238,11 +238,20 @@ function renderRoute(state) {
   loadDashboard();
 }
 window.addEventListener("popstate", (e) => renderRoute(e.state));
+let toastTimeoutId = null;
 function toast(msg) {
   const t = document.getElementById("toast");
   t.textContent = msg;
   t.classList.add("show");
-  setTimeout(() => t.classList.remove("show"), 2600);
+  // Duración proporcional al largo del mensaje -- antes eran siempre 2.6s
+  // fijos, y los resúmenes de "se guardaron X de Y ítems: <errores>" (que
+  // pueden ser bastante largos) se alcanzaban a cortar antes de leerlos.
+  // Si se llama toast() de nuevo antes de que se cumpla el timeout anterior,
+  // hay que cancelarlo -- si no, el toast viejo podía ocultar el nuevo
+  // mensaje a mitad de camino.
+  if (toastTimeoutId) clearTimeout(toastTimeoutId);
+  const duracion = Math.min(9000, Math.max(2600, msg.length * 60));
+  toastTimeoutId = setTimeout(() => { t.classList.remove("show"); toastTimeoutId = null; }, duracion);
 }
 
 // Traduce los errores técnicos más comunes de Supabase/Postgres a un
@@ -270,6 +279,18 @@ function el(tag, attrs = {}, children = []) {
     else if (c) e.appendChild(c);
   });
   return e;
+}
+
+// Fila de tabla que abre un detalle al hacer clic -- una <tr> con onclick
+// por sí sola no es alcanzable con teclado (no tiene tabindex ni responde a
+// Enter), así que quedaba invisible para navegación por teclado. Esto la
+// hace tabulable y activable con Enter, igual que un link/botón real.
+function filaClickable(onActivar, celdas) {
+  return el("tr", {
+    class: "row-clickable", tabindex: "0",
+    onclick: onActivar,
+    onkeydown: (e) => { if (e.key === "Enter") onActivar(); },
+  }, celdas);
 }
 
 // ------------------------------------------------------------
@@ -609,7 +630,15 @@ function wireDashboard() {
   document.getElementById("btn-nueva").addEventListener("click", () => openNuevaRendicion());
   document.getElementById("btn-solicitar-fondos").addEventListener("click", () => openNuevaSolicitud());
   document.getElementById("btn-admin-usuarios").addEventListener("click", () => openAdminUsuarios());
-  document.getElementById("btn-exportar-excel").addEventListener("click", exportarExcel);
+  const btnExportarExcel = document.getElementById("btn-exportar-excel");
+  btnExportarExcel.addEventListener("click", async () => {
+    btnExportarExcel.disabled = true;
+    const textoOriginal = btnExportarExcel.textContent;
+    btnExportarExcel.textContent = "Generando...";
+    await exportarExcel();
+    btnExportarExcel.disabled = false;
+    btnExportarExcel.textContent = textoOriginal;
+  });
   document.getElementById("btn-admin-plantillas").addEventListener("click", () => openAdminPlantillas());
   document.getElementById("btn-comprobante-rango").addEventListener("click", () => {
     document.getElementById("panel-rango").style.display = "block";
@@ -618,11 +647,14 @@ function wireDashboard() {
     document.getElementById("panel-rango").style.display = "none";
     document.getElementById("rango-status").className = "ocr-status";
   });
-  document.getElementById("btn-generar-rango").addEventListener("click", () => {
+  const btnGenerarRango = document.getElementById("btn-generar-rango");
+  btnGenerarRango.addEventListener("click", async () => {
     const desde = document.getElementById("rango-desde").value;
     const hasta = document.getElementById("rango-hasta").value;
     if (!desde || !hasta) { toast("Elige ambas fechas."); return; }
-    generarComprobantesPorRango(desde, hasta);
+    btnGenerarRango.disabled = true;
+    await generarComprobantesPorRango(desde, hasta);
+    btnGenerarRango.disabled = false;
   });
   document.querySelectorAll(".back-link").forEach((b) =>
     b.addEventListener("click", () => history.back())
@@ -663,10 +695,6 @@ async function loadDashboard() {
     .order("created_at", { ascending: false });
   dashboardData.mias = mias || [];
 
-  const pendiente = dashboardData.mias.filter((r) => r.estado === "Pendiente").reduce((s, r) => s + Number(r.monto_total), 0);
-  const aprobado = dashboardData.mias.filter((r) => r.estado === "Aprobado").reduce((s, r) => s + Number(r.monto_total), 0);
-  renderStats(pendiente, aprobado, dashboardData.mias.length);
-
   const { data: solicitudesMias } = await db
     .from("solicitudes_fondos")
     .select("*")
@@ -699,6 +727,22 @@ async function loadDashboard() {
     dashboardData.solicitudesAprobacion = [];
   }
 
+  // El admin ve totales de TODA la empresa (ya tiene los datos: dashboardData.aprobaciones
+  // trae cada rendición, sin filtrar por estado, cuando el rol es admin) --
+  // antes siempre se mostraban los propios, aunque quien mirara fuera admin
+  // y le sirviera más ver el conjunto completo de un vistazo.
+  const esAdmin = currentProfile?.rol === "admin";
+  const paraStats = esAdmin ? dashboardData.aprobaciones : dashboardData.mias;
+  const pendienteStats = paraStats.filter((r) => r.estado === "Pendiente");
+  const pendiente = pendienteStats.reduce((s, r) => s + Number(r.monto_total), 0);
+  const aprobado = paraStats.filter((r) => r.estado === "Aprobado").reduce((s, r) => s + Number(r.monto_total), 0);
+  // Cuántas de las Pendientes llevan más de 7 días esperando -- antes no
+  // había ninguna forma de detectar un cuello de botella sin abrir cada
+  // rendición a mirar la fecha una por una.
+  const haceUnaSemana = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const antiguas = pendienteStats.filter((r) => new Date(r.created_at).getTime() < haceUnaSemana).length;
+  renderStats(pendiente, aprobado, paraStats.length, esAdmin, antiguas);
+
   applyDashboardFilters();
 }
 
@@ -723,21 +767,27 @@ function applyDashboardFilters() {
   renderListSolicitudes(document.getElementById("list-solicitudes-aprobacion"), dashboardData.solicitudesAprobacion.filter(pasaFiltroSolicitud), true);
 }
 
-function renderStats(pendiente, aprobado, count) {
+function renderStats(pendiente, aprobado, count, esAdmin, antiguas) {
   const row = document.getElementById("stat-row");
   row.innerHTML = "";
   row.appendChild(el("div", { class: "stat-card" }, [
-    el("div", { class: "label" }, "Rendiciones"),
+    el("div", { class: "label" }, esAdmin ? "Rendiciones (toda la empresa)" : "Rendiciones"),
     el("div", { class: "value" }, String(count)),
   ]));
   row.appendChild(el("div", { class: "stat-card blue" }, [
-    el("div", { class: "label" }, "Pendiente de aprobar"),
+    el("div", { class: "label" }, esAdmin ? "Pendiente de aprobar (empresa)" : "Pendiente de aprobar"),
     el("div", { class: "value" }, fmtCLP(pendiente)),
   ]));
   row.appendChild(el("div", { class: "stat-card teal" }, [
-    el("div", { class: "label" }, "Aprobado"),
+    el("div", { class: "label" }, esAdmin ? "Aprobado (empresa)" : "Aprobado"),
     el("div", { class: "value" }, fmtCLP(aprobado)),
   ]));
+  if (antiguas > 0) {
+    row.appendChild(el("div", { class: "stat-card", style: "border:1px solid var(--warn);" }, [
+      el("div", { class: "label" }, "Pendientes hace +7 días"),
+      el("div", { class: "value", style: "color:var(--warn);" }, String(antiguas)),
+    ]));
+  }
 }
 
 function renderList(container, rows, showEmpleado) {
@@ -774,7 +824,7 @@ function renderList(container, rows, showEmpleado) {
       el("td", { class: "center" }, el("span", { class: "pill " + r.estado }, r.estado)),
     );
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
-    tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalle(r.id) }, celdas));
+    tbody.appendChild(filaClickable(() => openDetalle(r.id), celdas));
   });
 
   container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
@@ -814,7 +864,7 @@ function renderListSolicitudes(container, rows, showEmpleado) {
       el("td", { class: "center" }, el("span", { class: "pill " + s.estado }, s.estado)),
     );
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
-    tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalleSolicitud(s.id) }, celdas));
+    tbody.appendChild(filaClickable(() => openDetalleSolicitud(s.id), celdas));
   });
 
   container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
@@ -852,6 +902,8 @@ async function openAdminUsuarios(pushHistory = true) {
     list.appendChild(el("div", { class: "empty-state" }, "No hay usuarios registrados todavía."));
     return;
   }
+
+  document.getElementById("btn-ir-plantillas").onclick = () => openAdminPlantillas();
 
   const filtroRol = document.getElementById("filtro-usuarios-rol");
   const filtroTexto = document.getElementById("filtro-usuarios-texto");
@@ -891,8 +943,8 @@ async function openAdminUsuarios(pushHistory = true) {
           select.value = u.rol;
           return;
         }
-        const { error: updErr } = await db.from("profiles").update({ rol: nuevoRol }).eq("id", u.id);
-        if (updErr) { toast("No se pudo actualizar: " + updErr.message); select.value = u.rol; }
+        const res = await updateChecked("profiles", u.id, { rol: nuevoRol });
+        if (!res.ok) { toast(res.mensaje); select.value = u.rol; }
         else { toast(`${u.nombre} ahora es ${nuevoRol}.`); u.rol = nuevoRol; }
       });
 
@@ -906,8 +958,8 @@ async function openAdminUsuarios(pushHistory = true) {
       selectPlantilla.value = u.plantilla_id || "";
       selectPlantilla.addEventListener("change", async () => {
         const nuevaPlantillaId = selectPlantilla.value || null;
-        const { error: updErr } = await db.from("profiles").update({ plantilla_id: nuevaPlantillaId }).eq("id", u.id);
-        if (updErr) { toast("No se pudo actualizar: " + updErr.message); selectPlantilla.value = u.plantilla_id || ""; return; }
+        const res = await updateChecked("profiles", u.id, { plantilla_id: nuevaPlantillaId });
+        if (!res.ok) { toast(res.mensaje); selectPlantilla.value = u.plantilla_id || ""; return; }
         u.plantilla_id = nuevaPlantillaId;
         toast(`Perfil de ${u.nombre} actualizado.`);
       });
@@ -949,8 +1001,8 @@ async function openAdminUsuarios(pushHistory = true) {
           ? `¿Reactivar a ${u.nombre}? Podrá volver a iniciar sesión.`
           : `¿Desactivar a ${u.nombre}? No podrá volver a iniciar sesión hasta que la reactives. Su historial de rendiciones no se toca.`;
         if (!confirm(mensaje)) return;
-        const { error: updErr } = await db.from("profiles").update({ activo: nuevoActivo }).eq("id", u.id);
-        if (updErr) { toast("No se pudo actualizar: " + updErr.message); return; }
+        const res = await updateChecked("profiles", u.id, { activo: nuevoActivo });
+        if (!res.ok) { toast(res.mensaje); return; }
         u.activo = nuevoActivo;
         btnActivo.textContent = nuevoActivo ? "Desactivar" : "Reactivar";
         toast(`${u.nombre} ${nuevoActivo ? "reactivado" : "desactivado"}.`);
@@ -999,8 +1051,8 @@ function renderEditarPerfilPanel(cell, usuario, nombreCell) {
       const cargo = cargoField.querySelector("input").value.trim() || null;
       const empresaElegida = empresaField.querySelector("select").value;
       const empresa_default = empresaElegida === "(Sin asignar)" ? null : empresaElegida;
-      const { error } = await db.from("profiles").update({ nombre, rut, cargo, empresa_default }).eq("id", usuario.id);
-      if (error) { toast("No se pudo guardar: " + error.message); return; }
+      const res = await updateChecked("profiles", usuario.id, { nombre, rut, cargo, empresa_default });
+      if (!res.ok) { toast(res.mensaje); return; }
       usuario.nombre = nombre;
       usuario.rut = rut;
       usuario.cargo = cargo;
@@ -1107,9 +1159,10 @@ function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = 
         if (error) { toast("No se pudo asignar: " + error.message); checkbox.checked = false; return; }
         cuentasActuales.add(c.cuenta);
       } else {
-        const { error } = await db.from("perfil_cuentas")
-          .delete().eq("profile_id", usuario.id).eq("cuenta_cod", c.cuenta);
-        if (error) { toast("No se pudo quitar: " + error.message); checkbox.checked = true; return; }
+        const { data: borrada, error } = await db.from("perfil_cuentas")
+          .delete().eq("profile_id", usuario.id).eq("cuenta_cod", c.cuenta).select();
+        if (error) { toast(mensajeErrorAmigable(error)); checkbox.checked = true; return; }
+        if (!borrada || !borrada.length) { toast("No tienes permiso para quitar esta cuenta."); checkbox.checked = true; return; }
         cuentasActuales.delete(c.cuenta);
       }
       contador.textContent = `${cuentasActuales.size} seleccionadas`;
@@ -1241,8 +1294,8 @@ async function openAdminPlantillas(pushHistory = true) {
             onclick: async () => {
               const nuevoNombre = campo.querySelector("input").value.trim();
               if (!nuevoNombre) { toast("El nombre no puede quedar vacío."); return; }
-              const { error: updErr } = await db.from("perfil_plantillas").update({ nombre: nuevoNombre }).eq("id", p.id);
-              if (updErr) { toast("No se pudo renombrar: " + updErr.message); return; }
+              const res = await updateChecked("perfil_plantillas", p.id, { nombre: nuevoNombre });
+              if (!res.ok) { toast(res.mensaje); return; }
               p.nombre = nuevoNombre;
               nombreCell.textContent = nuevoNombre;
               filaExtra.style.display = "none";
@@ -1260,8 +1313,9 @@ async function openAdminPlantillas(pushHistory = true) {
         ? `¿Eliminar "${p.nombre}"? ${personas} persona(s) la tienen asignada y perderían esas cuentas (conservan sus cuentas individuales, si tienen). No se puede deshacer.`
         : `¿Eliminar "${p.nombre}"? No se puede deshacer.`;
       if (!confirm(aviso)) return;
-      const { error: delErr } = await db.from("perfil_plantillas").delete().eq("id", p.id);
-      if (delErr) { toast("No se pudo eliminar: " + delErr.message); return; }
+      const { data: borrada, error: delErr } = await db.from("perfil_plantillas").delete().eq("id", p.id).select();
+      if (delErr) { toast(mensajeErrorAmigable(delErr)); return; }
+      if (!borrada || !borrada.length) { toast("No tienes permiso para eliminar esta plantilla, o ya no existe."); return; }
       toast("Plantilla eliminada.");
       openAdminPlantillas(false);
     });
@@ -1303,9 +1357,10 @@ function renderPlantillaCuentasPanel(panel, plantilla, cuentasActuales, cuentasC
         if (error) { toast("No se pudo asignar: " + error.message); checkbox.checked = false; return; }
         cuentasActuales.add(c.cuenta);
       } else {
-        const { error } = await db.from("plantilla_cuentas")
-          .delete().eq("plantilla_id", plantilla.id).eq("cuenta_cod", c.cuenta);
-        if (error) { toast("No se pudo quitar: " + error.message); checkbox.checked = true; return; }
+        const { data: borrada, error } = await db.from("plantilla_cuentas")
+          .delete().eq("plantilla_id", plantilla.id).eq("cuenta_cod", c.cuenta).select();
+        if (error) { toast(mensajeErrorAmigable(error)); checkbox.checked = true; return; }
+        if (!borrada || !borrada.length) { toast("No tienes permiso para quitar esta cuenta."); checkbox.checked = true; return; }
         cuentasActuales.delete(c.cuenta);
       }
       contador.textContent = `${cuentasActuales.size} seleccionadas`;
@@ -1563,7 +1618,10 @@ async function analizarComprobante(id, file, statusEl) {
     statusEl.className = "ocr-status show ok";
   } catch (err) {
     console.error("Error en OCR:", err);
-    statusEl.textContent = "No se pudo leer el comprobante automáticamente. Completa los datos a mano.";
+    // Antes se mostraba siempre el mismo mensaje genérico, así que un PDF
+    // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
+    // se veía exactamente igual que cualquier otro problema.
+    statusEl.textContent = `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano.`;
     statusEl.className = "ocr-status show err";
   }
 }
@@ -1601,7 +1659,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     statusEl.className = "ocr-status show ok";
   } catch (err) {
     console.error("Error en OCR:", err);
-    statusEl.textContent = "No se pudo leer el comprobante automáticamente. Completa los datos a mano.";
+    statusEl.textContent = `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano.`;
     statusEl.className = "ocr-status show err";
   }
 }
@@ -1667,7 +1725,7 @@ function buildSinDocumentoFields(id) {
 
 function fieldInput(id, label, type, placeholder = "") {
   return el("div", { class: "field" }, [
-    el("label", {}, label),
+    el("label", { for: id }, label),
     el("input", { id, type, placeholder }),
   ]);
 }
@@ -1678,20 +1736,20 @@ function fieldInputMoney(id, label) {
     input.value = raw ? Number(raw).toLocaleString("es-CL") : "";
     recalcTotal();
   });
-  return el("div", { class: "field" }, [el("label", {}, label), input]);
+  return el("div", { class: "field" }, [el("label", { for: id }, label), input]);
 }
 function parseMoneyValue(str) {
   return Number(String(str || "").replace(/\D/g, "")) || 0;
 }
 function fieldFile(id, label) {
   return el("div", { class: "field" }, [
-    el("label", {}, label),
+    el("label", { for: id }, label),
     el("input", { id, type: "file", accept: "image/*,application/pdf" }),
   ]);
 }
 function fieldSelect(id, label, options) {
   const select = el("select", { id }, options.map((o) => el("option", { value: o }, o)));
-  return el("div", { class: "field" }, [el("label", {}, label), select]);
+  return el("div", { class: "field" }, [el("label", { for: id }, label), select]);
 }
 function fieldSelectCategoria(id) {
   const filtradas = cuentasPermitidas
@@ -1699,7 +1757,7 @@ function fieldSelectCategoria(id) {
     : CATEGORIAS_GASTO;
   const opciones = filtradas.length ? filtradas : CATEGORIAS_GASTO;
   const select = el("select", { id }, opciones.map((c) => el("option", { value: c.nombre }, c.nombre)));
-  return el("div", { class: "field" }, [el("label", {}, "Categoría del gasto"), select]);
+  return el("div", { class: "field" }, [el("label", { for: id }, "Categoría del gasto"), select]);
 }
 
 // Nombres de columna reales de la tabla "movimientos" (proyecto de contabilidad, solo lectura).
@@ -1769,18 +1827,27 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     const cuenta = (match && match[MOVIMIENTOS_COLS.cuentaCod]) || CUENTA_POR_TIPO_DOC[item.tipo_documento];
     const comprobante = (match && match[MOVIMIENTOS_COLS.comprobante]) || null;
 
+    // Escribir primero, mostrar el resultado recién si de verdad quedó
+    // guardado -- antes se pintaba el ✔ aunque el update no hubiera tocado
+    // ninguna fila (RLS bloqueándolo en silencio), y al recargar la página
+    // el ítem volvía a aparecer sin verificar sin ninguna explicación.
+    const res = await updateChecked("rendicion_items", item.id, {
+      existe_en_contabilidad: !!match,
+      cuenta_contable: cuenta,
+      comprobante_contable_encontrado: comprobante,
+    });
+    if (!res.ok) {
+      box.className = "verify-box show err";
+      box.textContent = res.mensaje;
+      return;
+    }
+    item.existe_en_contabilidad = !!match;
+    item.cuenta_contable = cuenta;
+
     box.className = "verify-box show " + (match ? "ok" : "no");
     box.textContent = match
       ? `✔ Registrada en contabilidad · Cuenta ${cuenta}`
       : "✘ Todavía no aparece registrada en contabilidad.";
-
-    await db.from("rendicion_items").update({
-      existe_en_contabilidad: !!match,
-      cuenta_contable: cuenta,
-      comprobante_contable_encontrado: comprobante,
-    }).eq("id", item.id);
-    item.existe_en_contabilidad = !!match;
-    item.cuenta_contable = cuenta;
   } catch (err) {
     box.className = "verify-box show err";
     box.textContent = "No se pudo verificar (revisa los nombres de columnas de 'movimientos').";
@@ -1891,41 +1958,37 @@ async function submitRendicion() {
     if (!solicitudFondoId) { toast("Selecciona el fondo (solicitud aprobada) que estás rindiendo."); return; }
   }
 
-  const montoTotal = items.reduce((s, i) => s + i.monto, 0);
   const btn = document.getElementById("btn-guardar-rendicion");
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Guardando...';
 
   try {
-    const { data: rendicion, error: errR } = await db
-      .from("rendiciones")
-      .insert({
-        empleado_id: currentUser.id,
-        empleado_nombre: currentProfile?.nombre || currentUser.email,
-        rut_empleado: currentProfile?.rut || null,
-        tipo_rendicion: tipoRendicion,
-        empresa: empresaRendicion,
-        monto_total: montoTotal,
-        estado: "Pendiente",
-        comentario,
-        solicitud_fondo_id: solicitudFondoId,
-      })
-      .select()
-      .single();
-    if (errR) throw errR;
-
-    // Se recalcula el total según lo que REALMENTE queda guardado -- si
-    // falla la subida de un comprobante o el insert de un ítem, ese ítem
-    // se descarta (nunca se guarda "aprobable" sin su respaldo obligatorio)
-    // y el monto_total no debe incluirlo.
-    let montoRealGuardado = 0;
-    let itemsGuardados = 0;
+    // Subimos los comprobantes ANTES de crear la rendición -- así, si todos
+    // fallan (red, un nombre de archivo raro, etc.), nunca se llega a
+    // insertar la cabecera y no se quema un folio en el intento. Antes se
+    // creaba la cabecera primero: cada reintento fallido dejaba una
+    // rendición fantasma en $0 Y el número de folio se perdía para siempre
+    // (una secuencia autoincremental de Postgres no reutiliza los números
+    // de filas borradas).
+    const rendicionId = crypto.randomUUID();
+    const itemsConAdjunto = [];
     const erroresItems = [];
     for (const [idx, item] of items.entries()) {
-      let adjuntoUrl = null;
       const file = item._fotoInput?.files?.[0];
+      delete item._fotoInput;
+      let adjuntoUrl = null;
       if (file) {
-        const path = `${currentUser.id}/${rendicion.id}-${Date.now()}-${file.name}`;
+        // Un nombre de archivo con "°", tildes u otros caracteres fuera de
+        // ASCII rompe la ruta del storage y la subida falla -- ej. "Factura
+        // N°9893.pdf". Se sanea antes de armar la ruta, la persona nunca ve
+        // este nombre (solo se usa como parte interna del path).
+        const nombreSeguro = file.name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+        // "idx" (además de Date.now()) evita que dos ítems con el mismo
+        // nombre de archivo (ej. dos fotos "foto.jpg" del celular) puedan
+        // llegar a compartir la misma ruta si alguna vez coincidiera el
+        // milisegundo -- upload() no sobreescribe en silencio (falla con
+        // 409), pero total es gratis evitarlo del todo.
+        const path = `${currentUser.id}/${rendicionId}-${idx}-${Date.now()}-${nombreSeguro}`;
         const { error: upErr } = await db.storage.from("comprobantes").upload(path, file);
         if (upErr) {
           console.error("Error subiendo comprobante:", upErr);
@@ -1934,8 +1997,40 @@ async function submitRendicion() {
         }
         adjuntoUrl = path;
       }
-      delete item._fotoInput;
-      const { error: itemErr } = await db.from("rendicion_items").insert({ ...item, rendicion_id: rendicion.id, adjunto_url: adjuntoUrl });
+      itemsConAdjunto.push({ item, idx, adjunto_url: adjuntoUrl });
+    }
+
+    if (!itemsConAdjunto.length) {
+      toast(`No se pudo subir ningún comprobante, así que no se creó la rendición. ${erroresItems.join(" · ")}`);
+      return;
+    }
+
+    const { data: rendicion, error: errR } = await db
+      .from("rendiciones")
+      .insert({
+        id: rendicionId,
+        empleado_id: currentUser.id,
+        empleado_nombre: currentProfile?.nombre || currentUser.email,
+        rut_empleado: currentProfile?.rut || null,
+        tipo_rendicion: tipoRendicion,
+        empresa: empresaRendicion,
+        monto_total: itemsConAdjunto.reduce((s, x) => s + x.item.monto, 0),
+        estado: "Pendiente",
+        comentario,
+        solicitud_fondo_id: solicitudFondoId,
+      })
+      .select()
+      .single();
+    if (errR) throw errR;
+
+    // Se recalcula el total según lo que REALMENTE queda guardado -- si el
+    // insert del ítem en sí falla (más raro que la subida, ej. una
+    // restricción de la base), ese ítem se descarta y el monto_total no
+    // debe incluirlo.
+    let montoRealGuardado = 0;
+    let itemsGuardados = 0;
+    for (const { item, idx, adjunto_url } of itemsConAdjunto) {
+      const { error: itemErr } = await db.from("rendicion_items").insert({ ...item, rendicion_id: rendicion.id, adjunto_url });
       if (itemErr) {
         console.error("Error guardando ítem:", itemErr);
         erroresItems.push(`Ítem ${idx + 1}: no se pudo guardar (${itemErr.message}).`);
@@ -1945,28 +2040,25 @@ async function submitRendicion() {
       itemsGuardados++;
     }
 
-    if (montoRealGuardado !== montoTotal) {
-      await db.from("rendiciones").update({ monto_total: montoRealGuardado }).eq("id", rendicion.id);
-    }
-
     if (!itemsGuardados) {
-      // Ningún ítem se pudo guardar (falló la subida del comprobante o el
-      // insert): no dejar una rendición fantasma sin ítems dando vueltas en
-      // la cola de aprobación con $0 -- antes quedaba creada igual, con
-      // nada que aprobar y sin ningún aviso claro de que algo había fallado.
-      // .select() para confirmar que el borrado realmente afectó la fila
-      // (requiere la policy "rendiciones_delete_propia_vacia") y no decirle
-      // a la persona que se borró cuando en realidad quedó ahí, bloqueada
-      // en silencio por RLS -- el mismo caso que ya nos mordió con
-      // aprobarItem antes de que existiera updateChecked().
+      // El o los comprobantes sí se subieron, pero el insert del ítem en sí
+      // falló para todos -- igual limpiamos la cabecera para no dejar el
+      // folio con una rendición vacía. .select() para confirmar que el
+      // borrado realmente afectó la fila (requiere la policy
+      // "rendiciones_delete_propia_vacia") y no decirle a la persona que se
+      // borró cuando en realidad quedó ahí, bloqueada en silencio por RLS
+      // -- el mismo caso que ya nos mordió con aprobarItem antes de que
+      // existiera updateChecked().
       const { data: borrada } = await db.from("rendiciones").delete().eq("id", rendicion.id).select();
       const mensajeBase = `No se pudo guardar ningún ítem. ${erroresItems.join(" · ")}`;
       toast(borrada && borrada.length
         ? `${mensajeBase} La rendición no quedó creada.`
         : `${mensajeBase} La rendición quedó guardada vacía -- avisa a un admin para que la revise.`);
-      btn.disabled = false;
-      btn.textContent = "Guardar rendición";
       return;
+    }
+
+    if (montoRealGuardado !== rendicion.monto_total) {
+      await db.from("rendiciones").update({ monto_total: montoRealGuardado }).eq("id", rendicion.id);
     }
 
     if (erroresItems.length) {
@@ -1988,7 +2080,7 @@ async function submitRendicion() {
     replaceView("view-dashboard");
     loadDashboard();
   } catch (err) {
-    toast("Error: " + (err.message || "no se pudo guardar."));
+    toast(mensajeErrorAmigable(err));
   } finally {
     btn.disabled = false;
     btn.textContent = "Enviar a aprobación";
@@ -2076,7 +2168,7 @@ async function submitSolicitud() {
     replaceView("view-dashboard");
     loadDashboard();
   } catch (err) {
-    toast("Error: " + (err.message || "no se pudo guardar."));
+    toast(mensajeErrorAmigable(err));
   } finally {
     btn.disabled = false;
     btn.textContent = "Enviar solicitud";
@@ -2164,7 +2256,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
           el("td", {}, el("span", { class: "pill " + r.estado }, r.estado)),
         ];
         celdas.forEach((td, i) => td.setAttribute("data-label", cols[i]));
-        tbody.appendChild(el("tr", { class: "row-clickable", onclick: () => openDetalle(r.id) }, celdas));
+        tbody.appendChild(filaClickable(() => openDetalle(r.id), celdas));
       });
       tabla.appendChild(tbody);
       box.appendChild(el("div", { class: "table-scroll" }, [tabla]));
@@ -2187,20 +2279,31 @@ async function openDetalleSolicitud(id, pushHistory = true) {
       style: "width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:0.9rem; resize:vertical;",
     });
     rechazoBox.appendChild(rechazoInput);
+    const btnConfirmarRechazo = el("button", { class: "btn btn-danger", type: "button" }, "Confirmar rechazo");
+    btnConfirmarRechazo.addEventListener("click", async () => {
+      const motivo = rechazoInput.value.trim();
+      if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
+      btnConfirmarRechazo.disabled = true;
+      btnConfirmarRechazo.textContent = "Rechazando...";
+      await aprobarSolicitud(s, "Rechazado", motivo);
+      btnConfirmarRechazo.disabled = false;
+      btnConfirmarRechazo.textContent = "Confirmar rechazo";
+    });
     rechazoBox.appendChild(el("div", { style: "display:flex; gap:10px; margin-top:8px;" }, [
-      el("button", {
-        class: "btn btn-danger", type: "button",
-        onclick: () => {
-          const motivo = rechazoInput.value.trim();
-          if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
-          aprobarSolicitud(s, "Rechazado", motivo);
-        },
-      }, "Confirmar rechazo"),
+      btnConfirmarRechazo,
       el("button", { class: "btn btn-ghost", type: "button", onclick: () => { rechazoBox.style.display = "none"; } }, "Cancelar"),
     ]));
 
+    const btnAprobar = el("button", { class: "btn btn-success" }, "Aprobar");
+    btnAprobar.addEventListener("click", async () => {
+      btnAprobar.disabled = true;
+      btnAprobar.textContent = "Aprobando...";
+      await aprobarSolicitud(s, "Aprobado");
+      btnAprobar.disabled = false;
+      btnAprobar.textContent = "Aprobar";
+    });
     const actions = el("div", { style: "display:flex;gap:10px;margin-top:16px" }, [
-      el("button", { class: "btn btn-success", onclick: () => aprobarSolicitud(s, "Aprobado") }, "Aprobar"),
+      btnAprobar,
       el("button", { class: "btn btn-danger", onclick: () => { rechazoBox.style.display = "block"; } }, "Rechazar"),
     ]);
     box.appendChild(actions);
@@ -2219,10 +2322,10 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
   };
   if (estado === "Rechazado") cambios.motivo_rechazo = motivoRechazo;
 
-  const { error } = await db.from("solicitudes_fondos").update(cambios).eq("id", solicitud.id);
-  if (error) {
-    toast(mensajeErrorAmigable(error));
-    if (/ya fue procesad/i.test(error.message || "")) openDetalleSolicitud(solicitud.id, false);
+  const res = await updateChecked("solicitudes_fondos", solicitud.id, cambios);
+  if (!res.ok) {
+    toast(res.mensaje);
+    if (/ya fue procesad/i.test(res.mensaje)) openDetalleSolicitud(solicitud.id, false);
     return;
   }
 
@@ -2326,7 +2429,16 @@ async function openDetalle(id, pushHistory = true) {
     celdas.push(el("td", { class: "wrap" }, it.centro_costo || "-"));
     celdas.push(el("td", { class: "wrap" }, it.descripcion || "-"));
     celdas.push(el("td", { class: "monto" }, fmtCLP(it.monto)));
-    celdas.push(el("td", { class: "center" }, el("span", { class: "pill " + (it.estado || "Pendiente"), style: "font-size:0.72rem" }, it.estado || "Pendiente")));
+    // Si el ítem quedó Rechazado dentro de una rendición que en general
+    // terminó Aprobada, el pill rojo por sí solo no dice nada -- antes el
+    // motivo (que sí se guarda) no se mostraba en ningún lado de la UI, así
+    // que el empleado no tenía forma de saber por qué justo ESE ítem quedó
+    // afuera del monto y del comprobante.
+    const estadoCellContenido = [el("span", { class: "pill " + (it.estado || "Pendiente"), style: "font-size:0.72rem" }, it.estado || "Pendiente")];
+    if (it.estado === "Rechazado" && it.motivo_rechazo) {
+      estadoCellContenido.push(el("p", { style: "margin:4px 0 0;font-size:0.72rem;color:var(--danger);" }, it.motivo_rechazo));
+    }
+    celdas.push(el("td", { class: "center" }, estadoCellContenido));
     // En celular la tabla se apila como tarjetas (ver CSS) -- cada celda
     // necesita saber el nombre de su columna para mostrarlo como etiqueta.
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
@@ -2374,10 +2486,19 @@ async function openDetalle(id, pushHistory = true) {
     // aprobación"). Un ítem Rechazado necesita un motivo, igual que el
     // rechazo general de la rendición.
     if (puedeAprobar) {
-      accionesCell.appendChild(el("button", {
-        class: "btn btn-success btn-sm", type: "button",
-        onclick: () => aprobarItem(it, r, "Aprobado"),
-      }, "Aprobar ítem"));
+      const btnAprobarItem = el("button", { class: "btn btn-success btn-sm", type: "button" }, "Aprobar ítem");
+      btnAprobarItem.addEventListener("click", async () => {
+        // Si aprobarItem() tiene éxito vuelve a pintar todo el detalle (este
+        // botón incluido), así que no hace falta reactivarlo a mano en ese
+        // caso -- pero mientras esté en vuelo, sin esto un doble clic podía
+        // disparar dos aprobaciones seguidas antes de que la primera volviera.
+        btnAprobarItem.disabled = true;
+        btnAprobarItem.textContent = "Aprobando...";
+        await aprobarItem(it, r, "Aprobado");
+        btnAprobarItem.disabled = false;
+        btnAprobarItem.textContent = "Aprobar ítem";
+      });
+      accionesCell.appendChild(btnAprobarItem);
       accionesCell.appendChild(el("button", {
         class: "btn btn-danger btn-sm", type: "button",
         onclick: () => {
@@ -2388,15 +2509,18 @@ async function openDetalle(id, pushHistory = true) {
             style: "width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-family:inherit; font-size:0.85rem; resize:vertical;",
           });
           extraCell.appendChild(motivoInput);
+          const btnConfirmarRechazo = el("button", { class: "btn btn-danger btn-sm", type: "button" }, "Confirmar rechazo del ítem");
+          btnConfirmarRechazo.addEventListener("click", async () => {
+            const motivo = motivoInput.value.trim();
+            if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
+            btnConfirmarRechazo.disabled = true;
+            btnConfirmarRechazo.textContent = "Rechazando...";
+            await aprobarItem(it, r, "Rechazado", motivo);
+            btnConfirmarRechazo.disabled = false;
+            btnConfirmarRechazo.textContent = "Confirmar rechazo del ítem";
+          });
           extraCell.appendChild(el("div", { style: "display:flex; gap:8px; margin-top:8px;" }, [
-            el("button", {
-              class: "btn btn-danger btn-sm", type: "button",
-              onclick: () => {
-                const motivo = motivoInput.value.trim();
-                if (!motivo) { toast("Escribe el motivo del rechazo."); return; }
-                aprobarItem(it, r, "Rechazado", motivo);
-              },
-            }, "Confirmar rechazo del ítem"),
+            btnConfirmarRechazo,
             el("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: () => { filaExtra.style.display = "none"; } }, "Cancelar"),
           ]));
         },
@@ -2417,7 +2541,6 @@ async function openDetalle(id, pushHistory = true) {
   if (r.estado === "Aprobado") {
     box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:10px" },
       `Aprobado por ${r.aprobador_nombre || "-"} el ${fmtDate(r.fecha_aprobacion)}`));
-    box.appendChild(el("button", { class: "btn btn-secondary", onclick: () => descargarCSV(r, items) }, "Descargar comprobante para Kame"));
   }
 
   if (r.estado === "Rechazado") {
@@ -2427,29 +2550,6 @@ async function openDetalle(id, pushHistory = true) {
       el("p", { style: "margin:0 0 4px; font-weight:600;" }, `Rechazado por ${r.aprobador_nombre || "-"} el ${fmtDate(r.fecha_aprobacion)}`),
       el("p", { style: "margin:0;" }, r.motivo_rechazo || "No se dejó un motivo."),
     ]));
-  }
-
-  // El aviso por correo al empleado se manda una sola vez, al momento de
-  // aprobar/rechazar (ver finalizarAprobacionRendicion) -- si falló ahí
-  // (ej. Resend mal configurado, o la sesión de quien aprobó estaba
-  // desactualizada) no hay reintento automático. Este botón repite
-  // exactamente esa misma llamada, a mano, sin tener que recurrir a la
-  // consola del navegador.
-  if (esAprobadorViewer && (r.estado === "Aprobado" || r.estado === "Rechazado")) {
-    const btnReenviar = el("button", { class: "btn btn-ghost btn-sm", style: "margin-top:8px;", type: "button" }, "Reenviar notificación por correo");
-    btnReenviar.addEventListener("click", async () => {
-      btnReenviar.disabled = true;
-      btnReenviar.textContent = "Enviando...";
-      const { data, error } = await db.functions.invoke("notificar-estado-rendicion", { body: { rendicion_id: r.id } });
-      if (error || !data?.ok) {
-        toast("No se pudo enviar: " + (error?.message || "revisa los logs de la función en Supabase."));
-      } else {
-        toast("Notificación reenviada.");
-      }
-      btnReenviar.disabled = false;
-      btnReenviar.textContent = "Reenviar notificación por correo";
-    });
-    box.appendChild(btnReenviar);
   }
 
   if (puedeAprobar) {
@@ -2462,30 +2562,69 @@ async function openDetalle(id, pushHistory = true) {
       const rechazados = (items || []).filter((it) => it.estado === "Rechazado").length;
       box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:16px" },
         `${aprobados} ítem(s) aprobado(s), ${rechazados} rechazado(s). Al finalizar, los rechazados quedan fuera del monto y del comprobante.`));
-      box.appendChild(el("button", {
-        class: "btn btn-primary", style: "margin-top:8px;",
-        onclick: () => finalizarAprobacionRendicion(r, items),
-      }, "Finalizar aprobación"));
+      const btnFinalizar = el("button", { class: "btn btn-primary", style: "margin-top:8px;" }, "Finalizar aprobación");
+      btnFinalizar.addEventListener("click", async () => {
+        btnFinalizar.disabled = true;
+        btnFinalizar.textContent = "Finalizando...";
+        await finalizarAprobacionRendicion(r, items);
+        btnFinalizar.disabled = false;
+        btnFinalizar.textContent = "Finalizar aprobación";
+      });
+      box.appendChild(btnFinalizar);
     }
   }
 
-  box.appendChild(el("button", {
-    class: "btn btn-secondary", style: "margin-top:16px;",
+  // Todas las acciones secundarias (descargas, reenviar aviso, historial)
+  // van juntas en una sola fila que se ajusta sola (flex-wrap) -- antes cada
+  // botón se agregaba suelto con su propio margin-top distinto, así que en
+  // pantallas angostas quedaban amontonados con alturas y separaciones
+  // inconsistentes en vez de una fila prolija.
+  const acciones = el("div", { style: "display:flex; flex-wrap:wrap; gap:8px; margin-top:16px;" });
+  if (r.estado === "Aprobado") {
+    acciones.appendChild(el("button", {
+      class: "btn btn-secondary btn-sm", type: "button",
+      onclick: () => descargarCSV(r, items),
+    }, "Descargar comprobante para Kame"));
+  }
+  // El aviso por correo al empleado se manda una sola vez, al momento de
+  // aprobar/rechazar (ver finalizarAprobacionRendicion) -- si falló ahí
+  // (ej. Resend mal configurado, o la sesión de quien aprobó estaba
+  // desactualizada) no hay reintento automático. Este botón repite
+  // exactamente esa misma llamada, a mano, sin tener que recurrir a la
+  // consola del navegador.
+  if (esAprobadorViewer && (r.estado === "Aprobado" || r.estado === "Rechazado")) {
+    const btnReenviar = el("button", { class: "btn btn-secondary btn-sm", type: "button" }, "Reenviar notificación por correo");
+    btnReenviar.addEventListener("click", async () => {
+      btnReenviar.disabled = true;
+      btnReenviar.textContent = "Enviando...";
+      const { data, error } = await db.functions.invoke("notificar-estado-rendicion", { body: { rendicion_id: r.id } });
+      if (error || !data?.ok) {
+        toast("No se pudo enviar: " + (error?.message || "revisa los logs de la función en Supabase."));
+      } else {
+        toast("Notificación reenviada.");
+      }
+      btnReenviar.disabled = false;
+      btnReenviar.textContent = "Reenviar notificación por correo";
+    });
+    acciones.appendChild(btnReenviar);
+  }
+  acciones.appendChild(el("button", {
+    class: "btn btn-secondary btn-sm", type: "button",
     onclick: () => generarInformePDF(r, items),
   }, "Descargar informe PDF"));
-
   // Quién cambió qué y cuándo, para todos los ítems de esta rendición (no
-  // solo el más reciente) -- abajo del todo porque es información de
-  // auditoría, no algo que se consulte en el flujo normal de aprobar/editar.
-  // Ni el botón aparece si la rendición nunca tuvo un cambio registrado.
+  // solo el más reciente) -- es información de auditoría, no algo que se
+  // consulte en el flujo normal de aprobar/editar. Ni el botón aparece si
+  // la rendición nunca tuvo un cambio registrado.
+  const historialBox = el("div", { style: "width:100%; margin-top:8px;" });
   if (historialCount && historialCount > 0) {
-    const historialBox = el("div", { style: "margin-top:10px;" });
-    box.appendChild(el("button", {
-      class: "btn btn-ghost btn-sm", style: "margin-top:16px;",
+    acciones.appendChild(el("button", {
+      class: "btn btn-secondary btn-sm", type: "button",
       onclick: () => mostrarHistorialRendicion(r.id, historialBox),
     }, "Ver historial de cambios"));
-    box.appendChild(historialBox);
   }
+  box.appendChild(acciones);
+  box.appendChild(historialBox);
 
   if (pushHistory) pushView("view-detalle", { id }); else show("view-detalle");
 }
@@ -2503,7 +2642,7 @@ async function openDetalle(id, pushHistory = true) {
 async function updateChecked(table, id, cambios) {
   const { data, error } = await db.from(table).update(cambios).eq("id", id).select();
   if (error) return { ok: false, mensaje: mensajeErrorAmigable(error) };
-  if (!data || data.length === 0) return { ok: false, mensaje: "No tienes permiso para actualizar este ítem." };
+  if (!data || data.length === 0) return { ok: false, mensaje: "No tienes permiso para hacer este cambio, o ya no existe." };
   return { ok: true, data };
 }
 
@@ -2538,10 +2677,10 @@ async function finalizarAprobacionRendicion(rendicion, items) {
     cambios.motivo_rechazo = rechazados.map((it) => it.motivo_rechazo).filter(Boolean).join(" | ") || "Todos los ítems fueron rechazados.";
   }
 
-  const { error } = await db.from("rendiciones").update(cambios).eq("id", rendicion.id);
-  if (error) {
-    toast(mensajeErrorAmigable(error));
-    if (/ya fue procesad/i.test(error.message || "")) openDetalle(rendicion.id, false);
+  const res = await updateChecked("rendiciones", rendicion.id, cambios);
+  if (!res.ok) {
+    toast(res.mensaje);
+    if (/ya fue procesad/i.test(res.mensaje)) openDetalle(rendicion.id, false);
     return;
   }
 
@@ -2882,8 +3021,13 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
         );
 
         if (cambios.monto !== it.monto) {
-          const { data: todos } = await db.from("rendicion_items").select("monto").eq("rendicion_id", rendicion.id);
-          const nuevoTotal = (todos || []).reduce((s, x) => s + Number(x.monto), 0);
+          // Excluir Rechazado: un aprobador puede editar el monto de un
+          // ítem mientras revisa uno por uno, antes de "Finalizar
+          // aprobación" -- si ya rechazó otro ítem de la misma rendición,
+          // sumarlo acá infla el Total mostrado (y el stat de Pendientes
+          // del dashboard) con plata que nunca va a quedar aprobada.
+          const { data: todos } = await db.from("rendicion_items").select("monto, estado").eq("rendicion_id", rendicion.id);
+          const nuevoTotal = (todos || []).filter((x) => x.estado !== "Rechazado").reduce((s, x) => s + Number(x.monto), 0);
           await db.from("rendiciones").update({ monto_total: nuevoTotal }).eq("id", rendicion.id);
         }
 
@@ -2935,7 +3079,14 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
   // "Comentario Linea" va con el mismo texto en todas las líneas de la
   // rendición (así aparece en los comprobantes reales de Kame que revisamos:
   // el mismo glosa se repite en cada línea de una misma transacción).
-  (items || []).forEach((it) => {
+  //
+  // Filtrado acá adentro, no confiado a quien llama: la contrapartida de
+  // abajo siempre usa rendicion.monto_total, que excluye los ítems
+  // Rechazados (ver finalizarAprobacionRendicion) -- si algún llamador
+  // pasara la lista sin filtrar (como pasaba antes con el botón "Descargar
+  // comprobante para Kame" y con el export por rango de fechas), las líneas
+  // Debe sumaban más que el Haber y el comprobante quedaba descuadrado.
+  (items || []).filter((it) => it.estado === "Aprobado").forEach((it) => {
     if (it.tipo_item === "ConDocumento") {
       // El Centro de Costo de un "Documento electrónico" es solo para uso
       // interno de la app (reportes, Excel) -- no se manda en el

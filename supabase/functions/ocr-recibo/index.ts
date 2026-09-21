@@ -23,6 +23,13 @@ async function requireUser(req: Request) {
   const anon = createClient(SUPABASE_URL, ANON_KEY);
   const { data, error } = await anon.auth.getUser(jwt);
   if (error || !data?.user) throw new Error("Sesión inválida o expirada.");
+  // Cliente autenticado como la propia persona (no service role, no hace
+  // falta acá): RLS ya la deja leer su propio perfil. Sin este chequeo, una
+  // cuenta desactivada con una sesión todavía viva podía seguir consumiendo
+  // la cuota paga de Gemini.
+  const asUser = createClient(SUPABASE_URL, ANON_KEY, { global: { headers: { Authorization: authHeader } } });
+  const { data: profile } = await asUser.from("profiles").select("activo").eq("id", data.user.id).maybeSingle();
+  if (profile?.activo === false) throw new Error("Tu cuenta fue desactivada.");
   return data.user;
 }
 
@@ -90,7 +97,14 @@ Deno.serve(async (req: Request) => {
           ],
         },
       ],
-      generationConfig: { temperature: 0, responseMimeType: "application/json" },
+      // maxOutputTokens explícito: sin esto, un PDF (que consume bastantes
+      // más tokens de "visión de documento" que una foto comprimida, sobre
+      // todo si tiene varias páginas) puede agotar el límite por defecto del
+      // modelo ANTES de terminar de escribir el JSON de salida. Cuando eso
+      // pasa, Gemini responde 200 OK con finishReason "MAX_TOKENS" y texto
+      // vacío -- no es un error, así que antes cursaba directo al mensaje
+      // genérico de "no se pudo leer" sin ninguna pista real de la causa.
+      generationConfig: { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192 },
     };
 
     // Gemini a veces devuelve "high demand" de forma transitoria (picos de uso),
@@ -120,10 +134,18 @@ Deno.serve(async (req: Request) => {
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) {
-      // Gemini puede responder 200 OK sin "candidates" (ej. filtro de
-      // seguridad bloqueó la imagen) -- antes esto se devolvía como "{}"
-      // silencioso y el formulario quedaba vacío sin ninguna pista de por qué.
-      const motivo = data?.promptFeedback?.blockReason || "Gemini no devolvió resultado para esta imagen.";
+      // Gemini puede responder 200 OK sin "candidates", o con texto vacío,
+      // por más de un motivo -- antes esto se devolvía como "{}" silencioso
+      // y el formulario quedaba vacío sin ninguna pista de por qué. Un PDF
+      // (sobre todo escaneado o de varias páginas) consume bastantes más
+      // tokens de "visión de documento" que una foto comprimida, así que es
+      // más probable que llegue a MAX_TOKENS antes de terminar el JSON --
+      // eso también cuenta como "sin resultado", no es un error de la API.
+      const finishReason = data?.candidates?.[0]?.finishReason;
+      const motivo = data?.promptFeedback?.blockReason
+        || (finishReason === "MAX_TOKENS" ? "El comprobante es muy complejo para procesarlo completo (MAX_TOKENS)." : null)
+        || (finishReason ? `Gemini no devolvió resultado (finishReason: ${finishReason}).` : null)
+        || "Gemini no devolvió resultado para este comprobante.";
       throw new Error(motivo);
     }
     const parsed = JSON.parse(text);

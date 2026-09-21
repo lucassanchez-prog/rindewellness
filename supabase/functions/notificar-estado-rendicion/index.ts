@@ -1,9 +1,11 @@
 // Edge Function: notificar-estado-rendicion
 // Cuando un aprobador aprueba o rechaza una rendición, le manda un correo
-// al EMPLEADO que la envió (no a los aprobadores) avisando el resultado,
-// y si fue rechazada, el motivo. También la reutiliza la app para avisar
-// el resultado de una SOLICITUD DE FONDOS (payload con tipo: "solicitud")
-// -- mismo mecanismo, solo cambia el texto del asunto y del cuerpo.
+// al EMPLEADO que la envió avisando el resultado (y el motivo, si fue
+// rechazada), con el resto de aprobadores/admin en copia para que el
+// equipo vea el resultado sin tener que entrar a la app. También la
+// reutiliza la app para avisar el resultado de una SOLICITUD DE FONDOS
+// (payload con tipo: "solicitud") -- mismo mecanismo, solo cambia el
+// texto del asunto y del cuerpo.
 //
 // Exige que quien llama sea aprobador/admin: sin este chequeo cualquiera
 // con la anon key podía mandarle a cualquier empleado un correo "tu
@@ -40,6 +42,9 @@ const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 const FROM_EMAIL = Deno.env.get("RESEND_FROM_EMAIL") || "RindeWellness <onboarding@resend.dev>";
+// Ver el mismo comentario en notificar-aprobador -- ninguno de los dos
+// correos tenía un link real al detalle, solo texto plano.
+const APP_URL = Deno.env.get("APP_URL") || "https://rindewellness.netlify.app";
 const FALLBACK_EMAIL = Deno.env.get("RESEND_FALLBACK_EMAIL");
 
 const corsHeaders = {
@@ -64,8 +69,14 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
   const anon = createClient(SUPABASE_URL, ANON_KEY);
   const { data: userRes, error: userErr } = await anon.auth.getUser(jwt);
   if (userErr || !userRes?.user) throw new Error("Sesión inválida o expirada.");
-  const { data: profile } = await admin.from("profiles").select("id, nombre, rol").eq("id", userRes.user.id).maybeSingle();
+  const { data: profile, error: profileErr } = await admin.from("profiles").select("id, nombre, rol, activo").eq("id", userRes.user.id).maybeSingle();
+  if (profileErr) throw profileErr;
   if (!profile) throw new Error("Perfil no encontrado.");
+  // Las policies de la base ya bloquean a alguien desactivado a nivel de
+  // fila, pero esta función corre con el service role (que se salta RLS) --
+  // sin este chequeo explícito, una cuenta desactivada con una sesión
+  // todavía viva podía seguir disparando estos correos igual.
+  if (profile.activo === false) throw new Error("Tu cuenta fue desactivada.");
   return profile;
 }
 
@@ -74,25 +85,40 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
 // RESEND_FALLBACK_EMAIL configurado, reintenta mandándolo ahí para que el
 // aviso no se pierda -- avisando en el propio correo quién era el
 // destinatario real.
-async function enviarConFallback(to: string[], subject: string, html: string) {
-  const enviar = (destinatarios: string[], asuntoFinal: string, htmlFinal: string) =>
+async function enviarConFallback(to: string[], subject: string, html: string, cc: string[] = []) {
+  const enviar = (destinatarios: string[], asuntoFinal: string, htmlFinal: string, ccFinal: string[]) =>
     fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: FROM_EMAIL, to: destinatarios, subject: asuntoFinal, html: htmlFinal }),
+      body: JSON.stringify({
+        from: FROM_EMAIL, to: destinatarios, cc: ccFinal.length ? ccFinal : undefined,
+        subject: asuntoFinal, html: htmlFinal,
+      }),
     });
 
-  let resp = await enviar(to, subject, html);
+  let resp = await enviar(to, subject, html, cc);
   let data = await resp.json();
   if (!resp.ok && FALLBACK_EMAIL && /only send testing emails/i.test(data?.message || "")) {
+    // Mismo tag <p> que antes (un Google Apps Script del usuario reenvía
+    // estos correos parseando "Destinatario real:" del cuerpo en texto
+    // plano -- lo más seguro es tocar solo colores/texto, no la estructura
+    // HTML). Antes era fondo amarillo con ícono de alerta, que se veía como
+    // un aviso de spam/phishing; ahora es neutro. En modo de pruebas de
+    // Resend el cc tampoco puede llegar a nadie más que el dueño de la
+    // cuenta, así que se suma a la lista de "destinatario real" en vez de
+    // perderse en silencio.
     const htmlConAviso = `
-      <p style="background:#fff3cd;color:#7a5c00;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;">
-        ⚠ Reenviado a esta casilla porque Resend todavía no tiene un dominio verificado.
-        Destinatario real: ${escapeHtml(to.join(", "))}
+      <p style="background:#f4f7fb;color:#5b6472;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;font-size:12px;">
+        Destinatario real: ${escapeHtml([...to, ...cc].join(", "))}
       </p>
       ${html}
     `;
-    resp = await enviar([FALLBACK_EMAIL], `[Reenviado] ${subject}`, htmlConAviso);
+    // OJO: "[Reenviado]" tal cual, con corchetes -- hay un Google Apps
+    // Script del lado del usuario que reenvía estos correos automáticamente
+    // buscando exactamente `subject:"[Reenviado]" from:onboarding@resend.dev`
+    // + la línea "Destinatario real:" en el cuerpo. Cambiar este prefijo
+    // (o esa frase) rompe ese reenvío automático sin que la app se entere.
+    resp = await enviar([FALLBACK_EMAIL], `[Reenviado] ${subject}`, htmlConAviso, []);
     data = await resp.json();
   }
   return { resp, data };
@@ -168,11 +194,29 @@ Deno.serve(async (req: Request) => {
         </table>
         ${aprobado && !esSolicitud && items_excluidos ? `<p style="background:#fbf1e2;color:#7a5c00;padding:10px 14px;border-radius:6px;">Se excluyeron estos ítems por no cumplir los requisitos: <strong>${escapeHtml(items_excluidos)}</strong>. El monto total ya refleja solo lo aprobado.</p>` : ""}
         ${aprobado && esSolicitud ? `<p style="color:#5b6472;">La entrega del fondo corresponde a que la gestione Finanzas, fuera de la app.</p>` : ""}
-        <p>Ingresa a RindeWellness para ver el detalle.</p>
+        <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:6px;background:#046bd2;">
+          <a href="${APP_URL}/#${esSolicitud ? "detalle-solicitud" : "detalle"}/${rendicion_id}" style="display:inline-block;padding:10px 20px;color:#ffffff;text-decoration:none;font-weight:bold;">Ver detalle</a>
+        </td></tr></table>
       </div>
     `;
 
-    const { resp, data } = await enviarConFallback([destinatario], asunto, html);
+    // En copia van todos los aprobadores/admin (no solo quien aprobó esta
+    // vez), para que el resto del equipo vea el resultado sin tener que
+    // entrar a la app -- mismo destinatario que ya usa notificar-aprobador
+    // para avisar de algo nuevo pendiente.
+    const { data: aprobadoresProfiles } = await admin
+      .from("profiles")
+      .select("id")
+      .in("rol", ["aprobador", "admin"]);
+    const { data: usersData } = await admin.auth.admin.listUsers();
+    const emailPorId = new Map((usersData?.users || []).map((u) => [u.id, u.email]));
+    const ccEmails = [...new Set(
+      (aprobadoresProfiles || [])
+        .map((p) => emailPorId.get(p.id))
+        .filter((email): email is string => !!email && email !== destinatario)
+    )];
+
+    const { resp, data } = await enviarConFallback([destinatario], asunto, html, ccEmails);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
 
     return new Response(JSON.stringify({ ok: true, enviados: 1 }), {

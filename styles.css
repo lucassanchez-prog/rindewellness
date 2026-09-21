@@ -94,6 +94,10 @@ button {
   transition: transform 0.05s ease, background 0.15s ease;
 }
 .btn:active { transform: scale(0.98); }
+.btn:focus-visible, .row-clickable:focus-visible, .tab-btn:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
 .btn-primary { background: var(--blue); color: white; }
 .btn-primary:hover { background: var(--blue-dark); }
 .btn-secondary { background: var(--card); color: var(--ink); border: 1px solid var(--line); }
@@ -561,6 +565,13 @@ button {
   .items-table td.monto { text-align: left; }
   .items-table td.center { text-align: left; }
   .items-table tr.acciones-row td { padding: 10px; background: transparent; }
+  /* .btn-sm mide ~30px de alto en pantalla chica (6px padding + texto a
+     0.78rem) -- muy por debajo de lo recomendado para tocar con el dedo, y
+     estas filas suelen tener 3-5 botones seguidos ("Aprobar ítem",
+     "Rechazar ítem", "Ver", "Editar", "Verificar"). Solo se agranda acá
+     adentro (no en toda la app) para no desarmar tablas más densas en
+     escritorio que sí dependen del tamaño chico. */
+  .acciones-cell .btn-sm { padding: 10px 14px; font-size: 0.85rem; }
 }
 
 .btn-sm {

@@ -38,6 +38,12 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
+// Ninguno de los dos correos (este y notificar-estado-rendicion) tenía un
+// link real -- solo texto plano "Ingresa a RindeWellness". La app ya lee el
+// hash de la URL al cargar y también después de loguearse (ver
+// estadoDesdeHash/onLoggedIn en app.js), así que un link directo al detalle
+// funciona incluso para alguien que todavía no inició sesión.
+const APP_URL = Deno.env.get("APP_URL") || "https://rindewellness.netlify.app";
 const FROM_EMAIL = Deno.env.get("RESEND_FROM_EMAIL") || "RindeWellness <onboarding@resend.dev>";
 const FALLBACK_EMAIL = Deno.env.get("RESEND_FALLBACK_EMAIL");
 
@@ -68,8 +74,14 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
   const anon = createClient(SUPABASE_URL, ANON_KEY);
   const { data: userRes, error: userErr } = await anon.auth.getUser(jwt);
   if (userErr || !userRes?.user) throw new Error("Sesión inválida o expirada.");
-  const { data: profile } = await admin.from("profiles").select("id, nombre, rol").eq("id", userRes.user.id).maybeSingle();
+  const { data: profile, error: profileErr } = await admin.from("profiles").select("id, nombre, rol, activo").eq("id", userRes.user.id).maybeSingle();
+  if (profileErr) throw profileErr;
   if (!profile) throw new Error("Perfil no encontrado.");
+  // Las policies de la base ya bloquean a alguien desactivado a nivel de
+  // fila, pero esta función corre con el service role (que se salta RLS) --
+  // sin este chequeo explícito, una cuenta desactivada con una sesión
+  // todavía viva podía seguir disparando estos correos igual.
+  if (profile.activo === false) throw new Error("Tu cuenta fue desactivada.");
   return profile;
 }
 
@@ -89,13 +101,22 @@ async function enviarConFallback(to: string[], subject: string, html: string) {
   let resp = await enviar(to, subject, html);
   let data = await resp.json();
   if (!resp.ok && FALLBACK_EMAIL && /only send testing emails/i.test(data?.message || "")) {
+    // Mismo tag <p> que antes -- un Google Apps Script del usuario reenvía
+    // estos correos parseando "Destinatario real:" del cuerpo en texto
+    // plano, así que lo más seguro es tocar solo colores/texto, no la
+    // estructura HTML. Antes era fondo amarillo con ícono de alerta, que se
+    // veía como un aviso de spam/phishing; ahora es neutro.
     const htmlConAviso = `
-      <p style="background:#fff3cd;color:#7a5c00;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;">
-        ⚠ Reenviado a esta casilla porque Resend todavía no tiene un dominio verificado.
+      <p style="background:#f4f7fb;color:#5b6472;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;font-size:12px;">
         Destinatario real: ${escapeHtml(to.join(", "))}
       </p>
       ${html}
     `;
+    // OJO: "[Reenviado]" tal cual, con corchetes -- hay un Google Apps
+    // Script del lado del usuario que reenvía estos correos automáticamente
+    // buscando exactamente `subject:"[Reenviado]" from:onboarding@resend.dev`
+    // + la línea "Destinatario real:" en el cuerpo. Cambiar este prefijo
+    // (o esa frase) rompe ese reenvío automático sin que la app se entere.
     resp = await enviar([FALLBACK_EMAIL], `[Reenviado] ${subject}`, htmlConAviso);
     data = await resp.json();
   }
@@ -155,6 +176,7 @@ Deno.serve(async (req: Request) => {
     const asunto = esSolicitud
       ? `Nueva solicitud de fondos pendiente · ${folioFmt} · ${empleado_nombre}`
       : `Nueva rendición pendiente · ${folioFmt} · ${empleado_nombre}`;
+    const linkDetalle = `${APP_URL}/#${esSolicitud ? "detalle-solicitud" : "detalle"}/${rendicion_id}`;
     const html = `
       <div style="font-family: Arial, sans-serif; color: #1a1f27;">
         <h2 style="margin-bottom: 4px;">${esSolicitud ? "Nueva solicitud de fondos para aprobar" : "Nueva rendición para aprobar"}</h2>
@@ -166,7 +188,9 @@ Deno.serve(async (req: Request) => {
           <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${esSolicitud ? "Monto solicitado" : "Monto total"}</td><td><strong>${montoFmt}</strong></td></tr>
           ${comentario ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">${esSolicitud ? "Motivo" : "Comentario"}</td><td>${escapeHtml(comentario)}</td></tr>` : ""}
         </table>
-        <p>Ingresa a RindeWellness para revisarla y aprobarla o rechazarla.</p>
+        <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:6px;background:#046bd2;">
+          <a href="${linkDetalle}" style="display:inline-block;padding:10px 20px;color:#ffffff;text-decoration:none;font-weight:bold;">Revisar y aprobar</a>
+        </td></tr></table>
       </div>
     `;
 

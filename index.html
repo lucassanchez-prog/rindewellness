@@ -40,11 +40,11 @@
 
         <form id="form-login">
           <div class="field">
-            <label>Correo</label>
+            <label for="login-email">Correo</label>
             <input type="email" id="login-email" required autocomplete="email" />
           </div>
           <div class="field">
-            <label>Contraseña</label>
+            <label for="login-password">Contraseña</label>
             <div class="password-field">
               <input type="password" id="login-password" required autocomplete="current-password" />
               <button type="button" class="btn-ver-password" id="btn-ver-password" aria-label="Mostrar contraseña">👁</button>
@@ -52,11 +52,11 @@
           </div>
           <div id="signup-extra" style="display:none">
             <div class="field">
-              <label>Nombre completo</label>
+              <label for="login-nombre">Nombre completo</label>
               <input type="text" id="login-nombre" autocomplete="name" />
             </div>
             <div class="field">
-              <label>RUT</label>
+              <label for="login-rut">RUT</label>
               <input type="text" id="login-rut" placeholder="12.345.678-9" />
               <p class="ocr-status" id="login-rut-hint"></p>
             </div>
@@ -87,7 +87,7 @@
 
         <form id="form-recuperar">
           <div class="field">
-            <label>Correo</label>
+            <label for="recuperar-email">Correo</label>
             <input type="email" id="recuperar-email" required autocomplete="email" />
           </div>
           <button type="submit" class="btn btn-primary btn-block" id="btn-recuperar-submit">Enviar link</button>
@@ -111,11 +111,11 @@
 
         <form id="form-nueva-clave">
           <div class="field">
-            <label>Nueva contraseña</label>
+            <label for="nueva-clave-1">Nueva contraseña</label>
             <input type="password" id="nueva-clave-1" required autocomplete="new-password" />
           </div>
           <div class="field">
-            <label>Confirmar contraseña</label>
+            <label for="nueva-clave-2">Confirmar contraseña</label>
             <input type="password" id="nueva-clave-2" required autocomplete="new-password" />
           </div>
           <button type="submit" class="btn btn-primary btn-block" id="btn-nueva-clave-submit">Guardar contraseña</button>
@@ -158,11 +158,11 @@
         <div class="card" id="panel-rango" style="display:none; margin-bottom:18px;">
           <div class="field-row">
             <div class="field">
-              <label>Desde</label>
+              <label for="rango-desde">Desde</label>
               <input type="date" id="rango-desde" />
             </div>
             <div class="field">
-              <label>Hasta</label>
+              <label for="rango-hasta">Hasta</label>
               <input type="date" id="rango-hasta" />
             </div>
           </div>
@@ -177,7 +177,7 @@
 
         <div class="filter-bar" id="filter-bar">
           <div class="field">
-            <label>Estado</label>
+            <label for="filtro-estado">Estado</label>
             <select id="filtro-estado">
               <option value="">Todos</option>
               <option value="Pendiente">Pendiente</option>
@@ -186,13 +186,13 @@
             </select>
           </div>
           <div class="field">
-            <label>Empresa</label>
+            <label for="filtro-empresa">Empresa</label>
             <select id="filtro-empresa">
               <option value="">Todas</option>
             </select>
           </div>
           <div class="field">
-            <label>Buscar</label>
+            <label for="filtro-texto">Buscar</label>
             <input type="text" id="filtro-texto" placeholder="Comentario o nombre..." />
           </div>
         </div>
@@ -218,26 +218,26 @@
         <div class="card" style="max-width:560px">
           <div class="field-row">
             <div class="field">
-              <label>Empresa</label>
+              <label for="sf-empresa">Empresa</label>
               <select id="sf-empresa"></select>
             </div>
             <div class="field">
-              <label>Centro de Costo</label>
+              <label for="sf-cc">Centro de Costo</label>
               <select id="sf-cc"></select>
             </div>
           </div>
           <div class="field-row">
             <div class="field">
-              <label>Monto solicitado</label>
+              <label for="sf-monto">Monto solicitado</label>
               <input type="text" id="sf-monto" inputmode="numeric" placeholder="0" />
             </div>
             <div class="field">
-              <label>Fecha en que se necesita</label>
+              <label for="sf-fecha">Fecha en que se necesita</label>
               <input type="date" id="sf-fecha" />
             </div>
           </div>
           <div class="field">
-            <label>Motivo / para qué es</label>
+            <label for="sf-motivo">Motivo / para qué es</label>
             <textarea id="sf-motivo" rows="3" placeholder="Ej: Compra de materiales para evento en sucursal Talca"></textarea>
           </div>
           <button class="btn btn-primary" id="btn-guardar-solicitud">Enviar solicitud</button>
@@ -258,11 +258,11 @@
         <div class="card" style="margin-bottom:18px">
           <div class="field-row">
             <div class="field">
-              <label>Fecha</label>
+              <label for="nr-fecha">Fecha</label>
               <input type="date" id="nr-fecha" required />
             </div>
             <div class="field">
-              <label>Tipo de rendición</label>
+              <label for="nr-tipo">Tipo de rendición</label>
               <select id="nr-tipo">
                 <option value="Reembolso">Reembolso</option>
                 <option value="FondoPorRendir">Rendición de fondo por rendir</option>
@@ -270,21 +270,21 @@
             </div>
           </div>
           <div class="field" id="nr-fondo-wrap" style="display:none">
-            <label>Fondo asociado (solicitud aprobada que estás rindiendo)</label>
+            <label for="nr-fondo">Fondo asociado (solicitud aprobada que estás rindiendo)</label>
             <select id="nr-fondo"></select>
           </div>
           <div class="field-row">
             <div class="field">
-              <label>Empresa (en que se registrará esta rendición)</label>
+              <label for="nr-empresa">Empresa (en que se registrará esta rendición)</label>
               <select id="nr-empresa"></select>
             </div>
             <div class="field">
-              <label>Sucursal</label>
+              <label for="nr-cc">Sucursal</label>
               <select id="nr-cc"></select>
             </div>
           </div>
           <div class="field">
-            <label>Comentario general</label>
+            <label for="nr-comentario">Comentario general</label>
             <input type="text" id="nr-comentario" placeholder="Ej: Rendición viaje a terreno" />
           </div>
         </div>
@@ -311,10 +311,13 @@
       <!-- ADMINISTRACION DE USUARIOS -->
       <div id="view-admin" class="view">
         <button class="back-link" data-back="dashboard">&larr; Volver</button>
-        <div class="hero-row"><div><h1>Usuarios</h1><p>Administra los permisos de cada persona del grupo</p></div></div>
+        <div class="hero-row">
+          <div><h1>Usuarios</h1><p>Administra los permisos de cada persona del grupo</p></div>
+          <button class="btn btn-secondary" id="btn-ir-plantillas" type="button">Plantillas de perfil</button>
+        </div>
         <div class="filter-bar" id="filter-bar-usuarios">
           <div class="field">
-            <label>Rol</label>
+            <label for="filtro-usuarios-rol">Rol</label>
             <select id="filtro-usuarios-rol">
               <option value="">Todos</option>
               <option value="empleado">empleado</option>
@@ -323,7 +326,7 @@
             </select>
           </div>
           <div class="field">
-            <label>Buscar</label>
+            <label for="filtro-usuarios-texto">Buscar</label>
             <input type="text" id="filtro-usuarios-texto" placeholder="Nombre o RUT..." />
           </div>
         </div>
