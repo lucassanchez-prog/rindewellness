@@ -2330,6 +2330,28 @@ async function llamarOcrRecibo(file) {
   return data;
 }
 
+// El comprobante ya quedó adjunto en el <input type=file> antes de llamar a
+// esto (fotoInput/fotoInput2 lo retienen aunque el OCR falle -- ver
+// addItemRow / buildSinDocumentoFields), así que reintentar no requiere que
+// la persona vuelva a elegir el archivo: basta con volver a llamar al mismo
+// analizador con el mismo File. Común a "Con documento" y "Gasto directo"
+// para no duplicar el armado del botón en los dos catch.
+function mostrarErrorOcr(statusEl, err, reintentar) {
+  statusEl.textContent = "";
+  statusEl.className = "ocr-status show err";
+  statusEl.appendChild(document.createTextNode(
+    `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano, o `
+  ));
+  statusEl.appendChild(el("button", {
+    type: "button",
+    // Botón con look de link de texto (no el .btn grande) para que quepa
+    // dentro del mensaje de estado sin desentonar.
+    style: "background:none; border:none; padding:0; margin:0; color:inherit; text-decoration:underline; font:inherit; cursor:pointer;",
+    onclick: reintentar,
+  }, "reintenta con IA"));
+  statusEl.appendChild(document.createTextNode("."));
+}
+
 async function analizarComprobante(id, file, statusEl) {
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
@@ -2372,8 +2394,7 @@ async function analizarComprobante(id, file, statusEl) {
     // Antes se mostraba siempre el mismo mensaje genérico, así que un PDF
     // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
     // se veía exactamente igual que cualquier otro problema.
-    statusEl.textContent = `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano.`;
-    statusEl.className = "ocr-status show err";
+    mostrarErrorOcr(statusEl, err, () => analizarComprobante(id, file, statusEl));
   }
 }
 
@@ -2448,8 +2469,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     statusEl.className = "ocr-status show ok";
   } catch (err) {
     console.error("Error en OCR:", err);
-    statusEl.textContent = `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano.`;
-    statusEl.className = "ocr-status show err";
+    mostrarErrorOcr(statusEl, err, () => analizarComprobanteGastoDirecto(id, file, statusEl));
   }
 }
 
