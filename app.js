@@ -2330,11 +2330,19 @@ async function llamarOcrRecibo(file) {
     // falta de configuración) queda en error.context (el Response),
     // así que hay que leerlo a mano para no perderlo.
     let mensaje = error.message;
+    let previaId = null;
     try {
       const cuerpo = await error.context?.json();
       if (cuerpo?.error) mensaje = cuerpo.error;
+      // ocr-recibo sube el comprobante y lo encola en ocr_previos apenas
+      // falla en vivo (ver migracion_ocr_previo.sql) -- este id es lo que
+      // deja seguirlo (disparar el agente altiro + saber cuándo esté listo)
+      // sin esperar a que se envíe la rendición.
+      if (cuerpo?.previaId) previaId = cuerpo.previaId;
     } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
-    throw new Error(mensaje);
+    const err = new Error(mensaje);
+    err.previaId = previaId;
+    throw err;
   }
   if (data?.error) throw new Error(data.error);
   return data;
@@ -2392,46 +2400,93 @@ function mostrarErrorOcr(statusEl, err, reintentar) {
   ]));
 }
 
+// Aplica el resultado de la IA a los campos de un ítem "Documento
+// electrónico" -- lo usa tanto el éxito en vivo (más abajo) como la cola
+// PRE-envío (ocr_previos) cuando el agente en segundo plano lo resuelve
+// mientras el formulario sigue abierto (ver dispararAgenteYEsperar). "gen"
+// evita pisar datos más nuevos si la persona ya seleccionó otro archivo
+// mientras tanto.
+async function aplicarResultadoOcrCon(id, data, gen) {
+  if (!esGeneracionVigenteOcr(id, gen)) return;
+  ocrExitoso.set(id, true);
+  if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
+  if (data.rut_proveedor) {
+    const rutFormateado = formatearRut(data.rut_proveedor);
+    document.getElementById(`${id}-rut`).value = rutFormateado;
+    // Si ese RUT ya está en la contabilidad, su razón social real le gana
+    // a lo que la IA haya alcanzado a leer de la imagen.
+    const nombreReal = await buscarNombreProveedorPorRut(rutFormateado);
+    if (nombreReal && esGeneracionVigenteOcr(id, gen)) document.getElementById(`${id}-nombreprov`).value = nombreReal;
+  }
+  if (data.tipo_documento && TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
+    document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
+  }
+  if (data.nro_documento) document.getElementById(`${id}-folio`).value = data.nro_documento;
+  if (data.fecha) document.getElementById(`${id}-venc`).value = data.fecha;
+  if (data.descripcion) document.getElementById(`${id}-desc`).value = data.descripcion;
+  // Number.isFinite: aunque ocr-recibo ya descarta un monto que no sea un
+  // número válido, un segundo chequeo acá es gratis y evita mostrar
+  // literalmente "NaN" en el campo si algo cambiara del lado del servidor.
+  if (data.monto && Number.isFinite(Number(data.monto))) {
+    document.getElementById(`${id}-monto`).value = Number(data.monto).toLocaleString("es-CL");
+  }
+  // Igual que en "Gasto directo": solo se aplica si existe tal cual en
+  // el desplegable, el campo queda visible y editable para confirmarla.
+  if (data.categoria_sugerida) {
+    const catSelect = document.getElementById(`${id}-categoriacon`);
+    if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+      catSelect.value = data.categoria_sugerida;
+    }
+  }
+  if (esGeneracionVigenteOcr(id, gen)) recalcTotal();
+}
+
+// Dispara el agente de reintento en segundo plano AHORA MISMO (en vez de
+// esperar hasta 5 minutos al próximo tick del cron -- ver
+// ocr-reintento-pendientes) y sondea el resultado mientras el ítem siga en
+// el formulario. Si el agente termina antes de que se envíe la rendición,
+// el resultado se aplica directo a los campos vía "aplicar" (como una
+// lectura en vivo exitosa: acá todavía no se guardó ni decidió nada). Si la
+// persona ya envió la rendición o cambió de archivo antes de que termine,
+// esta fila de ocr_previos simplemente queda sin aplicar -- no rompe nada,
+// el ítem ya guardado tiene su propia cola aparte (submitRendicion).
+function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
+  if (!previaId) return;
+  notificarAsync("ocr-reintento-pendientes", {}, "No se pudo disparar el reintento inmediato de OCR:");
+
+  const INTERVALO_MS = 5000;
+  const MAX_SONDEOS = 18; // ~90s de sondeo -- pasado eso, se deja que el cron lo siga intentando solo, sin seguir consultando desde un formulario que quizás ni sigue abierto
+  let intento = 0;
+  const sondear = async () => {
+    intento++;
+    // Se corta en silencio (no es un error, es solo dejar de esperar) si:
+    // ya hay una llamada más nueva para este ítem, el ítem se quitó del
+    // formulario, o se acabaron los sondeos.
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+    const { data, error } = await db.from("ocr_previos").select("estado, resultado").eq("id", previaId).maybeSingle();
+    if (error || !data) return;
+    if (data.estado === "listo" && data.resultado) {
+      await aplicar(data.resultado, gen);
+      if (esGeneracionVigenteOcr(id, gen)) {
+        statusEl.textContent = "✔ La IA logró leer el comprobante en un reintento automático. Revísalo antes de enviar.";
+        statusEl.className = "ocr-status show ok";
+      }
+      return;
+    }
+    if (data.estado === "agotado" || intento >= MAX_SONDEOS) return;
+    setTimeout(sondear, INTERVALO_MS);
+  };
+  setTimeout(sondear, INTERVALO_MS);
+}
+
 async function analizarComprobante(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
     const data = await llamarOcrRecibo(file);
+    await aplicarResultadoOcrCon(id, data, gen);
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
-    ocrExitoso.set(id, true);
-
-    if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
-    if (data.rut_proveedor) {
-      const rutFormateado = formatearRut(data.rut_proveedor);
-      document.getElementById(`${id}-rut`).value = rutFormateado;
-      // Si ese RUT ya está en la contabilidad, su razón social real le gana
-      // a lo que la IA haya alcanzado a leer de la imagen.
-      const nombreReal = await buscarNombreProveedorPorRut(rutFormateado);
-      if (nombreReal && esGeneracionVigenteOcr(id, gen)) document.getElementById(`${id}-nombreprov`).value = nombreReal;
-    }
-    if (data.tipo_documento && TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
-      document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
-    }
-    if (data.nro_documento) document.getElementById(`${id}-folio`).value = data.nro_documento;
-    if (data.fecha) document.getElementById(`${id}-venc`).value = data.fecha;
-    if (data.descripcion) document.getElementById(`${id}-desc`).value = data.descripcion;
-    // Number.isFinite: aunque ocr-recibo ya descarta un monto que no sea un
-    // número válido, un segundo chequeo acá es gratis y evita mostrar
-    // literalmente "NaN" en el campo si algo cambiara del lado del servidor.
-    if (data.monto && Number.isFinite(Number(data.monto))) {
-      const montoInput = document.getElementById(`${id}-monto`);
-      montoInput.value = Number(data.monto).toLocaleString("es-CL");
-    }
-    // Igual que en "Gasto directo": solo se aplica si existe tal cual en
-    // el desplegable, el campo queda visible y editable para confirmarla.
-    if (data.categoria_sugerida) {
-      const catSelect = document.getElementById(`${id}-categoriacon`);
-      if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
-        catSelect.value = data.categoria_sugerida;
-      }
-    }
-    recalcTotal();
 
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
@@ -2442,6 +2497,7 @@ async function analizarComprobante(id, file, statusEl) {
     // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
     // se veía exactamente igual que cualquier otro problema.
     mostrarErrorOcr(statusEl, err, () => analizarComprobante(id, file, statusEl));
+    dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrCon(id, data, g), statusEl);
   }
 }
 
@@ -2484,42 +2540,41 @@ async function mostrarHistorialProveedor(id, nombreProveedor) {
   hint.className = "ocr-status show";
 }
 
+// Par de aplicarResultadoOcrCon, para "Boleta" (Gasto directo) -- ver el
+// comentario de aquella.
+async function aplicarResultadoOcrSin(id, data, gen) {
+  if (!esGeneracionVigenteOcr(id, gen)) return;
+  ocrExitoso.set(id, true);
+  if (data.nombre_proveedor) {
+    document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
+    mostrarHistorialProveedor(id, data.nombre_proveedor);
+  }
+  if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
+  if (data.monto && Number.isFinite(Number(data.monto))) {
+    document.getElementById(`${id}-monto2`).value = Number(data.monto).toLocaleString("es-CL");
+  }
+  // La categoría sugerida solo se aplica si existe tal cual en el
+  // desplegable (puede estar filtrado por las cuentas permitidas del
+  // usuario) -- el campo queda igual visible y editable para que la
+  // persona la confirme o la cambie, nunca se oculta.
+  if (data.categoria_sugerida) {
+    const catSelect = document.getElementById(`${id}-categoria`);
+    if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+      catSelect.value = data.categoria_sugerida;
+      catSelect.dispatchEvent(new Event("change"));
+    }
+  }
+  if (esGeneracionVigenteOcr(id, gen)) recalcTotal();
+}
+
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
     const data = await llamarOcrRecibo(file);
+    await aplicarResultadoOcrSin(id, data, gen);
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
-    ocrExitoso.set(id, true);
-
-    if (data.nombre_proveedor) {
-      document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
-      mostrarHistorialProveedor(id, data.nombre_proveedor);
-    }
-    if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
-    // Number.isFinite: aunque ocr-recibo ya descarta un monto que no sea un
-    // número válido, un segundo chequeo acá es gratis y evita mostrar
-    // literalmente "NaN" en el campo si algo cambiara del lado del servidor.
-    if (data.monto && Number.isFinite(Number(data.monto))) {
-      const montoInput = document.getElementById(`${id}-monto2`);
-      montoInput.value = Number(data.monto).toLocaleString("es-CL");
-    }
-    // La categoría sugerida solo se aplica si existe tal cual en el
-    // desplegable (puede estar filtrado por las cuentas permitidas del
-    // usuario) -- el campo queda igual visible y editable para que la
-    // persona la confirme o la cambie, nunca se oculta.
-    if (data.categoria_sugerida) {
-      const catSelect = document.getElementById(`${id}-categoria`);
-      // El "&&" con catSelect: hoy siempre existe (ver buildSinDocumentoFields),
-      // pero analizarComprobante (su par) sí lo chequea -- consistencia entre
-      // ambas, para no reventar acá si algún día deja de ser cierto.
-      if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
-        catSelect.value = data.categoria_sugerida;
-        catSelect.dispatchEvent(new Event("change"));
-      }
-    }
-    recalcTotal();
 
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
@@ -2527,6 +2582,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
     mostrarErrorOcr(statusEl, err, () => analizarComprobanteGastoDirecto(id, file, statusEl));
+    dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrSin(id, data, g), statusEl);
   }
 }
 

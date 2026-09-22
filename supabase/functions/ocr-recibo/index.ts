@@ -52,11 +52,15 @@ Deno.serve(async (req: Request) => {
 
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   let userId: string | null = null;
+  // Declarados afuera del try porque el catch los necesita para encolar el
+  // comprobante en ocr_previos si la lectura en vivo falla -- ver más abajo.
+  let imageBase64: string | undefined;
+  let mimeType: string | undefined;
   try {
     const user = await requireUser(req);
     userId = user.id;
 
-    const { imageBase64, mimeType } = await req.json();
+    ({ imageBase64, mimeType } = await req.json());
 
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
@@ -97,13 +101,43 @@ Deno.serve(async (req: Request) => {
     });
   } catch (err) {
     const mensaje = String(err instanceof Error ? err.message : err);
+    const esRechazoEsperable = /No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje);
     // No registramos los rechazos esperables (sesión inválida, límite de
     // frecuencia) como "fallo" -- son parte del funcionamiento normal, no
     // algo que un admin necesite revisar en el registro de eventos.
-    if (!/No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje)) {
+    if (!esRechazoEsperable) {
       await logEvent(admin, "ocr_fail", { usuarioId: userId, detalle: mensaje });
     }
-    return new Response(JSON.stringify({ error: mensaje }), {
+
+    // El agente en segundo plano "toma el rol" apenas falla la lectura en
+    // vivo, no recién cuando se envía la rendición (ver
+    // migracion_ocr_previo.sql) -- se sube el comprobante a Storage y se
+    // encola en ocr_previos ACÁ MISMO, antes de responderle al frontend, así
+    // ocr-reintento-pendientes ya tiene algo real que reintentar desde el
+    // primer fallo. Best-effort: si esto falla (ej. Storage caído también),
+    // no debe tapar el mensaje de error original de Gemini con uno de
+    // Storage -- se loguea aparte y se responde igual sin previaId.
+    let previaId: string | null = null;
+    if (!esRechazoEsperable && userId && imageBase64) {
+      try {
+        const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
+        const path = `${userId}/previo-${crypto.randomUUID()}`;
+        const { error: errUpload } = await admin.storage.from("comprobantes").upload(path, bytes, {
+          contentType: mimeType || "application/octet-stream",
+        });
+        if (errUpload) throw errUpload;
+        const { data: previa, error: errInsert } = await admin.from("ocr_previos").insert({
+          usuario_id: userId,
+          storage_path: path,
+        }).select("id").single();
+        if (errInsert) throw errInsert;
+        previaId = previa.id as string;
+      } catch (errEncolar) {
+        console.error("No se pudo encolar el comprobante en ocr_previos:", errEncolar);
+      }
+    }
+
+    return new Response(JSON.stringify({ error: mensaje, previaId }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

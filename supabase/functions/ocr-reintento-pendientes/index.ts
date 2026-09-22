@@ -6,6 +6,14 @@
 // "Reintentar con IA": esto corre solo, programado con pg_cron (ver
 // migracion_ocr_reintento.sql), cada pocos minutos.
 //
+// Procesa DOS colas distintas, con la misma lógica:
+//   - ocr_previos: comprobantes que fallaron ANTES de que exista ninguna
+//     rendición (ocr-recibo los sube y encola ahí mismo apenas falla la
+//     lectura en vivo -- ver migracion_ocr_previo.sql). El "agente toma el
+//     rol" desde el primer fallo, no recién cuando se envía el formulario.
+//   - rendicion_items: comprobantes de ítems que YA se guardaron (la
+//     persona envió la rendición sin que el OCR hubiera tenido éxito).
+//
 // "Aprende" cuál modelo de Gemini probar primero (ver _shared/gemini-ocr.ts,
 // gemini_modelo_stats) y se auto-frena si detecta que la corrida anterior
 // falló casi entera -- durante una caída generalizada de Gemini, insistir
@@ -13,17 +21,19 @@
 // cada ítem sin ninguna chance real de éxito; mejor espaciar los intentos y
 // guardarlos para cuando la capacidad vuelva.
 //
-// Procesa cualquier ítem (ConDocumento o SinDocumento) de rendiciones que
-// SIGUEN Pendiente -- da lo mismo el tipo, mientras haya un comprobante
+// Para rendicion_items: solo de rendiciones que SIGUEN Pendiente -- da lo
+// mismo el tipo (ConDocumento o SinDocumento), mientras haya un comprobante
 // adjunto que el OCR en vivo no haya logrado leer. Una rendición ya
 // Aprobada/Rechazada no tiene sentido seguir reintentándola: nadie va a
 // mirar una sugerencia de IA para algo que ya se resolvió.
 //
-// El resultado NUNCA pisa datos ya guardados: se guarda aparte
-// (ocr_reintento_resultado) como una SUGERENCIA visible para quien revisa
-// el ítem, igual que la sugerencia de cuenta contable que ya existía --
-// aplicarlo o no queda a criterio humano, a través del flujo normal de
-// edición (que ya respeta los bloqueos de contenido post-aprobación).
+// El resultado NUNCA pisa datos ya guardados: en rendicion_items se guarda
+// aparte (ocr_reintento_resultado) como una SUGERENCIA visible para quien
+// revisa el ítem, igual que la sugerencia de cuenta contable que ya
+// existía -- aplicarlo o no queda a criterio humano. En ocr_previos, en
+// cambio, el frontend SÍ aplica el resultado directo a los campos del
+// formulario si todavía sigue abierto -- en esa etapa nada se ha guardado
+// ni decidido todavía, no hace falta tratarlo como sugerencia.
 //
 // Dos formas de disparar esta función:
 //   1. pg_cron, cada 5 minutos, con un secret compartido (CRON_SECRET) --
@@ -31,14 +41,15 @@
 //      seguridad: agarra lo que sea que quedó pendiente sin importar por
 //      qué (el navegador se cerró antes del disparo inmediato de abajo,
 //      ese disparo falló, etc).
-//   2. Con una sesión de usuario real, justo después de que submitRendicion
-//      (app.js) termina de guardar una rendición -- así el "agente" se pone
-//      a trabajar altiro en los ítems que esa persona acaba de dejar
-//      pendientes, en vez de que tengan que esperar hasta 5 minutos al
-//      próximo tick del cron. Acá se filtra a los ítems de ESE usuario
-//      (RLS no aplica -- se usa el service role igual que en modo cron --
-//      así que el filtro por empleado_id es lo único que evita que una
-//      persona dispare el reintento de comprobantes ajenos).
+//   2. Con una sesión de usuario real, justo después de un fallo de OCR en
+//      vivo (ocr-recibo) o de que submitRendicion (app.js) termina de
+//      guardar una rendición -- así el "agente" se pone a trabajar altiro
+//      en los comprobantes de esa persona, en vez de que tengan que
+//      esperar hasta 5 minutos al próximo tick del cron. Acá se filtra a
+//      los del usuario que llama (RLS no aplica -- se usa el service role
+//      igual que en modo cron -- así que el filtro por usuario/empleado_id
+//      es lo único que evita que una persona dispare el reintento de
+//      comprobantes ajenos).
 //
 // Deploy: supabase functions deploy ocr-reintento-pendientes
 // Secrets: supabase secrets set CRON_SECRET=<valor-random-largo>
@@ -75,25 +86,27 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Pocos ítems por corrida (no todos los pendientes de una sola vez): cada
-// uno puede tardar hasta ~22s (ver TIEMPO_MAX_TOTAL_MS en gemini-ocr.ts), y
-// las Edge Functions tienen su propio límite de tiempo total de ejecución.
-// Con el cron corriendo cada 5 minutos, un lote chico igual vacía la cola
-// rápido sin arriesgar que la función se corte a la mitad de un lote grande.
-const LOTE = 5;
-// Tope de reintentos por ítem -- si un comprobante lleva 6 pasadas sin
-// éxito (con el cron cada 5 min, más de media hora de intentos reales, no
-// solo un par de segundos), probablemente el problema es el documento en
-// sí (ilegible, corrupto) y no la disponibilidad de Gemini. Se marca
-// "agotado" para dejar de gastar cupo/tiempo en él para siempre.
+// Pocos ítems por corrida y por cola (no todos los pendientes de una sola
+// vez): cada uno puede tardar hasta ~22s (ver TIEMPO_MAX_TOTAL_MS en
+// gemini-ocr.ts), y las Edge Functions tienen su propio límite de tiempo
+// total de ejecución -- con dos colas activas en la misma corrida, un lote
+// grande en cada una podría superarlo.
+const LOTE_ITEMS = 4;
+const LOTE_PREVIOS = 3;
+// Tope de reintentos por comprobante -- si lleva 6 pasadas sin éxito (con
+// el cron cada 5 min, más de media hora de intentos reales, no solo un par
+// de segundos), probablemente el problema es el documento en sí (ilegible,
+// corrupto) y no la disponibilidad de Gemini. Se marca "agotado" para
+// dejar de gastar cupo/tiempo en él para siempre.
 const MAX_INTENTOS = 6;
 
 // Auto-frenado: si la corrida anterior falló en un 80% o más (y procesó al
-// menos 3 ítems, para no reaccionar a una muestra de 1), y fue hace menos
-// de este tiempo, se salta esta corrida entera sin gastar ningún intento.
-// Evita que una caída de Gemini de 40 minutos consuma los 6 MAX_INTENTOS de
-// cada ítem en los primeros 25 minutos, sin dejar nada en reserva para
-// cuando la capacidad realmente vuelva.
+// menos 3 comprobantes, para no reaccionar a una muestra de 1), y fue hace
+// menos de este tiempo, se salta esta corrida entera sin gastar ningún
+// intento. Evita que una caída de Gemini de 40 minutos consuma los 6
+// MAX_INTENTOS de cada comprobante en los primeros 25 minutos, sin dejar
+// nada en reserva para cuando la capacidad realmente vuelva. Solo aplica en
+// modo cron -- ver el comentario donde se usa, más abajo.
 const PAUSA_SI_CAIDA_GENERALIZADA_MS = 6 * 60 * 1000; // 6 minutos
 
 async function debePausarPorCaidaGeneralizada(admin: ReturnType<typeof createClient>): Promise<boolean> {
@@ -137,6 +150,58 @@ function mimeTypeDesdeNombre(path: string): string {
   return "image/jpeg";
 }
 
+// Misma lógica de descarga+lectura+actualización para las dos colas
+// (ocr_previos y rendicion_items) -- solo cambian la tabla y los nombres de
+// columna. Devuelve true si tuvo éxito.
+async function procesarPendiente(
+  admin: ReturnType<typeof createClient>,
+  tabla: string,
+  id: string,
+  storagePath: string,
+  intentosPrevios: number,
+  col: { estado: string; resultado: string; intentos: string; ultimo: string },
+): Promise<boolean> {
+  try {
+    const { data: archivo, error: errDescarga } = await admin.storage.from("comprobantes").download(storagePath);
+    // Comprobante ya no está en Storage (ej. "Limpiar archivos huérfanos"
+    // lo borró, o se editó/reemplazó) -- reintentar no tiene sentido, se
+    // agota de una sola vez en vez de esperar MAX_INTENTOS corridas para
+    // darse cuenta de lo mismo.
+    if (errDescarga || !archivo) {
+      await admin.from(tabla).update({
+        [col.estado]: "agotado",
+        [col.intentos]: MAX_INTENTOS,
+        [col.ultimo]: new Date().toISOString(),
+      }).eq("id", id);
+      console.error(`${tabla}: comprobante no encontrado para ${id}, se agota sin reintentar.`);
+      return false;
+    }
+    const base64 = arrayBufferToBase64(await archivo.arrayBuffer());
+    const mimeType = archivo.type || mimeTypeDesdeNombre(storagePath);
+    const resultado = await leerComprobante(admin, base64, mimeType);
+
+    await admin.from(tabla).update({
+      [col.estado]: "listo",
+      [col.resultado]: resultado,
+      [col.intentos]: intentosPrevios + 1,
+      [col.ultimo]: new Date().toISOString(),
+    }).eq("id", id);
+    return true;
+  } catch (err) {
+    const intentos = intentosPrevios + 1;
+    await admin.from(tabla).update({
+      [col.estado]: intentos >= MAX_INTENTOS ? "agotado" : "pendiente",
+      [col.intentos]: intentos,
+      [col.ultimo]: new Date().toISOString(),
+    }).eq("id", id);
+    console.error(`${tabla}: ${id} falló (intento ${intentos}):`, err);
+    return false;
+  }
+}
+
+const COL_ITEMS = { estado: "ocr_reintento_estado", resultado: "ocr_reintento_resultado", intentos: "ocr_reintento_intentos", ultimo: "ocr_reintento_ultimo" };
+const COL_PREVIOS = { estado: "estado", resultado: "resultado", intentos: "intentos", ultimo: "ultimo_intento" };
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -146,81 +211,57 @@ Deno.serve(async (req: Request) => {
 
     // El auto-frenado por caída generalizada es cosa del cron (que insiste
     // sobre TODOS los pendientes de TODOS los usuarios cada 5 min) -- un
-    // disparo inmediato de un usuario puntual, apenas envió su propia
-    // rendición, es un solo intento acotado (LOTE de acá abajo lo limita
-    // igual) y conviene que se note de verdad si Gemini sigue caído, no que
-    // se salte en silencio.
+    // disparo inmediato de un usuario puntual es un solo intento acotado
+    // (los LOTE_* de acá abajo lo limitan igual) y conviene que se note de
+    // verdad si Gemini sigue caído, no que se salte en silencio.
     if (auth.modo === "cron" && await debePausarPorCaidaGeneralizada(admin)) {
       return new Response(JSON.stringify({ ok: true, procesados: 0, exitosos: 0, nota: "Pausado: la corrida anterior falló casi entera, se espera antes de reintentar." }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
+    let procesados = 0;
+    let exitosos = 0;
+
+    // ---- Cola 1: ocr_previos (comprobantes de antes de enviar la rendición) ----
+    let consultaPrevios = admin
+      .from("ocr_previos")
+      .select("id, storage_path, intentos")
+      .eq("estado", "pendiente")
+      .order("ultimo_intento", { ascending: true, nullsFirst: true })
+      .limit(LOTE_PREVIOS);
+    if (auth.modo === "usuario") consultaPrevios = consultaPrevios.eq("usuario_id", auth.usuarioId);
+    const { data: previos, error: errPrevios } = await consultaPrevios;
+    if (errPrevios) throw errPrevios;
+    for (const p of previos || []) {
+      procesados++;
+      if (await procesarPendiente(admin, "ocr_previos", p.id as string, p.storage_path as string, (p.intentos as number) || 0, COL_PREVIOS)) exitosos++;
+    }
+
+    // ---- Cola 2: rendicion_items (ítems ya guardados sin OCR exitoso) ----
     // !inner con rendiciones.estado: una rendición ya Aprobada/Rechazada no
     // necesita seguir reintentando su OCR -- nadie va a revisar la
-    // sugerencia de un ítem que ya quedó resuelto. En modo "usuario" se
-    // suma el filtro por empleado_id -- ver el comentario de autorizar().
-    let consulta = admin
+    // sugerencia de un ítem que ya quedó resuelto.
+    let consultaItems = admin
       .from("rendicion_items")
       .select("id, adjunto_url, ocr_reintento_intentos, rendiciones!inner(estado, empleado_id)")
       .eq("ocr_reintento_estado", "pendiente")
       .eq("rendiciones.estado", "Pendiente")
       .not("adjunto_url", "is", null)
       .order("ocr_reintento_ultimo", { ascending: true, nullsFirst: true })
-      .limit(LOTE);
-    if (auth.modo === "usuario") {
-      consulta = consulta.eq("rendiciones.empleado_id", auth.usuarioId);
-    }
-    const { data: pendientes, error: errPend } = await consulta;
+      .limit(LOTE_ITEMS);
+    if (auth.modo === "usuario") consultaItems = consultaItems.eq("rendiciones.empleado_id", auth.usuarioId);
+    const { data: pendientes, error: errPend } = await consultaItems;
     if (errPend) throw errPend;
-
-    let procesados = 0;
-    let exitosos = 0;
     for (const item of pendientes || []) {
       procesados++;
-      const intentosPrevios = (item.ocr_reintento_intentos as number) || 0;
-      try {
-        const { data: archivo, error: errDescarga } = await admin.storage.from("comprobantes").download(item.adjunto_url as string);
-        // Comprobante ya no está en Storage (ej. "Limpiar archivos
-        // huérfanos" lo borró, o se editó el ítem y se reemplazó) --
-        // reintentar no tiene sentido, se agota de una sola vez en vez de
-        // esperar MAX_INTENTOS corridas para darse cuenta de lo mismo.
-        if (errDescarga || !archivo) {
-          await admin.from("rendicion_items").update({
-            ocr_reintento_estado: "agotado",
-            ocr_reintento_intentos: MAX_INTENTOS,
-            ocr_reintento_ultimo: new Date().toISOString(),
-          }).eq("id", item.id);
-          console.error(`ocr-reintento-pendientes: comprobante no encontrado para ítem ${item.id}, se agota sin reintentar.`);
-          continue;
-        }
-        const base64 = arrayBufferToBase64(await archivo.arrayBuffer());
-        const mimeType = archivo.type || mimeTypeDesdeNombre(item.adjunto_url as string);
-
-        const resultado = await leerComprobante(admin, base64, mimeType);
-
-        await admin.from("rendicion_items").update({
-          ocr_reintento_estado: "listo",
-          ocr_reintento_resultado: resultado,
-          ocr_reintento_intentos: intentosPrevios + 1,
-          ocr_reintento_ultimo: new Date().toISOString(),
-        }).eq("id", item.id);
-        exitosos++;
-      } catch (errItem) {
-        const intentos = intentosPrevios + 1;
-        await admin.from("rendicion_items").update({
-          ocr_reintento_estado: intentos >= MAX_INTENTOS ? "agotado" : "pendiente",
-          ocr_reintento_intentos: intentos,
-          ocr_reintento_ultimo: new Date().toISOString(),
-        }).eq("id", item.id);
-        console.error(`ocr-reintento-pendientes: ítem ${item.id} falló (intento ${intentos}):`, errItem);
-      }
+      if (await procesarPendiente(admin, "rendicion_items", item.id as string, item.adjunto_url as string, (item.ocr_reintento_intentos as number) || 0, COL_ITEMS)) exitosos++;
     }
 
-    // Un solo evento por corrida (no uno por ítem) -- corre cada 5 min sin
-    // que nadie lo esté mirando; un resumen agregado alcanza para el
-    // registro y para el auto-frenado de arriba, y no infla system_events
-    // con docenas de filas por hora.
+    // Un solo evento por corrida (no uno por comprobante) -- corre cada 5
+    // min sin que nadie lo esté mirando; un resumen agregado alcanza para
+    // el registro y para el auto-frenado de arriba, y no infla
+    // system_events con docenas de filas por hora.
     await logEvent(admin, "ocr_reintento_run", { metadata: { procesados, exitosos } });
     return new Response(JSON.stringify({ ok: true, procesados, exitosos }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
