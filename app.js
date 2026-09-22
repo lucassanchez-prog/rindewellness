@@ -2373,7 +2373,13 @@ function mostrarErrorOcr(statusEl, err, reintentar) {
   statusEl.textContent = "";
   statusEl.className = "ocr-status show err";
   statusEl.appendChild(document.createTextNode(
-    `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano, o reintenta:`
+    // No es obligatorio completar todo a mano acá: alcanza con el monto para
+    // poder enviar la rendición (lo único que de verdad exige el formulario
+    // -- ver submitRendicion). Si se envía igual, el ítem queda en cola y el
+    // agente de reintento en segundo plano (ocr-reintento-pendientes, cada
+    // 5 min) se encarga de leer el resto solo, sin que nadie tenga que
+    // volver a intentarlo a mano.
+    `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). No hace falta completar todo a mano: con el monto alcanza para enviar la rendición igual, y la IA sigue intentando leer el resto sola en segundo plano. O reintenta ahora mismo:`
   ));
   // .btn-sm real (no un link de texto disfrazado de botón) -- en su propia
   // línea, para que quede claro que es una acción y no parte de la oración.
