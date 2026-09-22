@@ -57,7 +57,7 @@ const VENTANA_RECIENTE_MS = 3 * 60 * 60 * 1000; // 3 horas
 // Registra el resultado de UN intento contra UN modelo -- no bloquea el
 // flujo principal si falla (una tabla de estadística que no se pudo
 // actualizar no debería tumbar una lectura de comprobante que sí funcionó).
-async function registrarIntentoModelo(admin: AdminClient | null, modelo: string, exito: boolean) {
+async function registrarIntentoModelo(admin: AdminClient | null, modelo: string, exito: boolean, mensajeError?: string) {
   if (!admin) return;
   try {
     const ahora = new Date().toISOString();
@@ -68,6 +68,11 @@ async function registrarIntentoModelo(admin: AdminClient | null, modelo: string,
       intentos_fail: (fila?.intentos_fail || 0) + (exito ? 0 : 1),
       ultimo_resultado: exito ? "ok" : "fail",
       ultimo_intento: ahora,
+      // El mensaje crudo POR MODELO. Sin esto solo quedaba en console.error
+      // de la Edge Function (que no se puede consultar desde acá), y hubo
+      // que deducir qué estaba fallando mirando los tiempos entre intentos
+      // -- costó horas de diagnóstico a ciegas.
+      ultimo_error: exito ? null : (mensajeError || null),
     });
   } catch (err) {
     console.error(`No se pudo registrar estadística de Gemini para ${modelo}:`, err);
@@ -229,7 +234,7 @@ async function llamarGemini(admin: AdminClient | null, modelo: string, intentosM
         : `Error de red consultando Gemini: ${String(errRed instanceof Error ? errRed.message : errRed)}`;
     }
 
-    await registrarIntentoModelo(admin, modelo, false);
+    await registrarIntentoModelo(admin, modelo, false, mensaje);
     ultimoError = new Error(mensaje);
     (ultimoError as Error & { reintentable?: boolean }).reintentable = esErrorDeRed || esErrorDeModelo(mensaje);
     const tiempoRestante = presupuesto.totalMs - (Date.now() - inicio);
