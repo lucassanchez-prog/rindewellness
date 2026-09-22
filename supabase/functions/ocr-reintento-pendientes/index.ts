@@ -25,9 +25,20 @@
 // aplicarlo o no queda a criterio humano, a través del flujo normal de
 // edición (que ya respeta los bloqueos de contenido post-aprobación).
 //
-// No requiere sesión de usuario (no hay ninguna persona logueada disparando
-// esto) -- en cambio, exige un secret compartido (CRON_SECRET) que solo
-// conoce el propio job de pg_cron.
+// Dos formas de disparar esta función:
+//   1. pg_cron, cada 5 minutos, con un secret compartido (CRON_SECRET) --
+//      procesa el lote más viejo de CUALQUIER usuario. Es la red de
+//      seguridad: agarra lo que sea que quedó pendiente sin importar por
+//      qué (el navegador se cerró antes del disparo inmediato de abajo,
+//      ese disparo falló, etc).
+//   2. Con una sesión de usuario real, justo después de que submitRendicion
+//      (app.js) termina de guardar una rendición -- así el "agente" se pone
+//      a trabajar altiro en los ítems que esa persona acaba de dejar
+//      pendientes, en vez de que tengan que esperar hasta 5 minutos al
+//      próximo tick del cron. Acá se filtra a los ítems de ESE usuario
+//      (RLS no aplica -- se usa el service role igual que en modo cron --
+//      así que el filtro por empleado_id es lo único que evita que una
+//      persona dispare el reintento de comprobantes ajenos).
 //
 // Deploy: supabase functions deploy ocr-reintento-pendientes
 // Secrets: supabase secrets set CRON_SECRET=<valor-random-largo>
@@ -38,8 +49,26 @@ import { logEvent } from "../_shared/logging.ts";
 import { leerComprobante } from "../_shared/gemini-ocr.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const CRON_SECRET = Deno.env.get("CRON_SECRET");
+
+type Autorizacion = { modo: "cron" } | { modo: "usuario"; usuarioId: string };
+
+async function autorizar(req: Request): Promise<Autorizacion> {
+  const authHeader = req.headers.get("Authorization") || "";
+  if (CRON_SECRET && authHeader === `Bearer ${CRON_SECRET}`) {
+    return { modo: "cron" };
+  }
+  // No es el secret del cron -- se acepta también un JWT de usuario real
+  // (ver punto 2 más arriba). Si no es ninguno de los dos, no autorizado.
+  const jwt = authHeader.replace(/^Bearer\s+/i, "");
+  if (!jwt) throw new Error("No autorizado.");
+  const anon = createClient(SUPABASE_URL, ANON_KEY);
+  const { data, error } = await anon.auth.getUser(jwt);
+  if (error || !data?.user) throw new Error("No autorizado.");
+  return { modo: "usuario", usuarioId: data.user.id };
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -113,15 +142,15 @@ Deno.serve(async (req: Request) => {
 
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   try {
-    // Comparación simple de string -- alcanza acá porque el secret solo lo
-    // conocen el propio proyecto (env var) y el job de pg_cron que se
-    // configura con el mismo valor, no hay usuarios de por medio.
-    const authHeader = req.headers.get("Authorization") || "";
-    if (!CRON_SECRET || authHeader !== `Bearer ${CRON_SECRET}`) {
-      throw new Error("No autorizado.");
-    }
+    const auth = await autorizar(req);
 
-    if (await debePausarPorCaidaGeneralizada(admin)) {
+    // El auto-frenado por caída generalizada es cosa del cron (que insiste
+    // sobre TODOS los pendientes de TODOS los usuarios cada 5 min) -- un
+    // disparo inmediato de un usuario puntual, apenas envió su propia
+    // rendición, es un solo intento acotado (LOTE de acá abajo lo limita
+    // igual) y conviene que se note de verdad si Gemini sigue caído, no que
+    // se salte en silencio.
+    if (auth.modo === "cron" && await debePausarPorCaidaGeneralizada(admin)) {
       return new Response(JSON.stringify({ ok: true, procesados: 0, exitosos: 0, nota: "Pausado: la corrida anterior falló casi entera, se espera antes de reintentar." }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -129,15 +158,20 @@ Deno.serve(async (req: Request) => {
 
     // !inner con rendiciones.estado: una rendición ya Aprobada/Rechazada no
     // necesita seguir reintentando su OCR -- nadie va a revisar la
-    // sugerencia de un ítem que ya quedó resuelto.
-    const { data: pendientes, error: errPend } = await admin
+    // sugerencia de un ítem que ya quedó resuelto. En modo "usuario" se
+    // suma el filtro por empleado_id -- ver el comentario de autorizar().
+    let consulta = admin
       .from("rendicion_items")
-      .select("id, adjunto_url, ocr_reintento_intentos, rendiciones!inner(estado)")
+      .select("id, adjunto_url, ocr_reintento_intentos, rendiciones!inner(estado, empleado_id)")
       .eq("ocr_reintento_estado", "pendiente")
       .eq("rendiciones.estado", "Pendiente")
       .not("adjunto_url", "is", null)
       .order("ocr_reintento_ultimo", { ascending: true, nullsFirst: true })
       .limit(LOTE);
+    if (auth.modo === "usuario") {
+      consulta = consulta.eq("rendiciones.empleado_id", auth.usuarioId);
+    }
+    const { data: pendientes, error: errPend } = await consulta;
     if (errPend) throw errPend;
 
     let procesados = 0;

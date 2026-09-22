@@ -2901,6 +2901,7 @@ async function submitRendicion() {
   }
 
   if (!items.length) { toast("Ingresa el monto de al menos un ítem."); return; }
+  const hayItemsPendientesOcr = items.some((it) => it.ocr_reintento_estado === "pendiente");
 
   let solicitudFondoId = null;
   if (tipoRendicion === "FondoPorRendir") {
@@ -3031,6 +3032,16 @@ async function submitRendicion() {
     }
 
     notificarAsync("notificar-aprobador", { rendicion_id: rendicion.id }, "No se pudo notificar al aprobador:");
+
+    // Si algún ítem quedó con el comprobante sin leer, no hace falta
+    // esperar hasta 5 minutos al próximo tick del cron (ver
+    // migracion_ocr_reintento.sql) -- se dispara altiro un intento
+    // inmediato, con sesión propia (el agente scopea a los ítems de este
+    // mismo usuario, ver ocr-reintento-pendientes). Fire-and-forget: si
+    // falla, el cron de todos modos lo agarra más tarde.
+    if (hayItemsPendientesOcr) {
+      notificarAsync("ocr-reintento-pendientes", {}, "No se pudo disparar el reintento inmediato de OCR:");
+    }
 
     toast("Rendición enviada a aprobación.");
     replaceView("view-dashboard");
