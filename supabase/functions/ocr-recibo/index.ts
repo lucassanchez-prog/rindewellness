@@ -12,9 +12,11 @@
 // Secret:  supabase secrets set GEMINI_API_KEY=tu-api-key
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 async function requireUser(req: Request) {
   const authHeader = req.headers.get("Authorization") || "";
@@ -34,7 +36,10 @@ async function requireUser(req: Request) {
 }
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
-const GEMINI_MODEL = "gemini-3.6-flash";
+// Configurable por si Google renombra/da de baja el alias del modelo --
+// antes estaba fijo en el código, así que un cambio de Google rompía el OCR
+// para todos por igual, sin forma de corregirlo sin un redeploy.
+const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-3.6-flash";
 const GEMINI_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -81,12 +86,32 @@ Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la list
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+  let userId: string | null = null;
   try {
-    await requireUser(req);
+    const user = await requireUser(req);
+    userId = user.id;
     if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
+
+    // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
+    // llamar esta función en loop sin ningún tope, consumiendo la cuota
+    // paga de Gemini sin control. 40 comprobantes por hora es bastante más
+    // de lo que alguien carga a mano en una rendición real.
+    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
+    if (llamadasRecientes >= 40) {
+      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
+    }
+    await logEvent(admin, "ocr_call", { usuarioId: userId });
 
     const { imageBase64, mimeType } = await req.json();
     if (!imageBase64) throw new Error("Falta la imagen (imageBase64).");
+    // ~15MB de archivo original equivalen a ~20M caracteres en base64
+    // (overhead ~33%). Sin este tope, un PDF/foto gigante se manda entero a
+    // Gemini y puede colgar la función o fallar con un error de red opaco
+    // en vez de un mensaje claro.
+    if (imageBase64.length > 20_000_000) {
+      throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
+    }
 
     const body = {
       contents: [
@@ -161,7 +186,14 @@ Deno.serve(async (req: Request) => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err instanceof Error ? err.message : err) }), {
+    const mensaje = String(err instanceof Error ? err.message : err);
+    // No registramos los rechazos esperables (sesión inválida, límite de
+    // frecuencia) como "fallo" -- son parte del funcionamiento normal, no
+    // algo que un admin necesite revisar en el registro de eventos.
+    if (!/No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje)) {
+      await logEvent(admin, "ocr_fail", { usuarioId: userId, detalle: mensaje });
+    }
+    return new Response(JSON.stringify({ error: mensaje }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

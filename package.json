@@ -1,0 +1,9 @@
+{
+  "name": "rindewellness",
+  "private": true,
+  "version": "1.0.0",
+  "description": "RindeWellness -- app de rendición de gastos (frontend estático, sin build step). Este package.json existe solo para correr los tests de pure.js con el test runner incorporado de Node.",
+  "scripts": {
+    "test": "node --test tests/"
+  }
+}

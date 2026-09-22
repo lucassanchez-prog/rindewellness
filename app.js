@@ -2,36 +2,11 @@
 // RindeWellness - lógica de la app (vanilla JS + Supabase)
 // ============================================================
 
-// Formatea un RUT chileno con puntos de miles y guión (ej. "21.315.322-6").
-// Se aplica al guardar/perder foco, para que quede así en toda la app,
-// exportaciones y comprobantes -- nunca sin puntos.
-function formatearRut(rut) {
-  const limpio = String(rut || "").replace(/[^0-9kK]/g, "").toUpperCase();
-  if (limpio.length < 2) return limpio;
-  const cuerpo = limpio.slice(0, -1).replace(/^0+/, "") || "0";
-  const dv = limpio.slice(-1);
-  const cuerpoFormateado = cuerpo.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
-  return `${cuerpoFormateado}-${dv}`;
-}
-
-// Valida el dígito verificador de un RUT chileno (algoritmo módulo 11).
-// No confirma que la persona exista, solo que el número está bien escrito
-// (pesca typos como transponer dígitos).
-function validarRut(rut) {
-  const limpio = String(rut || "").replace(/[^0-9kK]/g, "").toUpperCase();
-  if (limpio.length < 2) return false;
-  const cuerpo = limpio.slice(0, -1);
-  const dv = limpio.slice(-1);
-  let suma = 0;
-  let multiplo = 2;
-  for (let i = cuerpo.length - 1; i >= 0; i--) {
-    suma += parseInt(cuerpo[i], 10) * multiplo;
-    multiplo = multiplo === 7 ? 2 : multiplo + 1;
-  }
-  const resto = 11 - (suma % 11);
-  const dvEsperado = resto === 11 ? "0" : resto === 10 ? "K" : String(resto);
-  return dv === dvEsperado;
-}
+// formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash y parseMoneyValue
+// viven en pure.js (cargado antes que este archivo, ver index.html) -- son
+// funciones puras sin DOM ni red, separadas para poder testearlas con Node
+// (ver tests/pure.test.js) sin arrastrar el resto de la app.
+const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue } = window.RindeCore;
 
 const CFG = window.RINDE_WELLNESS_CONFIG || {};
 let db = null; // proyecto propio de la app (lectura/escritura)
@@ -167,29 +142,6 @@ const CATEGORIAS_GASTO = [
 // ------------------------------------------------------------
 // Utilidades
 // ------------------------------------------------------------
-function fmtCLP(n) {
-  return "$" + Math.round(n || 0).toLocaleString("es-CL");
-}
-function fmtDate(d) {
-  if (!d) return "";
-  // Una fecha "sola" (YYYY-MM-DD, sin hora) hay que leerla como fecha de
-  // calendario local: si se la pasamos tal cual a `new Date()`, JS la
-  // interpreta como medianoche UTC y, en Chile (UTC-3/-4), se muestra un
-  // día antes. Los timestamps completos (con hora) sí se convierten a hora
-  // local normalmente.
-  const soloFecha = /^\d{4}-\d{2}-\d{2}$/.exec(String(d));
-  if (soloFecha) {
-    const [y, m, day] = String(d).split("-").map(Number);
-    return new Date(y, m - 1, day).toLocaleDateString("es-CL");
-  }
-  return new Date(d).toLocaleDateString("es-CL");
-}
-// Kame espera DD/MM/AAAA. fmtDate ya da DD-MM-AAAA (formato es-CL), así que
-// alcanza con cambiar los guiones por barras -- OJO: dar vuelta el orden acá
-// (como se hacía antes) invierte el día y el año.
-function fmtDateSlash(d) {
-  return fmtDate(d).replace(/-/g, "/");
-}
 function show(viewId) {
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   document.getElementById(viewId).classList.add("active");
@@ -212,6 +164,7 @@ function estadoDesdeHash() {
   if (base === "detalle-solicitud" && param) return { viewId: "view-detalle-solicitud", params: { id: param } };
   if (base === "admin") return { viewId: "view-admin", params: {} };
   if (base === "plantillas") return { viewId: "view-plantillas", params: {} };
+  if (base === "reportes") return { viewId: "view-reportes", params: {} };
   if (base === "nueva") return { viewId: "view-nueva", params: {} };
   if (base === "nueva-solicitud") return { viewId: "view-nueva-solicitud", params: {} };
   return { viewId: "view-dashboard", params: {} };
@@ -232,6 +185,7 @@ function renderRoute(state) {
   if (viewId === "view-detalle-solicitud" && params.id) { openDetalleSolicitud(params.id, false); return; }
   if (viewId === "view-admin") { openAdminUsuarios(false); return; }
   if (viewId === "view-plantillas") { openAdminPlantillas(false); return; }
+  if (viewId === "view-reportes") { openReportes(false); return; }
   if (viewId === "view-nueva") { openNuevaRendicion(false); return; }
   if (viewId === "view-nueva-solicitud") { openNuevaSolicitud(false); return; }
   show("view-dashboard");
@@ -584,7 +538,7 @@ async function onLoggedIn(user) {
     profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
   document.getElementById("btn-admin-usuarios").style.display =
     profile && profile.rol === "admin" ? "inline-block" : "none";
-  document.getElementById("btn-admin-plantillas").style.display =
+  document.getElementById("btn-reportes").style.display =
     profile && profile.rol === "admin" ? "inline-block" : "none";
   document.getElementById("btn-exportar-excel").style.display =
     profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
@@ -597,7 +551,7 @@ async function onLoggedIn(user) {
   // rendición o "Usuarios", te dejamos en esa misma pantalla en vez de
   // mandarte siempre al dashboard -- el hash de la URL sobrevive la recarga.
   const estadoInicial = estadoDesdeHash();
-  const esVistaSoloAdmin = estadoInicial.viewId === "view-admin" || estadoInicial.viewId === "view-plantillas";
+  const esVistaSoloAdmin = ["view-admin", "view-plantillas", "view-reportes"].includes(estadoInicial.viewId);
   if (esVistaSoloAdmin && profile?.rol !== "admin") {
     replaceView("view-dashboard");
     await loadDashboard();
@@ -630,6 +584,7 @@ function wireDashboard() {
   document.getElementById("btn-nueva").addEventListener("click", () => openNuevaRendicion());
   document.getElementById("btn-solicitar-fondos").addEventListener("click", () => openNuevaSolicitud());
   document.getElementById("btn-admin-usuarios").addEventListener("click", () => openAdminUsuarios());
+  document.getElementById("btn-reportes").addEventListener("click", () => openReportes());
   const btnExportarExcel = document.getElementById("btn-exportar-excel");
   btnExportarExcel.addEventListener("click", async () => {
     btnExportarExcel.disabled = true;
@@ -639,7 +594,6 @@ function wireDashboard() {
     btnExportarExcel.disabled = false;
     btnExportarExcel.textContent = textoOriginal;
   });
-  document.getElementById("btn-admin-plantillas").addEventListener("click", () => openAdminPlantillas());
   document.getElementById("btn-comprobante-rango").addEventListener("click", () => {
     document.getElementById("panel-rango").style.display = "block";
   });
@@ -871,6 +825,98 @@ function renderListSolicitudes(container, rows, showEmpleado) {
 }
 
 // ------------------------------------------------------------
+// Reportes (solo admin): gasto acumulado por empresa y por categoría, en
+// el rango de fechas elegido. No pega una consulta nueva a la base -- el
+// admin ya trae TODAS las rendiciones en dashboardData.aprobaciones (ver
+// loadDashboard), así que esto solo agrupa lo que ya está en memoria.
+// ------------------------------------------------------------
+async function openReportes(pushHistory = true) {
+  if (pushHistory) pushView("view-reportes"); else show("view-reportes");
+  const desdeInput = document.getElementById("reportes-desde");
+  const hastaInput = document.getElementById("reportes-hasta");
+  if (!desdeInput.value) {
+    const hace30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    desdeInput.value = hace30.toISOString().slice(0, 10);
+  }
+  if (!hastaInput.value) hastaInput.value = new Date().toISOString().slice(0, 10);
+
+  desdeInput.onchange = renderReportes;
+  hastaInput.onchange = renderReportes;
+
+  // Si todavía no se cargó el dashboard en esta sesión (ej. F5 directo en
+  // #reportes), dashboardData.aprobaciones viene vacío -- lo pedimos antes
+  // de renderizar para no mostrar "sin datos" de entrada.
+  if (!dashboardData.aprobaciones.length) await loadDashboard();
+  renderReportes();
+}
+
+async function renderReportes() {
+  const cont = document.getElementById("reportes-contenido");
+  const desde = document.getElementById("reportes-desde").value;
+  const hasta = document.getElementById("reportes-hasta").value;
+  const desdeMs = desde ? new Date(desde + "T00:00:00").getTime() : -Infinity;
+  const hastaMs = hasta ? new Date(hasta + "T23:59:59").getTime() : Infinity;
+
+  const rendicionesEnRango = dashboardData.aprobaciones.filter((r) => {
+    const t = new Date(r.created_at).getTime();
+    return r.estado === "Aprobado" && t >= desdeMs && t <= hastaMs;
+  });
+
+  cont.innerHTML = "";
+  if (!rendicionesEnRango.length) {
+    cont.appendChild(el("div", { class: "empty-state" }, "No hay rendiciones aprobadas en este rango de fechas."));
+    return;
+  }
+
+  const porEmpresa = {};
+  rendicionesEnRango.forEach((r) => {
+    const clave = r.empresa || "Sin empresa";
+    porEmpresa[clave] = (porEmpresa[clave] || 0) + Number(r.monto_total || 0);
+  });
+
+  const totalGeneral = Object.values(porEmpresa).reduce((s, v) => s + v, 0);
+  cont.appendChild(el("div", { class: "totals-bar", style: "margin-bottom:18px;" }, [
+    el("span", {}, `Total aprobado (${rendicionesEnRango.length} rendición(es))`),
+    el("span", { class: "amount" }, fmtCLP(totalGeneral)),
+  ]));
+
+  const tablaEmpresa = (titulo, datos) => {
+    cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, titulo));
+    const tabla = el("table", { class: "items-table" });
+    tabla.appendChild(el("thead", {}, [el("tr", {}, [el("th", {}, "Nombre"), el("th", { class: "right" }, "Monto")])]));
+    const tbody = el("tbody");
+    Object.entries(datos).sort((a, b) => b[1] - a[1]).forEach(([nombre, monto]) => {
+      tbody.appendChild(el("tr", {}, [
+        el("td", { "data-label": "Nombre" }, nombre),
+        el("td", { class: "monto", "data-label": "Monto" }, fmtCLP(monto)),
+      ]));
+    });
+    tabla.appendChild(tbody);
+    cont.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+  };
+
+  tablaEmpresa("Por empresa", porEmpresa);
+
+  // Por categoría hace falta el detalle de ítems, que dashboardData no
+  // trae (solo cabeceras de rendiciones) -- se pide una sola vez acá, ya
+  // filtrado por las rendiciones del rango, en vez de traer TODOS los
+  // ítems de la base.
+  const { data: items, error } = await db
+    .from("rendicion_items")
+    .select("categoria, monto, empresa, tipo_item, estado")
+    .in("rendicion_id", rendicionesEnRango.map((r) => r.id))
+    .eq("estado", "Aprobado");
+  if (error) { console.error("Error cargando ítems para reportes:", error); return; }
+
+  const porCategoria = {};
+  (items || []).forEach((it) => {
+    const clave = it.tipo_item === "SinDocumento" ? (it.categoria || "Sin categoría") : "Documento electrónico";
+    porCategoria[clave] = (porCategoria[clave] || 0) + Number(it.monto || 0);
+  });
+  tablaEmpresa("Por categoría", porCategoria);
+}
+
+// ------------------------------------------------------------
 // Administración de usuarios (solo admin)
 // ------------------------------------------------------------
 const ROLES = ["empleado", "aprobador", "admin"];
@@ -904,6 +950,23 @@ async function openAdminUsuarios(pushHistory = true) {
   }
 
   document.getElementById("btn-ir-plantillas").onclick = () => openAdminPlantillas();
+
+  const btnRecordatorios = document.getElementById("btn-recordatorios");
+  btnRecordatorios.onclick = async () => {
+    btnRecordatorios.disabled = true;
+    const textoOriginal = btnRecordatorios.textContent;
+    btnRecordatorios.textContent = "Enviando...";
+    const { data, error } = await db.functions.invoke("recordatorios-pendientes", {});
+    if (error || !data?.ok) {
+      toast("No se pudo enviar: " + (error?.message || data?.error || "revisa los logs de la función en Supabase."));
+    } else if (data.total_pendientes) {
+      toast(`Recordatorio enviado a ${data.enviados} persona(s) sobre ${data.total_pendientes} pendiente(s).`);
+    } else {
+      toast(data.nota || "No había nada pendiente hace más de 3 días.");
+    }
+    btnRecordatorios.disabled = false;
+    btnRecordatorios.textContent = textoOriginal;
+  };
 
   const filtroRol = document.getElementById("filtro-usuarios-rol");
   const filtroTexto = document.getElementById("filtro-usuarios-texto");
@@ -1041,6 +1104,22 @@ function renderEditarPerfilPanel(cell, usuario, nombreCell) {
   const empresaField = fieldSelect("edit-perfil-empresa", "Empresa a la que pertenece", ["(Sin asignar)", ...EMPRESAS]);
   empresaField.querySelector("select").value = usuario.empresa_default || "(Sin asignar)";
 
+  // Delegación temporal de aprobación: para cuando el único aprobador/admin
+  // de turno está de vacaciones o con licencia. Mientras está activa y no
+  // vencida, esta persona cuenta como aprobador para todo efecto (ver
+  // is_admin_or_aprobador en migracion_mejoras_v2.sql), aunque su rol
+  // normal siga siendo "empleado".
+  const delegadoCheckbox = el("input", { type: "checkbox", id: "edit-perfil-delegado" });
+  delegadoCheckbox.checked = !!usuario.delegado_activo;
+  const delegadoHastaField = fieldInput("edit-perfil-delegado-hasta", "Delegado hasta (opcional, vacío = indefinido)", "date");
+  delegadoHastaField.querySelector("input").value = usuario.delegado_hasta ? String(usuario.delegado_hasta).slice(0, 10) : "";
+  const delegadoBox = el("div", { class: "field-row", style: "align-items:flex-end;" }, [
+    el("div", { class: "field" }, [
+      el("label", { for: "edit-perfil-delegado", style: "display:flex;align-items:center;gap:6px;" }, [delegadoCheckbox, "Delegado temporal (puede aprobar)"]),
+    ]),
+    delegadoHastaField,
+  ]);
+
   const guardar = el("button", {
     class: "btn btn-primary btn-sm", type: "button",
     onclick: async () => {
@@ -1051,12 +1130,17 @@ function renderEditarPerfilPanel(cell, usuario, nombreCell) {
       const cargo = cargoField.querySelector("input").value.trim() || null;
       const empresaElegida = empresaField.querySelector("select").value;
       const empresa_default = empresaElegida === "(Sin asignar)" ? null : empresaElegida;
-      const res = await updateChecked("profiles", usuario.id, { nombre, rut, cargo, empresa_default });
+      const delegado_activo = delegadoCheckbox.checked;
+      const delegadoHastaValor = delegadoHastaField.querySelector("input").value;
+      const delegado_hasta = delegado_activo && delegadoHastaValor ? new Date(delegadoHastaValor + "T23:59:59").toISOString() : null;
+      const res = await updateChecked("profiles", usuario.id, { nombre, rut, cargo, empresa_default, delegado_activo, delegado_hasta });
       if (!res.ok) { toast(res.mensaje); return; }
       usuario.nombre = nombre;
       usuario.rut = rut;
       usuario.cargo = cargo;
       usuario.empresa_default = empresa_default;
+      usuario.delegado_activo = delegado_activo;
+      usuario.delegado_hasta = delegado_hasta;
       nombreCell.textContent = nombre || "(sin nombre)";
       cell.parentElement.previousElementSibling.children[1].textContent = rut || "-";
       cell.closest(".item-extra-row").style.display = "none";
@@ -1070,6 +1154,7 @@ function renderEditarPerfilPanel(cell, usuario, nombreCell) {
 
   cell.appendChild(el("div", { class: "field-row" }, [nombreField, rutField]));
   cell.appendChild(el("div", { class: "field-row" }, [cargoField, empresaField]));
+  cell.appendChild(delegadoBox);
   cell.appendChild(el("div", { style: "display:flex; gap:8px; margin-top:8px;" }, [guardar, cancelar]));
 }
 
@@ -1478,18 +1563,43 @@ function openNuevaRendicion(pushHistory = true) {
   if (pushHistory) pushView("view-nueva"); else show("view-nueva");
 }
 
+// Después de quitar un ítem, "Ítem 1, Ítem 3" (saltándose el 2) da la
+// impresión de que falta algo -- esto vuelve a numerar en pantalla los que
+// quedan, de forma correlativa. Los ids internos (item-N) no se tocan, solo
+// el texto visible.
+function renumerarItems() {
+  document.querySelectorAll("#items-container .item-card").forEach((card, i) => {
+    const titulo = card.querySelector(".item-head strong");
+    if (titulo) titulo.textContent = `Ítem ${i + 1}`;
+  });
+}
+
 function addItemRow() {
   const id = "item-" + ++itemSeq;
   const wrap = el("div", { class: "item-card", id });
 
+  const titulo = el("strong", {}, `Ítem ${itemSeq}`);
   const head = el("div", { class: "item-head" }, [
-    el("strong", {}, `Ítem ${itemSeq}`),
-    el("button", { class: "btn btn-ghost", type: "button", onclick: () => { wrap.remove(); recalcTotal(); } }, "Quitar"),
+    titulo,
+    el("button", {
+      class: "btn btn-ghost", type: "button",
+      onclick: () => {
+        // Solo pedimos confirmación si la tarjeta ya tiene algo cargado
+        // (monto o comprobante) -- para una tarjeta extra vacía que la
+        // persona nunca llegó a usar, preguntar es puro ruido.
+        const tieneMonto = [...wrap.querySelectorAll('input[data-money]')].some((i) => i.value.trim());
+        const tieneArchivo = [...wrap.querySelectorAll('input[type=file]')].some((i) => i.files.length);
+        if ((tieneMonto || tieneArchivo) && !confirm("¿Quitar este ítem? Se pierde el comprobante y los datos cargados, no se puede deshacer.")) return;
+        wrap.remove();
+        renumerarItems();
+        recalcTotal();
+      },
+    }, "Quitar"),
   ]);
 
-  const toggle = el("div", { class: "toggle-group" }, [
-    el("button", { type: "button", class: "active", "data-tipo": "ConDocumento" }, "Documento electrónico"),
-    el("button", { type: "button", "data-tipo": "SinDocumento" }, "Boleta"),
+  const toggle = el("div", { class: "toggle-group", role: "tablist" }, [
+    el("button", { type: "button", class: "active", "data-tipo": "ConDocumento", "aria-pressed": "true" }, "Documento electrónico"),
+    el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Boleta"),
   ]);
 
   const bodyConDoc = buildConDocumentoFields(id);
@@ -1498,8 +1608,9 @@ function addItemRow() {
 
   toggle.querySelectorAll("button").forEach((b) => {
     b.addEventListener("click", () => {
-      toggle.querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      toggle.querySelectorAll("button").forEach((x) => { x.classList.remove("active"); x.setAttribute("aria-pressed", "false"); });
       b.classList.add("active");
+      b.setAttribute("aria-pressed", "true");
       const isCon = b.dataset.tipo === "ConDocumento";
       bodyConDoc.style.display = isCon ? "block" : "none";
       bodySinDoc.style.display = isCon ? "none" : "block";
@@ -1523,6 +1634,7 @@ function buildConDocumentoFields(id) {
     fieldSelect(`${id}-tipodoc`, "Tipo de documento", TIPOS_DOCUMENTO),
     fieldInput(`${id}-folio`, "N° de documento", "text"),
   ]);
+  const dupStatus = el("p", { class: "ocr-status", id: `${id}-dup-status` });
   const row3 = el("div", { class: "field-row" }, [
     fieldInput(`${id}-venc`, "Fecha del documento", "date"),
     fieldInputMoney(`${id}-monto`, "Monto"),
@@ -1536,6 +1648,7 @@ function buildConDocumentoFields(id) {
 
   box.appendChild(row1);
   box.appendChild(row2);
+  box.appendChild(dupStatus);
   box.appendChild(row3);
   box.appendChild(row4);
   box.appendChild(foto);
@@ -1547,6 +1660,7 @@ function buildConDocumentoFields(id) {
 
   const fotoInput = foto.querySelector("input[type=file]");
   fotoInput.addEventListener("change", () => {
+    if (!validarTamanoArchivo(fotoInput)) return;
     if (fotoInput.files && fotoInput.files[0]) analizarComprobante(id, fotoInput.files[0], ocrStatus);
   });
 
@@ -1554,11 +1668,40 @@ function buildConDocumentoFields(id) {
   // en vez de que la persona tenga que escribirla a mano.
   const rutInput = row1.querySelector(`#${id}-rut`);
   const nombreProvInput = row1.querySelector(`#${id}-nombreprov`);
+  const rutHint = el("p", { class: "ocr-status", id: `${id}-rut-hint` });
+  rutInput.parentElement.appendChild(rutHint);
+  const folioInput = row2.querySelector(`#${id}-folio`);
+
   rutInput.addEventListener("blur", async () => {
     rutInput.value = formatearRut(rutInput.value);
+    if (rutInput.value && !validarRut(rutInput.value)) {
+      rutHint.textContent = "Ese RUT no parece válido (revisa el dígito verificador).";
+      rutHint.className = "ocr-status show err";
+    } else {
+      rutHint.className = "ocr-status";
+    }
     const nombre = await buscarNombreProveedorPorRut(rutInput.value);
     if (nombre) nombreProvInput.value = nombre;
+    chequearDuplicado();
   });
+  folioInput.addEventListener("blur", chequearDuplicado);
+
+  // Detector de comprobantes duplicados: mismo RUT + N° de documento ya
+  // cargado antes en OTRA rendición (propia o ajena) que no esté Rechazada.
+  // Es solo un aviso, no bloquea -- puede haber compras legítimas repetidas
+  // al mismo proveedor con folios que coinciden por error de tipeo, así que
+  // la decisión final la sigue tomando la persona (o quien aprueba).
+  async function chequearDuplicado() {
+    const rut = rutInput.value.trim();
+    const folio = folioInput.value.trim();
+    dupStatus.className = "ocr-status";
+    if (!rut || !folio || !validarRut(rut)) return;
+    const { data, error } = await db.rpc("buscar_documento_duplicado", { p_rut: rut, p_nro: folio });
+    if (error || !data || !data.length) return;
+    const match = data[0];
+    dupStatus.textContent = `⚠ Este documento ya está registrado en la rendición N° ${match.folio} de ${match.empleado_nombre} (${match.estado}). Revisa que no sea un duplicado.`;
+    dupStatus.className = "ocr-status show err";
+  }
 
   return box;
 }
@@ -1700,6 +1843,7 @@ function buildSinDocumentoFields(id) {
 
   const fotoInput2 = foto.querySelector("input[type=file]");
   fotoInput2.addEventListener("change", () => {
+    if (!validarTamanoArchivo(fotoInput2)) return;
     if (fotoInput2.files && fotoInput2.files[0]) analizarComprobanteGastoDirecto(id, fotoInput2.files[0], ocrStatus);
   });
 
@@ -1729,17 +1873,36 @@ function fieldInput(id, label, type, placeholder = "") {
     el("input", { id, type, placeholder }),
   ]);
 }
+// Formatea en vivo un <input> de plata con puntos de miles ("1.234.567"),
+// conservando solo los dígitos escritos -- usado por fieldInputMoney y por
+// cualquier otro campo de monto suelto (ej. "sf-monto" en Solicitar
+// fondos) que antes reimplementaba esta misma lógica de forma idéntica.
+function formatearInputMoney(input) {
+  const raw = input.value.replace(/\D/g, "");
+  input.value = raw ? Number(raw).toLocaleString("es-CL") : "";
+}
 function fieldInputMoney(id, label) {
   const input = el("input", { id, type: "text", inputmode: "numeric", placeholder: "0", "data-money": "true" });
   input.addEventListener("input", () => {
-    const raw = input.value.replace(/\D/g, "");
-    input.value = raw ? Number(raw).toLocaleString("es-CL") : "";
+    formatearInputMoney(input);
     recalcTotal();
   });
   return el("div", { class: "field" }, [el("label", { for: id }, label), input]);
 }
-function parseMoneyValue(str) {
-  return Number(String(str || "").replace(/\D/g, "")) || 0;
+// Mismo límite que el bucket "comprobantes" en Supabase Storage (ver
+// migracion_mejoras_v2.sql) -- avisar acá, ANTES de intentar subir o
+// mandarlo a OCR, da un mensaje claro en vez de que la persona espere un
+// buen rato en una conexión de campo (celular, terreno) para recién
+// enterarse por un error crudo de la API que el archivo era muy pesado.
+const TAMANO_MAXIMO_ARCHIVO = 15 * 1024 * 1024;
+function validarTamanoArchivo(input) {
+  const file = input.files && input.files[0];
+  if (file && file.size > TAMANO_MAXIMO_ARCHIVO) {
+    toast(`El archivo "${file.name}" pesa ${(file.size / 1024 / 1024).toFixed(1)}MB (máx. 15MB). Comprímelo o saca una foto de menor resolución.`);
+    input.value = "";
+    return false;
+  }
+  return true;
 }
 function fieldFile(id, label) {
   return el("div", { class: "field" }, [
@@ -2065,16 +2228,7 @@ async function submitRendicion() {
       toast(`Se guardaron ${itemsGuardados} de ${items.length} ítems. Revisa la rendición y vuelve a cargar los que fallaron:\n${erroresItems.join(" · ")}`);
     }
 
-    // No bloqueamos el envío si el correo falla (ej. secret de Resend sin
-    // configurar todavía): la rendición ya quedó guardada, que es lo que
-    // importa. El aprobador igual la va a ver al entrar al dashboard.
-    // Ver el comentario sobre .then(({error}) ...) en
-    // finalizarAprobacionRendicion -- mismo motivo acá.
-    db.functions.invoke("notificar-aprobador", {
-      body: { rendicion_id: rendicion.id },
-    }).then(({ error }) => {
-      if (error) console.error("No se pudo notificar al aprobador:", error);
-    }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
+    notificarAsync("notificar-aprobador", { rendicion_id: rendicion.id }, "No se pudo notificar al aprobador:");
 
     toast("Rendición enviada a aprobación.");
     replaceView("view-dashboard");
@@ -2102,10 +2256,7 @@ function wireNuevaSolicitud() {
   EMPRESAS.forEach((emp) => empresaSelect.appendChild(el("option", { value: emp }, emp)));
   empresaSelect.addEventListener("change", actualizarCentroCostoSolicitud);
   const montoInput = document.getElementById("sf-monto");
-  montoInput.addEventListener("input", () => {
-    const raw = montoInput.value.replace(/\D/g, "");
-    montoInput.value = raw ? Number(raw).toLocaleString("es-CL") : "";
-  });
+  montoInput.addEventListener("input", () => formatearInputMoney(montoInput));
 }
 
 function actualizarCentroCostoSolicitud() {
@@ -2158,11 +2309,7 @@ async function submitSolicitud() {
 
     // Mismo correo/plantilla que una rendición nueva, pero con tipo
     // "solicitud" para que el asunto y el cuerpo hablen de un fondo.
-    db.functions.invoke("notificar-aprobador", {
-      body: { tipo: "solicitud", rendicion_id: solicitud.id },
-    }).then(({ error }) => {
-      if (error) console.error("No se pudo notificar al aprobador:", error);
-    }).catch((err) => console.error("No se pudo notificar al aprobador:", err));
+    notificarAsync("notificar-aprobador", { tipo: "solicitud", rendicion_id: solicitud.id }, "No se pudo notificar al aprobador:");
 
     toast("Solicitud de fondos enviada.");
     replaceView("view-dashboard");
@@ -2186,7 +2333,8 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     return;
   }
   const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
-  const puedeAprobar = esAprobadorViewer && s.estado === "Pendiente";
+  const esPropia = s.empleado_id === currentUser.id;
+  const puedeAprobar = esAprobadorViewer && s.estado === "Pendiente" && !esPropia;
 
   const box = document.getElementById("detalle-solicitud-card");
   box.innerHTML = "";
@@ -2272,6 +2420,11 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     ]));
   }
 
+  if (esAprobadorViewer && esPropia && s.estado === "Pendiente") {
+    box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:16px" },
+      "Es tu propia solicitud -- otro aprobador o admin debe revisarla, no puedes aprobarla o rechazarla tú mismo."));
+  }
+
   if (puedeAprobar) {
     const rechazoBox = el("div", { style: "display:none; margin-top:14px;" });
     const rechazoInput = el("textarea", {
@@ -2296,6 +2449,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
 
     const btnAprobar = el("button", { class: "btn btn-success" }, "Aprobar");
     btnAprobar.addEventListener("click", async () => {
+      if (!confirm(`¿Aprobar la solicitud de fondos de ${s.empleado_nombre} por ${fmtCLP(s.monto_solicitado)}? Esta acción no se puede deshacer.`)) return;
       btnAprobar.disabled = true;
       btnAprobar.textContent = "Aprobando...";
       await aprobarSolicitud(s, "Aprobado");
@@ -2333,14 +2487,8 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
   Object.assign(solicitud, cambios);
 
   // Igual que con las rendiciones: se le avisa por correo a quien pidió el
-  // fondo cómo quedó, con el motivo si fue rechazada. Ver el comentario en
-  // aprobarSolicitud/finalizarAprobacionRendicion sobre por qué hace falta
-  // el .then(({error}) ...) además del .catch().
-  db.functions.invoke("notificar-estado-rendicion", {
-    body: { tipo: "solicitud", rendicion_id: solicitud.id },
-  }).then(({ error }) => {
-    if (error) console.error("No se pudo notificar al empleado:", error);
-  }).catch((err) => console.error("No se pudo notificar al empleado:", err));
+  // fondo cómo quedó, con el motivo si fue rechazada.
+  notificarAsync("notificar-estado-rendicion", { tipo: "solicitud", rendicion_id: solicitud.id }, "No se pudo notificar al empleado:");
 
   replaceView("view-dashboard");
   loadDashboard();
@@ -2363,13 +2511,20 @@ async function openDetalle(id, pushHistory = true) {
   // en paralelo en vez de esperar la primera para recién pedir la segunda.
   // historialCount es solo para saber si hay algo que mostrar -- el botón de
   // historial ni aparece si la rendición nunca tuvo un cambio registrado.
-  const [{ data: items }, { count: historialCount }] = await Promise.all([
+  const [{ data: items }, { count: historialCount }, { data: montosEditados }] = await Promise.all([
     db.from("rendicion_items").select("*").eq("rendicion_id", id),
     db.from("rendicion_items_historial").select("id", { count: "exact", head: true }).eq("rendicion_id", id),
+    // Qué ítems tuvieron su monto editado a mano después de cargarse (por
+    // OCR o a mano) -- una señal de confianza simple para quien aprueba,
+    // usando datos que el historial ya guardaba pero que antes no se
+    // resumían en ningún lado de la vista de detalle.
+    db.from("rendicion_items_historial").select("item_id").eq("rendicion_id", id).eq("campo", "monto"),
   ]);
+  const itemsConMontoEditado = new Set((montosEditados || []).map((h) => h.item_id));
 
   const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
-  const puedeAprobar = esAprobadorViewer && r.estado === "Pendiente";
+  const esPropia = r.empleado_id === currentUser.id;
+  const puedeAprobar = esAprobadorViewer && r.estado === "Pendiente" && !esPropia;
 
   const box = document.getElementById("detalle-card");
   box.innerHTML = "";
@@ -2428,7 +2583,14 @@ async function openDetalle(id, pushHistory = true) {
     }
     celdas.push(el("td", { class: "wrap" }, it.centro_costo || "-"));
     celdas.push(el("td", { class: "wrap" }, it.descripcion || "-"));
-    celdas.push(el("td", { class: "monto" }, fmtCLP(it.monto)));
+    const montoCellContenido = [fmtCLP(it.monto)];
+    if (itemsConMontoEditado.has(it.id)) {
+      montoCellContenido.push(el("span", {
+        title: "El monto de este ítem fue editado manualmente después de cargarse.",
+        style: "margin-left:4px;cursor:help;",
+      }, "✏️"));
+    }
+    celdas.push(el("td", { class: "monto" }, montoCellContenido));
     // Si el ítem quedó Rechazado dentro de una rendición que en general
     // terminó Aprobada, el pill rojo por sí solo no dice nada -- antes el
     // motivo (que sí se guarda) no se mostraba en ningún lado de la UI, así
@@ -2552,11 +2714,32 @@ async function openDetalle(id, pushHistory = true) {
     ]));
   }
 
+  if (esAprobadorViewer && esPropia && r.estado === "Pendiente") {
+    box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:16px" },
+      "Es tu propia rendición -- otro aprobador o admin debe revisarla, no puedes aprobarla o rechazarla tú mismo."));
+  }
+
   if (puedeAprobar) {
     const pendientes = (items || []).filter((it) => (it.estado || "Pendiente") === "Pendiente").length;
     if (pendientes > 0) {
       box.appendChild(el("p", { style: "color:var(--warn);font-size:0.85rem;margin-top:16px" },
         `Faltan ${pendientes} ítem(s) por revisar (Aprobar ítem / Rechazar ítem, en la tabla de arriba) antes de poder finalizar la aprobación.`));
+      if (pendientes > 1) {
+        // Aprobar uno por uno tiene sentido cuando hay que revisar cada
+        // ítem con cuidado, pero para una rendición larga con varios ítems
+        // obviamente correctos, forzar el clic individual en cada uno es
+        // pura fricción -- este botón aprueba de un golpe todos los que
+        // sigan Pendientes (no toca los que ya se marcaron Aprobado o
+        // Rechazado a mano).
+        const btnAprobarTodos = el("button", { class: "btn btn-success btn-sm", style: "margin-top:8px;" }, `Aprobar los ${pendientes} ítems pendientes`);
+        btnAprobarTodos.addEventListener("click", async () => {
+          if (!confirm(`¿Aprobar de una vez los ${pendientes} ítem(s) que siguen Pendientes de esta rendición?`)) return;
+          btnAprobarTodos.disabled = true;
+          btnAprobarTodos.textContent = "Aprobando...";
+          await aprobarTodosPendientes(r, items);
+        });
+        box.appendChild(btnAprobarTodos);
+      }
     } else {
       const aprobados = (items || []).filter((it) => it.estado === "Aprobado").length;
       const rechazados = (items || []).filter((it) => it.estado === "Rechazado").length;
@@ -2564,6 +2747,8 @@ async function openDetalle(id, pushHistory = true) {
         `${aprobados} ítem(s) aprobado(s), ${rechazados} rechazado(s). Al finalizar, los rechazados quedan fuera del monto y del comprobante.`));
       const btnFinalizar = el("button", { class: "btn btn-primary", style: "margin-top:8px;" }, "Finalizar aprobación");
       btnFinalizar.addEventListener("click", async () => {
+        const totalAprobado = aprobados > 0 ? fmtCLP(items.filter((it) => it.estado === "Aprobado").reduce((s, it) => s + Number(it.monto || 0), 0)) : "$0";
+        if (!confirm(`¿Finalizar la aprobación de esta rendición? Quedará ${aprobados > 0 ? "Aprobada por " + totalAprobado : "Rechazada"}. Esta acción no se puede deshacer.`)) return;
         btnFinalizar.disabled = true;
         btnFinalizar.textContent = "Finalizando...";
         await finalizarAprobacionRendicion(r, items);
@@ -2646,12 +2831,46 @@ async function updateChecked(table, id, cambios) {
   return { ok: true, data };
 }
 
+// Dispara una Edge Function de notificación sin bloquear la UI ni el flujo
+// principal -- si el correo falla (Resend caído, secret sin configurar), la
+// rendición/solicitud ya quedó guardada de todas formas, que es lo que
+// importa. db.functions.invoke() NO rechaza la promesa cuando la función
+// responde con un error propio (ej. { error: "..." } en el body) -- resuelve
+// igual, así que hace falta revisar "error" en el .then() ADEMÁS del
+// .catch(): con solo este último, ese caso pasaba completamente
+// desapercibido, sin ni un console.error que lo delatara.
+function notificarAsync(fn, body, contexto) {
+  db.functions.invoke(fn, { body }).then(({ error }) => {
+    if (error) console.error(contexto, error);
+  }).catch((err) => console.error(contexto, err));
+}
+
 async function aprobarItem(item, rendicion, estado, motivo = null) {
   const cambios = { estado, motivo_rechazo: estado === "Rechazado" ? motivo : null };
   const res = await updateChecked("rendicion_items", item.id, cambios);
   if (!res.ok) { toast(res.mensaje); return; }
   Object.assign(item, cambios);
   toast(estado === "Aprobado" ? "Ítem aprobado." : "Ítem rechazado.");
+  openDetalle(rendicion.id, false);
+}
+
+// Aprueba de un golpe todos los ítems que sigan Pendientes de una rendición
+// (botón "Aprobar los N ítems pendientes" en openDetalle) -- para una
+// rendición larga donde cada ítem es obviamente correcto, aprobar uno por
+// uno es pura fricción. No toca los que el aprobador ya haya marcado a
+// mano como Aprobado o Rechazado.
+async function aprobarTodosPendientes(rendicion, items) {
+  const pendientes = items.filter((it) => (it.estado || "Pendiente") === "Pendiente");
+  let ok = 0;
+  const errores = [];
+  for (const it of pendientes) {
+    const res = await updateChecked("rendicion_items", it.id, { estado: "Aprobado", motivo_rechazo: null });
+    if (res.ok) { it.estado = "Aprobado"; it.motivo_rechazo = null; ok++; }
+    else errores.push(res.mensaje);
+  }
+  toast(errores.length
+    ? `Se aprobaron ${ok} de ${pendientes.length} ítems. ${errores[0]}`
+    : `${ok} ítem(s) aprobado(s).`);
   openDetalle(rendicion.id, false);
 }
 
@@ -2687,17 +2906,7 @@ async function finalizarAprobacionRendicion(rendicion, items) {
   toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
   Object.assign(rendicion, cambios);
 
-  // db.functions.invoke() NO rechaza la promesa cuando la función responde
-  // con un error propio (ej. falta RESEND_API_KEY, o Resend rechaza el
-  // envío) -- resuelve igual, con { error } adentro. Con solo un .catch()
-  // ese caso pasaba completamente desapercibido: la rendición quedaba
-  // aprobada pero el aviso por correo fallaba en silencio, sin ni un
-  // console.error que lo delatara.
-  db.functions.invoke("notificar-estado-rendicion", {
-    body: { rendicion_id: rendicion.id },
-  }).then(({ error }) => {
-    if (error) console.error("No se pudo notificar al empleado:", error);
-  }).catch((err) => console.error("No se pudo notificar al empleado:", err));
+  notificarAsync("notificar-estado-rendicion", { rendicion_id: rendicion.id }, "No se pudo notificar al empleado:");
 
   if (estado === "Aprobado") {
     await descargarCSV(rendicion, aprobados);
@@ -2862,9 +3071,9 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   let centroCostoDraft = it.centro_costo || "";
 
   const toggle = puedeCambiarTipo
-    ? el("div", { class: "toggle-group" }, [
-        el("button", { type: "button", "data-tipo": "ConDocumento" }, "Documento electrónico"),
-        el("button", { type: "button", "data-tipo": "SinDocumento" }, "Boleta"),
+    ? el("div", { class: "toggle-group", role: "tablist" }, [
+        el("button", { type: "button", "data-tipo": "ConDocumento", "aria-pressed": "false" }, "Documento electrónico"),
+        el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Boleta"),
       ])
     : null;
   const camposTipo = el("div");
@@ -2892,7 +3101,11 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
 
   function renderCamposTipo() {
     camposTipo.innerHTML = "";
-    if (toggle) toggle.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.tipo === tipoEditado));
+    if (toggle) toggle.querySelectorAll("button").forEach((b) => {
+      const activo = b.dataset.tipo === tipoEditado;
+      b.classList.toggle("active", activo);
+      b.setAttribute("aria-pressed", String(activo));
+    });
 
     const opcionesCC = CENTROS_COSTO_POR_EMPRESA[it.empresa] || ["Casa Matriz"];
     if (centroCostoDraft && !opcionesCC.includes(centroCostoDraft)) opcionesCC.unshift(centroCostoDraft);

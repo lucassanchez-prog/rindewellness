@@ -5,7 +5,11 @@
   --teal-dark: #13626e;
   --ink: #1c2733;
   --ink-soft: #5b6b7a;
-  --line: #e2e8f0;
+  /* Antes #e2e8f0: contra el fondo blanco de los campos (--card) medía
+     ~1.2:1 de contraste -- muy por debajo del 3:1 que pide WCAG 1.4.11 para
+     el borde de un control de formulario, así que un campo vacío era casi
+     invisible hasta hacerle foco (hallazgo de una revisión de accesibilidad). */
+  --line: #c7d0da;
   --paper: #f4f7fb;
   --paper-top: #eaf2fc;
   --card: #ffffff;
@@ -28,7 +32,7 @@
     --teal-dark: #5fc0b6;
     --ink: #e8edf0;
     --ink-soft: #9babb5;
-    --line: #2c3640;
+    --line: #3d4a58; /* mismo motivo que en :root, ver comentario ahí */
     --paper: #10161c;
     --paper-top: #16202a;
     --card: #1a222b;
@@ -49,7 +53,7 @@
   --teal-dark: #5fc0b6;
   --ink: #e8edf0;
   --ink-soft: #9babb5;
-  --line: #2c3640;
+  --line: #3d4a58; /* mismo motivo que en :root, ver comentario ahí */
   --paper: #10161c;
   --paper-top: #16202a;
   --card: #1a222b;
@@ -595,11 +599,6 @@ button {
   margin-bottom: 14px; background: none; border: none;
 }
 .back-link:hover { color: var(--blue); }
-
-.thumb {
-  width: 40px; height: 40px; border-radius: 8px; object-fit: cover;
-  border: 1px solid var(--line);
-}
 
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);

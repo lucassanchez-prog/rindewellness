@@ -33,6 +33,7 @@
 // los emails reales desde auth.users, cosa que la app normal no puede hacer.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -90,9 +91,28 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
 // RESEND_FALLBACK_EMAIL configurado, reintenta mandándolo ahí para que el
 // aviso no se pierda -- avisando en el propio correo quién era el
 // destinatario real.
+// Reintenta una vez con una breve espera ante un fallo de RED (fetch que
+// tira excepción, ej. timeout/DNS) o un 5xx de Resend -- antes un solo
+// hiccup transitorio perdía el correo para siempre, en silencio (el caller
+// solo hace .then/.catch con console.error, no reintenta nada).
+async function fetchConReintento(url: string, init: RequestInit): Promise<Response> {
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      const resp = await fetch(url, init);
+      if (resp.ok || resp.status < 500 || intento === 2) return resp;
+    } catch (err) {
+      if (intento === 2) throw err;
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  // Inalcanzable (el for siempre retorna o lanza en el segundo intento),
+  // pero TypeScript exige un retorno en todos los caminos.
+  return fetch(url, init);
+}
+
 async function enviarConFallback(to: string[], subject: string, html: string) {
   const enviar = (destinatarios: string[], asuntoFinal: string, htmlFinal: string) =>
-    fetch("https://api.resend.com/emails", {
+    fetchConReintento("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: FROM_EMAIL, to: destinatarios, subject: asuntoFinal, html: htmlFinal }),
@@ -126,15 +146,32 @@ async function enviarConFallback(to: string[], subject: string, html: string) {
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+  let callerId: string | null = null;
+  let rendicionId: string | null = null;
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
-    const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
     const caller = await requireProfile(req, admin);
+    callerId = caller.id;
 
     const { tipo, rendicion_id } = await req.json();
     if (!rendicion_id) throw new Error("Falta rendicion_id.");
+    rendicionId = rendicion_id;
     const esSolicitud = tipo === "solicitud";
+
+    // Límite de frecuencia: como cualquier sesión válida puede disparar
+    // esta función (no solo aprobador/admin -- un empleado la llama al
+    // enviar su propia rendición), sin esto alguien podía scriptear el
+    // envío repetido y spamear a todo el equipo de aprobadores.
+    const recientesPorFila = await contarEventosRecientes(admin, "notificar_aprobador_ok", { rendicionId: rendicion_id }, 2);
+    if (recientesPorFila >= 1) {
+      throw new Error("Ya se avisó a los aprobadores sobre esto hace un momento.");
+    }
+    const recientesPorUsuario = await contarEventosRecientes(admin, "notificar_aprobador_ok", { usuarioId: callerId }, 60);
+    if (recientesPorUsuario >= 30) {
+      throw new Error("Demasiados avisos enviados en la última hora. Espera un poco.");
+    }
 
     const tabla = esSolicitud ? "solicitudes_fondos" : "rendiciones";
     const { data: row, error: errRow } = await admin.from(tabla).select("*").eq("id", rendicion_id).maybeSingle();
@@ -149,11 +186,22 @@ Deno.serve(async (req: Request) => {
     const monto_total = esSolicitud ? row.monto_solicitado : row.monto_total;
     const comentario = esSolicitud ? row.motivo : row.comentario;
 
-    const { data: aprobadores, error: errPerfiles } = await admin
+    // Además de aprobador/admin "de planta", cuentan las personas con una
+    // delegación temporal activa y vigente (ver delegado_activo/
+    // delegado_hasta en migracion_mejoras_v2.sql) -- típicamente alguien
+    // cubriendo a un aprobador de vacaciones. Se filtra la vigencia acá
+    // (no en el SELECT) porque Supabase-js no arma bien un OR con fecha
+    // nula-o-futura en una sola llamada simple.
+    const { data: perfilesTodos, error: errPerfiles } = await admin
       .from("profiles")
-      .select("id, nombre, rol")
-      .in("rol", ["aprobador", "admin"]);
+      .select("id, nombre, rol, delegado_activo, delegado_hasta")
+      .or("rol.in.(aprobador,admin),delegado_activo.eq.true");
     if (errPerfiles) throw errPerfiles;
+    const ahora = Date.now();
+    const aprobadores = (perfilesTodos || []).filter((p) =>
+      ["aprobador", "admin"].includes(p.rol) ||
+      (p.delegado_activo && (!p.delegado_hasta || new Date(p.delegado_hasta).getTime() > ahora))
+    );
     if (!aprobadores || !aprobadores.length) {
       return new Response(JSON.stringify({ ok: true, enviados: 0, nota: "No hay aprobadores/admin registrados." }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -197,11 +245,16 @@ Deno.serve(async (req: Request) => {
     const { resp, data } = await enviarConFallback(destinatarios, asunto, html);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
 
+    await logEvent(admin, "notificar_aprobador_ok", { usuarioId: callerId, rendicionId });
     return new Response(JSON.stringify({ ok: true, enviados: destinatarios.length }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err instanceof Error ? err.message : err) }), {
+    const mensaje = String(err instanceof Error ? err.message : err);
+    if (!/No autenticado|Sesión inválida|desactivada|Ya se avisó|Demasiados avisos/i.test(mensaje)) {
+      await logEvent(admin, "notificar_aprobador_fail", { usuarioId: callerId, rendicionId, detalle: mensaje });
+    }
+    return new Response(JSON.stringify({ error: mensaje }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

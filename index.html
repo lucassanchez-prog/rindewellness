@@ -132,7 +132,6 @@
       <div class="user">
         <span id="user-name"></span>
         <button class="btn btn-ghost" id="btn-admin-usuarios" style="display:none">Usuarios</button>
-        <button class="btn btn-ghost" id="btn-admin-plantillas" style="display:none">Plantillas</button>
         <button class="btn btn-ghost" id="btn-theme-toggle" title="Cambiar tema" type="button">🌙</button>
         <button class="btn btn-ghost" id="btn-logout">Salir</button>
       </div>
@@ -148,6 +147,7 @@
             <p>Registra tus gastos y sigue el estado de tus reembolsos</p>
           </div>
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-secondary" id="btn-reportes" style="display:none">Reportes</button>
             <button class="btn btn-secondary" id="btn-exportar-excel" style="display:none">Exportar a Excel</button>
             <button class="btn btn-secondary" id="btn-comprobante-rango" style="display:none">Comprobante por rango</button>
             <button class="btn btn-secondary" id="btn-solicitar-fondos">+ Solicitar fondos</button>
@@ -313,7 +313,10 @@
         <button class="back-link" data-back="dashboard">&larr; Volver</button>
         <div class="hero-row">
           <div><h1>Usuarios</h1><p>Administra los permisos de cada persona del grupo</p></div>
-          <button class="btn btn-secondary" id="btn-ir-plantillas" type="button">Plantillas de perfil</button>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button class="btn btn-secondary" id="btn-recordatorios" type="button">Enviar recordatorios ahora</button>
+            <button class="btn btn-secondary" id="btn-ir-plantillas" type="button">Plantillas de perfil</button>
+          </div>
         </div>
         <div class="filter-bar" id="filter-bar-usuarios">
           <div class="field">
@@ -333,6 +336,27 @@
         <div class="card-list" id="list-usuarios"></div>
       </div>
 
+      <!-- REPORTES (solo admin) -->
+      <div id="view-reportes" class="view">
+        <button class="back-link" data-back="dashboard">&larr; Volver</button>
+        <div class="hero-row">
+          <div><h1>Reportes</h1><p>Gasto acumulado por empresa y por categoría, según el filtro de fechas de abajo</p></div>
+        </div>
+        <div class="card" style="margin-bottom:18px; max-width:420px;">
+          <div class="field-row">
+            <div class="field">
+              <label for="reportes-desde">Desde</label>
+              <input type="date" id="reportes-desde" />
+            </div>
+            <div class="field">
+              <label for="reportes-hasta">Hasta</label>
+              <input type="date" id="reportes-hasta" />
+            </div>
+          </div>
+        </div>
+        <div id="reportes-contenido"></div>
+      </div>
+
       <!-- ADMINISTRACION DE PLANTILLAS DE PERFIL -->
       <div id="view-plantillas" class="view">
         <button class="back-link" data-back="admin">&larr; Volver</button>
@@ -346,9 +370,10 @@
     </div>
   </div>
 
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="config.js"></script>
-  <script src="app.js?v=38"></script>
+  <script src="pure.js"></script>
+  <script src="app.js?v=39"></script>
 </body>
 </html>

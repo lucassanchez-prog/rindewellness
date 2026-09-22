@@ -36,6 +36,7 @@
 // puede hacer.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -85,9 +86,23 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
 // RESEND_FALLBACK_EMAIL configurado, reintenta mandándolo ahí para que el
 // aviso no se pierda -- avisando en el propio correo quién era el
 // destinatario real.
+// Ver el mismo helper (y el mismo motivo) en notificar-aprobador.
+async function fetchConReintento(url: string, init: RequestInit): Promise<Response> {
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      const resp = await fetch(url, init);
+      if (resp.ok || resp.status < 500 || intento === 2) return resp;
+    } catch (err) {
+      if (intento === 2) throw err;
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  return fetch(url, init);
+}
+
 async function enviarConFallback(to: string[], subject: string, html: string, cc: string[] = []) {
   const enviar = (destinatarios: string[], asuntoFinal: string, htmlFinal: string, ccFinal: string[]) =>
-    fetch("https://api.resend.com/emails", {
+    fetchConReintento("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -127,18 +142,31 @@ async function enviarConFallback(to: string[], subject: string, html: string, cc
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+  let callerId: string | null = null;
+  let rendicionId: string | null = null;
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
-    const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
     const caller = await requireProfile(req, admin);
+    callerId = caller.id;
     if (!["admin", "aprobador"].includes(caller.rol)) {
       throw new Error("Solo un aprobador o admin puede notificar el resultado de una rendición/solicitud.");
     }
 
     const { tipo, rendicion_id } = await req.json();
     if (!rendicion_id) throw new Error("Falta rendicion_id.");
+    rendicionId = rendicion_id;
     const esSolicitud = tipo === "solicitud";
+
+    // El botón "Reenviar notificación por correo" (app.js) permite reenviar
+    // a mano, así que acá el límite es más laxo que en notificar-aprobador
+    // (que se dispara solo, automático, al crear algo nuevo) -- pero igual
+    // debe existir un tope contra un script que lo golpee en loop.
+    const recientesPorUsuario = await contarEventosRecientes(admin, "notificar_estado_ok", { usuarioId: callerId }, 60);
+    if (recientesPorUsuario >= 30) {
+      throw new Error("Demasiados avisos enviados en la última hora. Espera un poco.");
+    }
 
     const tabla = esSolicitud ? "solicitudes_fondos" : "rendiciones";
     const { data: row, error: errRow } = await admin.from(tabla).select("*").eq("id", rendicion_id).maybeSingle();
@@ -166,11 +194,15 @@ Deno.serve(async (req: Request) => {
     // terminó Aprobada.
     let items_excluidos: string | null = null;
     if (!esSolicitud && estado === "Aprobado") {
-      const { data: rechazados } = await admin
+      const { data: rechazados, error: errRechazados } = await admin
         .from("rendicion_items")
         .select("descripcion, nombre_proveedor")
         .eq("rendicion_id", rendicion_id)
         .eq("estado", "Rechazado");
+      // Si esta consulta falla, es mejor frenar acá que mandar un correo de
+      // "aprobada" que omita en silencio que hubo ítems excluidos -- el
+      // correo es la fuente que el empleado usa para confiar en el monto.
+      if (errRechazados) throw errRechazados;
       items_excluidos = (rechazados || []).map((it) => it.descripcion || it.nombre_proveedor || "ítem").join(", ") || null;
     }
 
@@ -204,11 +236,18 @@ Deno.serve(async (req: Request) => {
     // vez), para que el resto del equipo vea el resultado sin tener que
     // entrar a la app -- mismo destinatario que ya usa notificar-aprobador
     // para avisar de algo nuevo pendiente.
-    const { data: aprobadoresProfiles } = await admin
+    const { data: perfilesTodos, error: errPerfilesTodos } = await admin
       .from("profiles")
-      .select("id")
-      .in("rol", ["aprobador", "admin"]);
-    const { data: usersData } = await admin.auth.admin.listUsers();
+      .select("id, rol, delegado_activo, delegado_hasta")
+      .or("rol.in.(aprobador,admin),delegado_activo.eq.true");
+    if (errPerfilesTodos) throw errPerfilesTodos;
+    const ahoraMs = Date.now();
+    const aprobadoresProfiles = (perfilesTodos || []).filter((p) =>
+      ["aprobador", "admin"].includes(p.rol) ||
+      (p.delegado_activo && (!p.delegado_hasta || new Date(p.delegado_hasta).getTime() > ahoraMs))
+    );
+    const { data: usersData, error: errUsersData } = await admin.auth.admin.listUsers();
+    if (errUsersData) throw errUsersData;
     const emailPorId = new Map((usersData?.users || []).map((u) => [u.id, u.email]));
     const ccEmails = [...new Set(
       (aprobadoresProfiles || [])
@@ -219,11 +258,16 @@ Deno.serve(async (req: Request) => {
     const { resp, data } = await enviarConFallback([destinatario], asunto, html, ccEmails);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
 
+    await logEvent(admin, "notificar_estado_ok", { usuarioId: callerId, rendicionId });
     return new Response(JSON.stringify({ ok: true, enviados: 1 }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err instanceof Error ? err.message : err) }), {
+    const mensaje = String(err instanceof Error ? err.message : err);
+    if (!/No autenticado|Sesión inválida|desactivada|Demasiados avisos/i.test(mensaje)) {
+      await logEvent(admin, "notificar_estado_fail", { usuarioId: callerId, rendicionId, detalle: mensaje });
+    }
+    return new Response(JSON.stringify({ error: mensaje }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
