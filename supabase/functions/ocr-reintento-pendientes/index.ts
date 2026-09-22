@@ -13,13 +13,11 @@
 // cada ítem sin ninguna chance real de éxito; mejor espaciar los intentos y
 // guardarlos para cuando la capacidad vuelva.
 //
-// Solo procesa ítems "ConDocumento" (facturas/boletas de honorarios) de
-// rendiciones que SIGUEN Pendiente -- son los que de verdad necesitan
-// RUT/folio/monto correctos para Kame; en "Boleta" (SinDocumento) la
-// categoría/CC las define la persona igual, y el monto/descripción casi
-// siempre ya quedaron completados a mano si la IA falló la primera vez. Una
-// rendición ya Aprobada/Rechazada no tiene sentido seguir reintentándola:
-// nadie va a mirar una sugerencia de IA para algo que ya se resolvió.
+// Procesa cualquier ítem (ConDocumento o SinDocumento) de rendiciones que
+// SIGUEN Pendiente -- da lo mismo el tipo, mientras haya un comprobante
+// adjunto que el OCR en vivo no haya logrado leer. Una rendición ya
+// Aprobada/Rechazada no tiene sentido seguir reintentándola: nadie va a
+// mirar una sugerencia de IA para algo que ya se resolvió.
 //
 // El resultado NUNCA pisa datos ya guardados: se guarda aparte
 // (ocr_reintento_resultado) como una SUGERENCIA visible para quien revisa
@@ -131,13 +129,11 @@ Deno.serve(async (req: Request) => {
 
     // !inner con rendiciones.estado: una rendición ya Aprobada/Rechazada no
     // necesita seguir reintentando su OCR -- nadie va a revisar la
-    // sugerencia de un ítem que ya quedó resuelto. tipo_item=ConDocumento:
-    // ver el comentario de arriba del archivo sobre por qué solo estos.
+    // sugerencia de un ítem que ya quedó resuelto.
     const { data: pendientes, error: errPend } = await admin
       .from("rendicion_items")
       .select("id, adjunto_url, ocr_reintento_intentos, rendiciones!inner(estado)")
       .eq("ocr_reintento_estado", "pendiente")
-      .eq("tipo_item", "ConDocumento")
       .eq("rendiciones.estado", "Pendiente")
       .not("adjunto_url", "is", null)
       .order("ocr_reintento_ultimo", { ascending: true, nullsFirst: true })

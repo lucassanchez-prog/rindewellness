@@ -2485,6 +2485,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   try {
     const data = await llamarOcrRecibo(file);
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
+    ocrExitoso.set(id, true);
 
     if (data.nombre_proveedor) {
       document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
@@ -2885,6 +2886,9 @@ async function submitRendicion() {
         categoria: document.getElementById(`${id}-categoria`).value,
         monto,
         descripcion: document.getElementById(`${id}-desc2`).value.trim(),
+        // Igual que en ConDocumento: si el OCR en vivo nunca completó este
+        // ítem con éxito, queda en cola para el reintento en segundo plano.
+        ocr_reintento_estado: ocrExitoso.get(id) === true ? null : "pendiente",
         _fotoInput: fotoInput2,
       });
     }
