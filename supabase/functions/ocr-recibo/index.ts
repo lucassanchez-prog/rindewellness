@@ -114,6 +114,30 @@ Deno.serve(async (req: Request) => {
     userId = user.id;
     if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
 
+    const { imageBase64, mimeType, listarModelos } = await req.json();
+
+    // Diagnóstico temporal (solo admin, no cuenta como llamada de OCR real):
+    // ya nos pasó dos veces en el mismo día que un modelo elegido a mano por
+    // nombre (guiándose por blog posts/changelog público de Google) resultó
+    // no estar disponible para ESTA cuenta específica -- "gemini-2.5-flash"
+    // estaba dado de baja, y ahora "gemini-3.1-pro" ni siquiera existe como
+    // ID válido ("not found for API version v1beta"). En vez de seguir
+    // adivinando, esto devuelve la lista REAL de modelos habilitados para
+    // este GEMINI_API_KEY, directo desde la API de Google. Sacar una vez que
+    // se haya usado para corregir GEMINI_MODELS_ORDEN con datos reales.
+    if (listarModelos) {
+      const { data: perfilCaller, error: errPerfilCaller } = await admin.from("profiles").select("rol").eq("id", userId).maybeSingle();
+      if (errPerfilCaller) throw errPerfilCaller;
+      if (perfilCaller?.rol !== "admin") throw new Error("Solo un admin puede listar los modelos.");
+      const respModelos = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
+      const dataModelos = await respModelos.json();
+      if (!respModelos.ok) throw new Error(dataModelos?.error?.message || "Error consultando la lista de modelos de Gemini.");
+      const modelos = (dataModelos?.models || [])
+        .filter((m: any) => (m.supportedGenerationMethods || []).includes("generateContent"))
+        .map((m: any) => ({ name: m.name, displayName: m.displayName }));
+      return new Response(JSON.stringify({ modelos }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
     // paga de Gemini sin control. Un intento fallido (ej. Gemini caído)
@@ -129,7 +153,6 @@ Deno.serve(async (req: Request) => {
     }
     await logEvent(admin, "ocr_call", { usuarioId: userId });
 
-    const { imageBase64, mimeType } = await req.json();
     if (!imageBase64) throw new Error("Falta la imagen (imageBase64).");
     // ~15MB de archivo original equivalen a ~20M caracteres en base64
     // (overhead ~33%). Sin este tope, un PDF/foto gigante se manda entero a

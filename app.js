@@ -2365,16 +2365,17 @@ function mostrarErrorOcr(statusEl, err, reintentar) {
   statusEl.textContent = "";
   statusEl.className = "ocr-status show err";
   statusEl.appendChild(document.createTextNode(
-    `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano, o `
+    `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano, o reintenta:`
   ));
-  statusEl.appendChild(el("button", {
-    type: "button",
-    // Botón con look de link de texto (no el .btn grande) para que quepa
-    // dentro del mensaje de estado sin desentonar.
-    style: "background:none; border:none; padding:0; margin:0; color:inherit; text-decoration:underline; font:inherit; cursor:pointer;",
-    onclick: reintentar,
-  }, "reintenta con IA"));
-  statusEl.appendChild(document.createTextNode("."));
+  // .btn-sm real (no un link de texto disfrazado de botón) -- en su propia
+  // línea, para que quede claro que es una acción y no parte de la oración.
+  statusEl.appendChild(el("div", { style: "margin-top:8px;" }, [
+    el("button", {
+      type: "button",
+      class: "btn btn-sm",
+      onclick: reintentar,
+    }, "🔄 Reintentar con IA"),
+  ]));
 }
 
 async function analizarComprobante(id, file, statusEl) {
