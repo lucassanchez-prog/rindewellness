@@ -40,8 +40,15 @@ const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 // antes estaba fijo en el código, así que un cambio de Google rompía el OCR
 // para todos por igual, sin forma de corregirlo sin un redeploy.
 const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-3.6-flash";
-const GEMINI_URL =
-  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+// Los modelos "gemini-3.x" recién lanzados sufren picos de demanda de Google
+// que a veces duran minutos, no segundos (503 "high demand" sostenido, no
+// un error puntual) -- reintentar contra el mismo modelo saturado no sirve
+// de nada en ese caso. Si el modelo principal sigue sin responder tras sus
+// reintentos, se prueba una vez más contra un modelo GA más establecido y
+// con mucha menos demanda, en vez de fallar directo.
+const GEMINI_MODEL_FALLBACK = Deno.env.get("GEMINI_MODEL_FALLBACK") || "gemini-2.5-flash";
+const geminiUrl = (modelo: string) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${GEMINI_API_KEY}`;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -136,25 +143,45 @@ Deno.serve(async (req: Request) => {
     // y la capa gratuita tiene un límite de solicitudes POR MINUTO ("quota
     // exceeded") que se libera solo unos segundos después -- ambos casos se
     // solucionan reintentando con espera, no son errores permanentes.
-    const INTENTOS = 3;
-    let data;
-    for (let intento = 1; intento <= INTENTOS; intento++) {
-      const resp = await fetch(GEMINI_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      data = await resp.json();
-      if (resp.ok) break;
+    async function llamarGemini(modelo: string, intentosMax: number) {
+      let ultimoError: Error = new Error("Error consultando Gemini");
+      for (let intento = 1; intento <= intentosMax; intento++) {
+        const resp = await fetch(geminiUrl(modelo), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const respData = await resp.json();
+        if (resp.ok) return respData;
 
-      const mensaje = data?.error?.message || "Error consultando Gemini";
-      const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensaje);
-      if (!esTransitorio || intento === INTENTOS) throw new Error(mensaje);
-      // El error de cuota trae su propio "retry in Ns"; si no lo trae, usamos
-      // el backoff normal. Esperamos un poco más que lo pedido por margen.
-      const retrySugerido = /retry in ([\d.]+)s/i.exec(mensaje);
-      const espera = retrySugerido ? Number(retrySugerido[1]) * 1000 + 1000 : 1500 * intento;
-      await new Promise((r) => setTimeout(r, espera));
+        const mensaje = respData?.error?.message || "Error consultando Gemini";
+        ultimoError = new Error(mensaje);
+        const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensaje);
+        if (!esTransitorio || intento === intentosMax) throw ultimoError;
+        // El error de cuota trae su propio "retry in Ns"; si no lo trae, usamos
+        // el backoff normal. Esperamos un poco más que lo pedido por margen.
+        const retrySugerido = /retry in ([\d.]+)s/i.exec(mensaje);
+        const espera = retrySugerido ? Math.min(Number(retrySugerido[1]) * 1000 + 1000, 4000) : 1200 * intento;
+        await new Promise((r) => setTimeout(r, espera));
+      }
+      throw ultimoError;
+    }
+
+    let data;
+    try {
+      data = await llamarGemini(GEMINI_MODEL, 2);
+    } catch (errPrimario) {
+      // Google a veces satura un modelo recién lanzado (gemini-3.x) por
+      // minutos, no segundos -- reintentar contra el mismo modelo no sirve
+      // en ese caso. Si el motivo fue sobrecarga/demanda (no otro error), se
+      // prueba una vez con un modelo GA más establecido antes de rendirse.
+      const mensajePrimario = String(errPrimario instanceof Error ? errPrimario.message : errPrimario);
+      const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensajePrimario);
+      if (esTransitorio && GEMINI_MODEL_FALLBACK && GEMINI_MODEL_FALLBACK !== GEMINI_MODEL) {
+        data = await llamarGemini(GEMINI_MODEL_FALLBACK, 2);
+      } else {
+        throw errPrimario;
+      }
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
