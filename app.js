@@ -2355,6 +2355,14 @@ function esGeneracionVigenteOcr(id, gen) {
   return ocrGeneracion.get(id) === gen;
 }
 
+// Si el OCR en vivo nunca tuvo éxito para este ítem (ConDocumento), al
+// enviar la rendición se encola para reintento en segundo plano (ver
+// ocr_reintento_estado en submitRendicion) -- un "agente" en Supabase
+// (Edge Function ocr-reintento-pendientes + pg_cron, ver
+// migracion_ocr_reintento.sql) lo sigue intentando cada 5 minutos aunque la
+// persona ya haya cerrado el navegador.
+const ocrExitoso = new Map();
+
 // El comprobante ya quedó adjunto en el <input type=file> antes de llamar a
 // esto (fotoInput/fotoInput2 lo retienen aunque el OCR falle -- ver
 // addItemRow / buildSinDocumentoFields), así que reintentar no requiere que
@@ -2385,6 +2393,7 @@ async function analizarComprobante(id, file, statusEl) {
   try {
     const data = await llamarOcrRecibo(file);
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
+    ocrExitoso.set(id, true);
 
     if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
     if (data.rut_proveedor) {
@@ -2846,6 +2855,10 @@ async function submitRendicion() {
         categoria: document.getElementById(`${id}-categoriacon`)?.value || null,
         monto,
         descripcion: document.getElementById(`${id}-desc`).value.trim(),
+        // Si el OCR en vivo nunca completó este ítem con éxito, queda en
+        // cola para que ocr-reintento-pendientes lo siga intentando en
+        // segundo plano (ver el comentario de ocrExitoso más arriba).
+        ocr_reintento_estado: ocrExitoso.get(id) === true ? null : "pendiente",
         _fotoInput: fotoInput,
       });
     } else {
@@ -3470,6 +3483,41 @@ async function openDetalle(id, pushHistory = true) {
     tbody.appendChild(el("tr", {}, celdas));
     tbody.appendChild(el("tr", { class: "acciones-row" }, [el("td", { colspan: String(columnas.length) }, [accionesCell])]));
     tbody.appendChild(filaExtra);
+
+    // Resultado del "agente" que reintenta el OCR en segundo plano (ver
+    // migracion_ocr_reintento.sql): nunca pisa lo ya guardado, es solo una
+    // sugerencia para que quien revisa el ítem decida si vale la pena
+    // aplicarla a mano (vía "Editar"). "agotado" no se muestra -- ya se
+    // avisó del fallo al momento de crear el ítem, no hace falta insistir
+    // para siempre con algo que se determinó ilegible.
+    // OJO: el display:block de .ocr-status va en un <div> ADENTRO del <td>,
+    // no en el <td> mismo -- mismo motivo que acciones-cell más arriba:
+    // ponerle un display distinto de table-cell directo a una celda con
+    // colspan hace que algunos navegadores dejen de sumarle el ancho de las
+    // columnas que abarca (ya nos mordió con el panel "Editar perfil" de
+    // Usuarios, mismo patrón).
+    if (it.ocr_reintento_estado === "pendiente") {
+      tbody.appendChild(el("tr", {}, [
+        el("td", { colspan: String(columnas.length) }, [
+          el("div", { class: "ocr-status show" },
+            "🔄 La IA sigue intentando leer este comprobante en segundo plano (Gemini estuvo saturado al crear el ítem)."),
+        ]),
+      ]));
+    } else if (it.ocr_reintento_estado === "listo" && it.ocr_reintento_resultado) {
+      const s = it.ocr_reintento_resultado;
+      const partes = [
+        s.nombre_proveedor && `Proveedor: ${s.nombre_proveedor}`,
+        s.rut_proveedor && `RUT: ${s.rut_proveedor}`,
+        s.nro_documento && `N° documento: ${s.nro_documento}`,
+        s.monto && `Monto: ${fmtCLP(s.monto)}`,
+      ].filter(Boolean).join(" · ");
+      tbody.appendChild(el("tr", {}, [
+        el("td", { colspan: String(columnas.length) }, [
+          el("div", { class: "ocr-status show ok" },
+            `💡 La IA logró leer este comprobante en un reintento en segundo plano: ${partes || "sin datos nuevos"}. Revísalo y aplícalo a mano con "Editar" si corresponde.`),
+        ]),
+      ]));
+    }
   });
 
   box.appendChild(el("div", { class: "table-scroll" }, [tabla]));
