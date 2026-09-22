@@ -44,9 +44,12 @@ const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-3.6-flash";
 // que a veces duran minutos, no segundos (503 "high demand" sostenido, no
 // un error puntual) -- reintentar contra el mismo modelo saturado no sirve
 // de nada en ese caso. Si el modelo principal sigue sin responder tras sus
-// reintentos, se prueba una vez más contra un modelo GA más establecido y
-// con mucha menos demanda, en vez de fallar directo.
-const GEMINI_MODEL_FALLBACK = Deno.env.get("GEMINI_MODEL_FALLBACK") || "gemini-2.5-flash";
+// reintentos, se prueba una vez más contra otro modelo con menos demanda.
+// OJO: Google está retirando el acceso a modelos pre-3.x para API keys
+// nuevas ("gemini-2.5-flash" ya no está disponible para keys nuevas, según
+// el propio mensaje de error de la API) -- el respaldo debe ser otro modelo
+// de la familia 3.x, no uno anterior.
+const GEMINI_MODEL_FALLBACK = Deno.env.get("GEMINI_MODEL_FALLBACK") || "gemini-3.5-flash";
 const geminiUrl = (modelo: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${GEMINI_API_KEY}`;
 

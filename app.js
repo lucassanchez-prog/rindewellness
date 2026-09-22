@@ -2312,7 +2312,20 @@ async function llamarOcrRecibo(file) {
     30000,
     "Se agotó el tiempo de espera leyendo el comprobante (conexión muy lenta o caída). Completa los datos a mano, o inténtalo de nuevo."
   );
-  if (error) throw error;
+  if (error) {
+    // Cuando la Edge Function responde con un status distinto de 2xx,
+    // supabase-js arma un error genérico ("Edge Function returned a
+    // non-2xx status code") y NO lee el cuerpo -- el mensaje real y
+    // específico que arma ocr-recibo (ej. "high demand", "MAX_TOKENS",
+    // falta de configuración) queda en error.context (el Response),
+    // así que hay que leerlo a mano para no perderlo.
+    let mensaje = error.message;
+    try {
+      const cuerpo = await error.context?.json();
+      if (cuerpo?.error) mensaje = cuerpo.error;
+    } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
+    throw new Error(mensaje);
+  }
   if (data?.error) throw new Error(data.error);
   return data;
 }
