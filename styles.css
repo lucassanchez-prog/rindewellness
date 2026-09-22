@@ -116,7 +116,12 @@ button {
 .btn-secondary:hover { border-color: var(--blue); color: var(--blue); }
 .btn-danger { background: var(--danger-bg); color: var(--danger); }
 .btn-success { background: var(--success-bg); color: var(--success); }
-.btn-ghost { background: transparent; color: var(--ink-soft); padding: 6px 10px; }
+/* border:1px (heredaba border:none de .btn) -- sin ningún borde ni fondo,
+   un botón "ghost" era indistinguible del texto normal de alrededor; ahora
+   se ve tenue pero reconocible como botón en cualquier parte donde se use
+   (Usuarios/Salir en el topbar, Cancelar, Dividir ítem, etc.). */
+.btn-ghost { background: transparent; color: var(--ink-soft); padding: 6px 10px; border: 1px solid var(--line); }
+.btn-ghost:hover { border-color: var(--blue); color: var(--blue); }
 .btn-block { width: 100%; }
 .btn[disabled] { opacity: 0.55; cursor: not-allowed; }
 
@@ -151,8 +156,10 @@ button {
   display: flex; align-items: center; gap: 12px;
   font-size: 0.85rem; color: rgba(255,255,255,0.9);
 }
-.topbar .user .btn-ghost { color: white; }
-.topbar .user .btn-ghost:hover { background: rgba(255,255,255,0.15); }
+/* border-color propio: el gris de var(--line) (pensado para fondos claros/
+   oscuros neutros) casi no se ve contra el gradiente de color del topbar. */
+.topbar .user .btn-ghost { color: white; border-color: rgba(255,255,255,0.5); }
+.topbar .user .btn-ghost:hover { background: rgba(255,255,255,0.15); border-color: white; }
 
 .app-shell {
   max-width: 1400px;
