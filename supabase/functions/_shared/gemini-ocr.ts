@@ -70,9 +70,18 @@ const esErrorDeCuota = (mensaje: string) =>
 // (no tiene sentido reintentar cada 5 minutos contra un tope diario).
 const ENFRIAMIENTO_POR_DEFECTO_MS = 60 * 60 * 1000; // 1 hora
 
+// Piso deliberado de 15 minutos: Google sugiere "retry in 41s", pero esa
+// pista resultó demasiado optimista -- el 2026-09-22 se respetó tres veces
+// seguidas y el modelo seguía sin cuota, con la sugerencia creciendo (20s,
+// luego 41s). Con el cron cada 5 minutos, hacerle caso significa picotear
+// toda la noche gastando 4 solicitudes por vuelta para recibir el mismo
+// rechazo. Si el límite era por minuto, 15 minutos igual lo recupera; si
+// era diario, deja de sangrar.
+const PISO_ENFRIAMIENTO_CUOTA_MS = 15 * 60 * 1000;
+
 function calcularEnfriamiento(mensaje: string): number {
   const sugerido = /retry in ([\d.]+)s/i.exec(mensaje);
-  if (sugerido) return Math.max(Number(sugerido[1]) * 1000 + 2000, 30_000);
+  if (sugerido) return Math.max(Number(sugerido[1]) * 1000 + 2000, PISO_ENFRIAMIENTO_CUOTA_MS);
   return ENFRIAMIENTO_POR_DEFECTO_MS;
 }
 
