@@ -98,12 +98,14 @@ const corsHeaders = {
 const LOTE_ITEMS = 2;
 const LOTE_PREVIOS = 2;
 const TIEMPO_MAX_FUNCION_MS = 110_000;
-// Tope de reintentos por comprobante -- si lleva 6 pasadas sin éxito (con
-// el cron cada 5 min, más de media hora de intentos reales, no solo un par
-// de segundos), probablemente el problema es el documento en sí (ilegible,
-// corrupto) y no la disponibilidad de Gemini. Se marca "agotado" para
-// dejar de gastar cupo/tiempo en él para siempre.
-const MAX_INTENTOS = 6;
+// Tope de reintentos por comprobante. OJO con subir este número: la cuota
+// gratuita de Gemini es de ~20 solicitudes por modelo, así que con 6
+// intentos × 4 modelos candidatos UN SOLO comprobante podía consumir 24
+// solicitudes -- más que la cuota diaria completa de un modelo. Eso fue
+// exactamente lo que pasó el 2026-09-22: la propia máquina de reintentos
+// agotó la cuota y después culpamos a Google por horas. Con 2, y con el
+// enfriamiento por modelo de gemini-ocr.ts, el gasto queda acotado.
+const MAX_INTENTOS = 2;
 
 // Auto-frenado: si la corrida anterior falló en un 80% o más (y procesó al
 // menos 3 comprobantes, para no reaccionar a una muestra de 1), y fue hace

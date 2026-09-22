@@ -57,22 +57,48 @@ const VENTANA_RECIENTE_MS = 3 * 60 * 60 * 1000; // 3 horas
 // Registra el resultado de UN intento contra UN modelo -- no bloquea el
 // flujo principal si falla (una tabla de estadística que no se pudo
 // actualizar no debería tumbar una lectura de comprobante que sí funcionó).
+// La cuota del nivel gratuito es POR MODELO (ej. "limit: 20, model:
+// gemini-3.6-flash"). Cuando un modelo la agota, seguir llamándolo es 100%
+// desperdicio: responde el mismo error sin hacer nada. Esto detecta ese
+// caso para poder ponerlo en enfriamiento.
+const esErrorDeCuota = (mensaje: string) =>
+  /quota|rate.?limit|exceeded your current quota/i.test(mensaje);
+
+// Cuánto esperar antes de volver a probar un modelo que agotó cuota. Google
+// manda un "Please retry in 20.4s" cuando es el límite por minuto; si no
+// viene ese dato, se asume que es el límite DIARIO y se espera bastante más
+// (no tiene sentido reintentar cada 5 minutos contra un tope diario).
+const ENFRIAMIENTO_POR_DEFECTO_MS = 60 * 60 * 1000; // 1 hora
+
+function calcularEnfriamiento(mensaje: string): number {
+  const sugerido = /retry in ([\d.]+)s/i.exec(mensaje);
+  if (sugerido) return Math.max(Number(sugerido[1]) * 1000 + 2000, 30_000);
+  return ENFRIAMIENTO_POR_DEFECTO_MS;
+}
+
 async function registrarIntentoModelo(admin: AdminClient | null, modelo: string, exito: boolean, mensajeError?: string) {
   if (!admin) return;
   try {
-    const ahora = new Date().toISOString();
+    const ahora = new Date();
     const { data: fila } = await admin.from("gemini_modelo_stats").select("intentos_ok, intentos_fail").eq("modelo", modelo).maybeSingle();
+    // Si el fallo fue por cuota, se anota hasta cuándo no vale la pena
+    // volver a llamarlo -- ver ordenarModelosPorRendimiento, que directamente
+    // lo saca de la lista hasta esa hora. Un éxito limpia el enfriamiento.
+    const enfriamiento = !exito && mensajeError && esErrorDeCuota(mensajeError)
+      ? new Date(ahora.getTime() + calcularEnfriamiento(mensajeError)).toISOString()
+      : null;
     await admin.from("gemini_modelo_stats").upsert({
       modelo,
       intentos_ok: (fila?.intentos_ok || 0) + (exito ? 1 : 0),
       intentos_fail: (fila?.intentos_fail || 0) + (exito ? 0 : 1),
       ultimo_resultado: exito ? "ok" : "fail",
-      ultimo_intento: ahora,
+      ultimo_intento: ahora.toISOString(),
       // El mensaje crudo POR MODELO. Sin esto solo quedaba en console.error
       // de la Edge Function (que no se puede consultar desde acá), y hubo
       // que deducir qué estaba fallando mirando los tiempos entre intentos
       // -- costó horas de diagnóstico a ciegas.
       ultimo_error: exito ? null : (mensajeError || null),
+      disponible_desde: enfriamiento,
     });
   } catch (err) {
     console.error(`No se pudo registrar estadística de Gemini para ${modelo}:`, err);
@@ -96,14 +122,25 @@ async function ordenarModelosPorRendimiento(admin: AdminClient | null): Promise<
   try {
     const { data: stats, error } = await admin
       .from("gemini_modelo_stats")
-      .select("modelo, intentos_ok, intentos_fail, ultimo_resultado, ultimo_intento")
+      .select("modelo, intentos_ok, intentos_fail, ultimo_resultado, ultimo_intento, disponible_desde")
       .in("modelo", GEMINI_MODELOS_BASE);
     if (error || !stats?.length) return GEMINI_MODELOS_BASE;
 
     const porModelo = new Map(stats.map((s) => [s.modelo as string, s]));
     const ahora = Date.now();
 
-    return [...GEMINI_MODELOS_BASE].sort((a, b) => {
+    // Lo más importante para no desperdiciar cuota: sacar de la lista los
+    // modelos que ya dijeron "quota exceeded" y todavía están en
+    // enfriamiento. Llamarlos de nuevo antes de tiempo no falla "gratis":
+    // consume una solicitud del cupo para recibir exactamente el mismo
+    // error. Si TODOS están enfriándose, se devuelve lista vacía y
+    // leerComprobante corta al instante sin tocar Gemini ni una vez.
+    const disponibles = GEMINI_MODELOS_BASE.filter((m) => {
+      const hasta = porModelo.get(m)?.disponible_desde as string | null | undefined;
+      return !hasta || new Date(hasta).getTime() <= ahora;
+    });
+
+    return disponibles.sort((a, b) => {
       const sa = porModelo.get(a);
       const sb = porModelo.get(b);
       const puntaje = (s: typeof sa) => {
@@ -249,6 +286,14 @@ async function llamarGemini(admin: AdminClient | null, modelo: string, intentosM
 async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknown, presupuesto: PresupuestoTiempo) {
   const inicio = Date.now();
   const modelosOrdenados = await ordenarModelosPorRendimiento(admin);
+  if (!modelosOrdenados.length) {
+    // Cero llamadas a Gemini: todos los modelos agotaron su cuota y siguen
+    // en enfriamiento. Antes esto igual gastaba una solicitud por modelo
+    // para recibir cuatro veces el mismo "quota exceeded".
+    const err = new Error("La cuota diaria gratuita de la IA está agotada por ahora. Se reintenta solo más tarde, sin que tengas que hacer nada.");
+    (err as Error & { reintentable?: boolean }).reintentable = true;
+    throw err;
+  }
   let ultimoError: Error = new Error("No hay modelos de Gemini configurados (GEMINI_MODELS_ORDEN).");
   for (let i = 0; i < modelosOrdenados.length; i++) {
     // Solo se empieza con otro candidato si queda tiempo para darle una
