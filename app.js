@@ -2304,6 +2304,162 @@ function conTimeout(promise, ms, mensaje) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(idTimeout));
 }
 
+// ---------------------------------------------------------------------
+// Lectura LOCAL de facturas electrónicas en PDF, sin IA.
+//
+// Una factura electrónica chilena generada digitalmente trae el texto
+// adentro del PDF (RUT, folio, total, fecha) -- no hace falta que un modelo
+// lo "mire" e interprete: se lee el dato exacto. Es gratis, instantáneo, no
+// consume la cuota de Gemini (que el 2026-09-22 se agotó y dejó la app sin
+// OCR todo un día) y es MÁS preciso que la IA para este caso, porque no
+// interpreta: extrae.
+//
+// La IA sigue siendo necesaria para fotos y PDF escaneados (imagen sin
+// texto), que es donde de verdad aporta. Si acá no se logra sacar lo
+// esencial, se cae a la IA como siempre.
+// ---------------------------------------------------------------------
+const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+let pdfjsCargando = null;
+
+// Se carga recién cuando alguien adjunta un PDF (son ~300KB): no tiene
+// sentido que los pague en descarga quien solo sube fotos.
+function cargarPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (pdfjsCargando) return pdfjsCargando;
+  pdfjsCargando = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = PDFJS_URL;
+    s.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+      resolve(window.pdfjsLib);
+    };
+    s.onerror = () => reject(new Error("No se pudo cargar el lector de PDF."));
+    document.head.appendChild(s);
+  });
+  return pdfjsCargando;
+}
+
+const MESES_ES = {
+  enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
+  julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+};
+const RE_RUT_EN_TEXTO = /(\d{1,2}\.?\d{3}\.?\d{3}\s*-\s*[\dkK])/g;
+
+// Los patrones de acá abajo NO son inventados: se ajustaron contra dos
+// facturas reales de emisores y maquetados distintos (Supletech/bsale y
+// Rindegastos/simpledte), y cada regla existe porque una versión anterior
+// se equivocó con una de ellas. Ver los comentarios puntuales.
+function parsearTextoFactura(texto) {
+  const t = texto.replace(/\s+/g, " ");
+
+  // El RUT del EMISOR va antes que el del receptor en los dos formatos
+  // probados. Se valida el dígito verificador (validarRut) para descartar
+  // números que solo parecen RUT.
+  const ruts = [...t.matchAll(RE_RUT_EN_TEXTO)]
+    .map((m) => m[1].replace(/\s/g, ""))
+    .filter((r) => validarRut(r));
+
+  let tipo_documento = null;
+  if (/FACTURA\s+EXENTA/i.test(t)) tipo_documento = "Factura Exenta Electrónica";
+  else if (/FACTURA\s+ELECTR/i.test(t)) tipo_documento = "Factura Electrónica";
+  else if (/BOLETA\s+DE\s+HONORARIO/i.test(t)) tipo_documento = "Boleta de Honorario";
+  else if (/BOLETA\s+ELECTR/i.test(t)) tipo_documento = "Boleta Electrónica";
+
+  // Folio solo si viene con su etiqueta pegada ("N° 136982"). Cuando la
+  // etiqueta quedó separada del número en el flujo de texto, se prefiere
+  // dejarlo en blanco antes que adivinar: un folio equivocado en
+  // contabilidad es peor que un campo vacío.
+  const mFolio = /(?:N[°ºo]\.?|FOLIO)\s*:?\s*(\d{2,10})\b/i.exec(t);
+
+  // Los RUT se sacan del texto ANTES de buscar importes: si no, sus dígitos
+  // se leen como pesos (77.574.911-3 daba un "monto" de $77.574.911).
+  const sinRuts = t.replace(RE_RUT_EN_TEXTO, " ");
+  const aNumero = (s) => Number(String(s).replace(/\./g, ""));
+  const RE_MONTO = "(\\d{1,3}(?:\\.\\d{3})+|\\d{4,})";
+
+  // 1) El importe etiquetado "Total $". El \\$ es obligatorio y "total" va
+  //    como palabra propia: sin eso matcheaba "SUBTOTAL 1577" (un SKU) y
+  //    "Total 2.40 CLF" (texto de una glosa).
+  const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])total\\s*\\(?\\s*\\$\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
+  let monto = mTotal ? aNumero(mTotal[1]) : null;
+  // 2) Si la etiqueta quedó lejos de su valor (pasa en el formato bsale),
+  //    el mayor importe CON SIGNO $ del documento es el total. El "$" es
+  //    clave: sin él ganaba un número de referencia de la sección
+  //    "Referencias a otros Documentos", que era más grande que el total.
+  if (!monto) {
+    const candidatos = [...sinRuts.matchAll(new RegExp(`\\$\\s*${RE_MONTO}`, "g"))]
+      .map((m) => aNumero(m[1]))
+      .filter((n) => n >= 1000);
+    monto = candidatos.length ? Math.max(...candidatos) : null;
+  }
+
+  let fecha = null;
+  const mNum = /\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/.exec(t);
+  const mTxt = /\b(\d{1,2})\s+de\s+([a-záéíóú]+)\s+(?:del?\s+)?(\d{4})\b/i.exec(t);
+  const iso = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  if (mNum) fecha = iso(mNum[3], mNum[2], mNum[1]);
+  else if (mTxt && MESES_ES[mTxt[2].toLowerCase()]) fecha = iso(mTxt[3], MESES_ES[mTxt[2].toLowerCase()], mTxt[1]);
+
+  return {
+    nombre_proveedor: null, // se resuelve por RUT contra contabilidad, que es más confiable que leerlo del PDF
+    rut_proveedor: ruts[0] || null,
+    tipo_documento,
+    nro_documento: mFolio ? mFolio[1] : null,
+    fecha,
+    monto,
+    descripcion: null,
+    categoria_sugerida: null,
+  };
+}
+
+// Sugerencia de categoría SIN IA: qué categoría se le puso antes a las
+// facturas de ESTE MISMO RUT. Sale del historial real de la empresa, así
+// que para un proveedor recurrente es más confiable que lo que pueda
+// deducir un modelo mirando el documento. La categoría además alimenta la
+// sugerencia de cuenta contable que ve el aprobador (ver
+// actualizarSugerenciaCuenta en iniciarEdicionItem).
+async function buscarCategoriaPorRut(rutProveedor) {
+  if (!rutProveedor) return null;
+  const { data, error } = await db
+    .from("rendicion_items")
+    .select("categoria")
+    .eq("rut_proveedor", rutProveedor)
+    .not("categoria", "is", null)
+    .order("id", { ascending: false })
+    .limit(20);
+  if (error || !data?.length) return null;
+  const conteo = {};
+  data.forEach((d) => { conteo[d.categoria] = (conteo[d.categoria] || 0) + 1; });
+  // La más usada; si hay empate gana la más reciente (el orden de la query).
+  return Object.entries(conteo).sort((a, b) => b[1] - a[1])[0][0];
+}
+
+// Devuelve los datos si el PDF traía texto suficiente, o null para que siga
+// el camino normal con IA (PDF escaneado, protegido, o sin los datos clave).
+async function leerPdfLocal(file) {
+  if ((file.type || "") !== "application/pdf") return null;
+  try {
+    const pdfjs = await cargarPdfJs();
+    const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+    let texto = "";
+    // Tope de páginas: una factura tiene 1-2; leer un PDF enorme entero solo
+    // para buscar un RUT no aporta y traba el navegador.
+    for (let p = 1; p <= Math.min(pdf.numPages, 3); p++) {
+      const contenido = await (await pdf.getPage(p)).getTextContent();
+      texto += contenido.items.map((i) => i.str).join(" ") + "\n";
+    }
+    if (texto.trim().length < 50) return null; // PDF escaneado: es una imagen, no hay texto que leer
+    const datos = parsearTextoFactura(texto);
+    // El piso para considerarlo bueno: RUT válido + monto. Sin esos dos no
+    // vale la pena saltarse la IA.
+    return datos.rut_proveedor && datos.monto ? datos : null;
+  } catch (err) {
+    console.error("No se pudo leer el PDF localmente, se usará la IA:", err);
+    return null;
+  }
+}
+
 async function llamarOcrRecibo(file) {
   const imageBase64 = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -2484,9 +2640,27 @@ function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
 
 async function analizarComprobante(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
-  statusEl.textContent = "🪄 Analizando comprobante con IA...";
+  statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
+    // Primero se intenta leer el PDF localmente: si es una factura
+    // electrónica con texto, sale al instante, gratis y sin gastar cuota de
+    // Gemini. Solo si eso no alcanza (foto, PDF escaneado) se llama a la IA.
+    const datosLocales = await leerPdfLocal(file);
+    if (datosLocales) {
+      // La categoría no sale del PDF, pero sí del historial de este mismo
+      // proveedor -- así el aprobador igual recibe su sugerencia de cuenta
+      // contable aunque la IA no haya intervenido en nada.
+      datosLocales.categoria_sugerida = await buscarCategoriaPorRut(datosLocales.rut_proveedor);
+      await aplicarResultadoOcrCon(id, datosLocales, gen);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
+      statusEl.textContent = datosLocales.categoria_sugerida
+        ? `✔ Datos leídos del PDF de la factura, y categoría sugerida según cómo clasificaste antes a este proveedor. Revísalos antes de enviar.`
+        : "✔ Datos leídos del PDF de la factura. Revísalos antes de enviar.";
+      statusEl.className = "ocr-status show ok";
+      return;
+    }
+
     const data = await llamarOcrRecibo(file);
     await aplicarResultadoOcrCon(id, data, gen);
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
