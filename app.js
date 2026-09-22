@@ -1506,7 +1506,12 @@ async function openAdminUsuarios(pushHistory = true) {
       const mostrarPanel = (tipo, render) => {
         const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
         if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
-        filaExtra.style.display = "table-row";
+        // "" (no "table-row" fijo): deja que el CSS decida -- en mobile
+        // (@media max-width:700px) .items-table tr pasa a display:block para
+        // apilarse como tarjeta, pero un estilo inline le gana a esa regla
+        // (no tiene !important) y dejaba la fila trabada en table-row dentro
+        // de un tbody ya puesto en block, rompiendo el ancho de esta celda.
+        filaExtra.style.display = "";
         extraCell.dataset.tipo = tipo;
         render(extraCell);
       };
@@ -1822,7 +1827,7 @@ async function openAdminPlantillas(pushHistory = true) {
     const mostrarPanel = (tipo, render) => {
       const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
       if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
-      filaExtra.style.display = "table-row";
+      filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
       extraCell.dataset.tipo = tipo;
       render(extraCell);
     };
@@ -3394,7 +3399,7 @@ async function openDetalle(id, pushHistory = true) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-sm", type: "button",
         onclick: () => {
-          filaExtra.style.display = "table-row";
+          filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
           iniciarEdicionItem(it, extraCell, r, esAprobadorViewer);
         },
       }, "Editar"));
@@ -3407,7 +3412,7 @@ async function openDetalle(id, pushHistory = true) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-sm", type: "button",
         onclick: () => {
-          filaExtra.style.display = "table-row";
+          filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
           const verifyBox = el("div", { class: "verify-box show" }, "Consultando...");
           extraCell.innerHTML = "";
           extraCell.appendChild(verifyBox);
@@ -3437,7 +3442,7 @@ async function openDetalle(id, pushHistory = true) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-danger btn-sm", type: "button",
         onclick: () => {
-          filaExtra.style.display = "table-row";
+          filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
           extraCell.innerHTML = "";
           const motivoInput = el("textarea", {
             rows: "2", placeholder: "Motivo del rechazo de este ítem (se le avisa por correo al empleado)...",
