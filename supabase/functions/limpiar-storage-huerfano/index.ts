@@ -60,6 +60,19 @@ Deno.serve(async (req: Request) => {
     if (errItems) throw errItems;
     const referenciados = new Set((items || []).map((i) => i.adjunto_url));
 
+    // OJO: ocr_previos (la cola de OCR de antes de enviar la rendición, ver
+    // migracion_ocr_previo.sql) también apunta a archivos de este bucket, y
+    // esta función no la conocía -- tal como estaba, habría borrado
+    // comprobantes que el agente todavía tenía pendientes de leer. Los
+    // 'pendiente' se protegen; los ya resueltos ('listo'/'agotado') sí son
+    // descartables: su resultado quedó guardado en la propia fila, el
+    // archivo ya no hace falta.
+    const { data: previos, error: errPrevios } = await admin.from("ocr_previos").select("id, storage_path, estado, created_at");
+    if (errPrevios) throw errPrevios;
+    (previos || []).forEach((p) => {
+      if (p.estado === "pendiente") referenciados.add(p.storage_path);
+    });
+
     // Storage no tiene un "listar todo el bucket" plano -- hay que recorrer
     // carpeta por carpeta (una por usuario, ver el path "userId/..." en
     // submitRendicion). Se listan las carpetas de primer nivel y después
@@ -82,17 +95,31 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    if (!huerfanos.length) {
+    // Filas de ocr_previos ya resueltas y viejas: se borran junto con sus
+    // archivos, si no la tabla crece para siempre con filas cuyo archivo ya
+    // no existe. Las 'pendiente' no se tocan nunca, sin importar la edad --
+    // el agente las sigue trabajando.
+    const previosABorrar = (previos || [])
+      .filter((p) => p.estado !== "pendiente")
+      .filter((p) => !p.created_at || new Date(p.created_at as string).getTime() <= limiteFecha)
+      .map((p) => p.id as string);
+
+    if (!huerfanos.length && !previosABorrar.length) {
       return new Response(JSON.stringify({ ok: true, borrados: 0, nota: "No se encontraron archivos huérfanos." }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    const { error: errBorrar } = await admin.storage.from("comprobantes").remove(huerfanos);
-    if (errBorrar) throw errBorrar;
+    if (huerfanos.length) {
+      const { error: errBorrar } = await admin.storage.from("comprobantes").remove(huerfanos);
+      if (errBorrar) throw errBorrar;
+    }
+    if (previosABorrar.length) {
+      await admin.from("ocr_previos").delete().in("id", previosABorrar);
+    }
 
-    await logEvent(admin, "limpieza_storage_ok", { usuarioId: callerId, metadata: { borrados: huerfanos.length } });
-    return new Response(JSON.stringify({ ok: true, borrados: huerfanos.length }), {
+    await logEvent(admin, "limpieza_storage_ok", { usuarioId: callerId, metadata: { borrados: huerfanos.length, filas_ocr_previos: previosABorrar.length } });
+    return new Response(JSON.stringify({ ok: true, borrados: huerfanos.length, filas_ocr_previos: previosABorrar.length }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
