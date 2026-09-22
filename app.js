@@ -2049,20 +2049,30 @@ function addItemRow() {
   const titulo = el("strong", {}, `Ítem ${itemSeq}`);
   const head = el("div", { class: "item-head" }, [
     titulo,
-    el("button", {
-      class: "btn btn-ghost", type: "button",
-      onclick: () => {
-        // Solo pedimos confirmación si la tarjeta ya tiene algo cargado
-        // (monto o comprobante) -- para una tarjeta extra vacía que la
-        // persona nunca llegó a usar, preguntar es puro ruido.
-        const tieneMonto = [...wrap.querySelectorAll('input[data-money]')].some((i) => i.value.trim());
-        const tieneArchivo = [...wrap.querySelectorAll('input[type=file]')].some((i) => i.files.length);
-        if ((tieneMonto || tieneArchivo) && !confirm("¿Quitar este ítem? Se pierde el comprobante y los datos cargados, no se puede deshacer.")) return;
-        wrap.remove();
-        renumerarItems();
-        recalcTotal();
-      },
-    }, "Quitar"),
+    el("div", { style: "display:flex; gap:6px;" }, [
+      // Un mismo documento (factura/boleta) puede corresponder a más de un
+      // Centro de Costo (ej. una factura de insumos que se reparte entre
+      // dos sedes) -- esto arma un segundo ítem con los mismos datos del
+      // documento (proveedor, RUT, tipo, N° documento, fecha, categoría, y
+      // el mismo comprobante adjunto), para que la persona solo tenga que
+      // repartir el monto y elegir el otro Centro de Costo, en vez de
+      // tipear todo de nuevo a mano.
+      el("button", { class: "btn btn-ghost", type: "button", onclick: () => dividirItem(wrap, id) }, "Dividir ítem"),
+      el("button", {
+        class: "btn btn-ghost", type: "button",
+        onclick: () => {
+          // Solo pedimos confirmación si la tarjeta ya tiene algo cargado
+          // (monto o comprobante) -- para una tarjeta extra vacía que la
+          // persona nunca llegó a usar, preguntar es puro ruido.
+          const tieneMonto = [...wrap.querySelectorAll('input[data-money]')].some((i) => i.value.trim());
+          const tieneArchivo = [...wrap.querySelectorAll('input[type=file]')].some((i) => i.files.length);
+          if ((tieneMonto || tieneArchivo) && !confirm("¿Quitar este ítem? Se pierde el comprobante y los datos cargados, no se puede deshacer.")) return;
+          wrap.remove();
+          renumerarItems();
+          recalcTotal();
+        },
+      }, "Quitar"),
+    ]),
   ]);
 
   const toggle = el("div", { class: "toggle-group", role: "tablist" }, [
@@ -2095,6 +2105,57 @@ function addItemRow() {
   // uno nuevo ("Ítem 5") puede no coincidir con su posición real en la
   // lista ("Ítem 3"). renumerarItems() lo corrige apenas se agrega.
   renumerarItems();
+}
+
+// Arma un ítem nuevo con los mismos datos del documento del ítem "wrap"
+// (proveedor, RUT, tipo, N° documento, fecha, categoría -- y el mismo
+// comprobante adjunto), para el caso real de una factura/boleta que
+// corresponde a más de un Centro de Costo. A propósito NO reparte el
+// monto a la mitad ni adivina nada -- deja el mismo monto en los dos y
+// que la persona ajuste cada uno a lo que realmente corresponde a cada
+// sede, junto con el Centro de Costo.
+function dividirItem(wrap, id) {
+  const esCon = wrap.querySelector('[data-tipo="ConDocumento"]').classList.contains("active");
+  const v = (sufijo) => document.getElementById(`${id}${sufijo}`)?.value || "";
+  const fotoInputOrigen = document.getElementById(esCon ? `${id}-foto` : `${id}-foto2`);
+  const datos = esCon
+    ? {
+        nombreprov: v("-nombreprov"), rut: v("-rut"), tipodoc: v("-tipodoc"),
+        folio: v("-folio"), venc: v("-venc"), categoria: v("-categoriacon"), monto: v("-monto"),
+      }
+    : { nombreprov2: v("-nombreprov2"), categoria: v("-categoria"), monto2: v("-monto2") };
+
+  addItemRow();
+  const nuevoId = "item-" + itemSeq;
+  const nuevoWrap = document.getElementById(nuevoId);
+  if (!esCon) nuevoWrap.querySelector('[data-tipo="SinDocumento"]').click();
+
+  if (esCon) {
+    document.getElementById(`${nuevoId}-nombreprov`).value = datos.nombreprov;
+    document.getElementById(`${nuevoId}-rut`).value = datos.rut;
+    if (datos.tipodoc) document.getElementById(`${nuevoId}-tipodoc`).value = datos.tipodoc;
+    document.getElementById(`${nuevoId}-folio`).value = datos.folio;
+    document.getElementById(`${nuevoId}-venc`).value = datos.venc;
+    const catSel = document.getElementById(`${nuevoId}-categoriacon`);
+    if (catSel && datos.categoria) catSel.value = datos.categoria;
+    document.getElementById(`${nuevoId}-monto`).value = datos.monto;
+  } else {
+    document.getElementById(`${nuevoId}-nombreprov2`).value = datos.nombreprov2;
+    const catSel = document.getElementById(`${nuevoId}-categoria`);
+    if (catSel && datos.categoria) { catSel.value = datos.categoria; catSel.dispatchEvent(new Event("change")); }
+    document.getElementById(`${nuevoId}-monto2`).value = datos.monto2;
+  }
+
+  if (fotoInputOrigen?.files?.length) {
+    const fotoInputNuevo = document.getElementById(esCon ? `${nuevoId}-foto` : `${nuevoId}-foto2`);
+    const dt = new DataTransfer();
+    dt.items.add(fotoInputOrigen.files[0]);
+    fotoInputNuevo.files = dt.files;
+  }
+
+  recalcTotal();
+  toast("Ítem dividido. Ajusta el monto y el Centro de Costo de cada uno para que sumen el total real del documento.");
+  document.getElementById(esCon ? `${nuevoId}-cccon` : `${nuevoId}-cc`)?.focus();
 }
 
 function buildConDocumentoFields(id) {
