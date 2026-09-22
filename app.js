@@ -2413,26 +2413,52 @@ function parsearTextoFactura(texto) {
   };
 }
 
-// Sugerencia de categoría SIN IA: qué categoría se le puso antes a las
-// facturas de ESTE MISMO RUT. Sale del historial real de la empresa, así
-// que para un proveedor recurrente es más confiable que lo que pueda
-// deducir un modelo mirando el documento. La categoría además alimenta la
-// sugerencia de cuenta contable que ve el aprobador (ver
+// Sugerencias SIN IA sacadas del historial real de ESTE MISMO RUT: qué
+// categoría y qué descripción se usaron antes para facturas del mismo
+// proveedor. Para un proveedor recurrente esto es más confiable que lo que
+// pueda deducir un modelo mirando el documento, y la categoría además
+// alimenta la sugerencia de cuenta contable que ve el aprobador (ver
 // actualizarSugerenciaCuenta en iniciarEdicionItem).
-async function buscarCategoriaPorRut(rutProveedor) {
-  if (!rutProveedor) return null;
+async function buscarDatosPreviosPorRut(rutProveedor) {
+  if (!rutProveedor) return { categoria: null, descripcion: null };
   const { data, error } = await db
     .from("rendicion_items")
-    .select("categoria")
+    .select("categoria, descripcion")
     .eq("rut_proveedor", rutProveedor)
-    .not("categoria", "is", null)
     .order("id", { ascending: false })
     .limit(20);
-  if (error || !data?.length) return null;
+  if (error || !data?.length) return { categoria: null, descripcion: null };
+
+  // Categoría: la más usada (si hay empate gana la más reciente, por el
+  // orden de la consulta). Puede venir toda en null -- los ítems "Documento
+  // electrónico" no tenían este campo hasta hace poco, así que para
+  // proveedores cargados antes de eso simplemente todavía no hay qué sugerir.
   const conteo = {};
-  data.forEach((d) => { conteo[d.categoria] = (conteo[d.categoria] || 0) + 1; });
-  // La más usada; si hay empate gana la más reciente (el orden de la query).
-  return Object.entries(conteo).sort((a, b) => b[1] - a[1])[0][0];
+  data.forEach((d) => { if (d.categoria) conteo[d.categoria] = (conteo[d.categoria] || 0) + 1; });
+  const categoria = Object.keys(conteo).length
+    ? Object.entries(conteo).sort((a, b) => b[1] - a[1])[0][0]
+    : null;
+
+  // Descripción: la del ítem más reciente, no la más repetida -- si a este
+  // proveedor se le compran cosas distintas, la última es la referencia más
+  // útil para editarla encima.
+  const descripcion = data.find((d) => d.descripcion && d.descripcion.trim())?.descripcion || null;
+
+  return { categoria, descripcion };
+}
+
+// El folio a veces no se puede sacar del texto del PDF porque su etiqueta
+// ("Nº") queda separada del número en el flujo. Pero los sistemas de
+// facturación suelen ponerlo en el NOMBRE del archivo ("Factura N9893
+// FoodTech.pdf", "GW_2026_09_FACTURA_136982_RINDEGASTOS SPA.pdf"), así que
+// sirve como segunda fuente. Se exige que venga acompañado de "factura",
+// "boleta", "N" o "F" para no confundirlo con una fecha o un correlativo
+// interno cualquiera del nombre.
+function folioDesdeNombreArchivo(nombre) {
+  if (!nombre) return null;
+  const sinExtension = nombre.replace(/\.[a-z0-9]+$/i, "");
+  const m = /(?:factura|boleta|dte|[NnFf])[ _\-°º]*(\d{3,10})\b/.exec(sinExtension);
+  return m ? m[1] : null;
 }
 
 // Devuelve los datos si el PDF traía texto suficiente, o null para que siga
@@ -2648,14 +2674,21 @@ async function analizarComprobante(id, file, statusEl) {
     // Gemini. Solo si eso no alcanza (foto, PDF escaneado) se llama a la IA.
     const datosLocales = await leerPdfLocal(file);
     if (datosLocales) {
-      // La categoría no sale del PDF, pero sí del historial de este mismo
-      // proveedor -- así el aprobador igual recibe su sugerencia de cuenta
-      // contable aunque la IA no haya intervenido en nada.
-      datosLocales.categoria_sugerida = await buscarCategoriaPorRut(datosLocales.rut_proveedor);
+      // El folio, cuando no se pudo leer del texto, suele venir en el nombre
+      // del archivo.
+      if (!datosLocales.nro_documento) datosLocales.nro_documento = folioDesdeNombreArchivo(file.name);
+      // Categoría y descripción no salen del PDF, pero sí del historial de
+      // este mismo proveedor -- así el aprobador igual recibe su sugerencia
+      // de cuenta contable aunque la IA no haya intervenido en nada.
+      const previos = await buscarDatosPreviosPorRut(datosLocales.rut_proveedor);
+      datosLocales.categoria_sugerida = previos.categoria;
+      datosLocales.descripcion = previos.descripcion;
+
       await aplicarResultadoOcrCon(id, datosLocales, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
-      statusEl.textContent = datosLocales.categoria_sugerida
-        ? `✔ Datos leídos del PDF de la factura, y categoría sugerida según cómo clasificaste antes a este proveedor. Revísalos antes de enviar.`
+      const conHistorial = previos.categoria || previos.descripcion;
+      statusEl.textContent = conHistorial
+        ? "✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor. Revísalos antes de enviar."
         : "✔ Datos leídos del PDF de la factura. Revísalos antes de enviar.";
       statusEl.className = "ocr-status show ok";
       return;
