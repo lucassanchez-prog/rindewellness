@@ -298,7 +298,12 @@ button {
   padding: 3px 0;
 }
 .cuenta-check input { width: auto; flex-shrink: 0; margin-top: 3px; }
-.cuenta-check span { white-space: normal; word-break: break-word; }
+/* flex:1 -- sin esto, el span (con flex-grow:0 por defecto) se encoge hasta
+   su "mínimo automático" en vez de tomar el espacio disponible, y como
+   word-break:break-word permite un mínimo de una sola letra, terminaba
+   partiendo el texto letra por letra en vertical dentro de columnas
+   angostas (ver .field-row). */
+.cuenta-check span { flex: 1; min-width: 0; white-space: normal; word-break: break-word; }
 .cuenta-check.oculto { display: none; }
 
 .pill {
@@ -330,7 +335,12 @@ button {
 
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .field label { font-size: 0.82rem; font-weight: 600; color: var(--ink-soft); }
-.field input, .field select, .field textarea {
+/* :not([type=checkbox|radio]) -- sin esto, esta regla (misma especificidad
+   que ".cuenta-check input", pero declarada después en el archivo, así que
+   gana el empate) forzaba cualquier checkbox/radio dentro de un .field a
+   ancho 100%, dejándole 0px de espacio a su <span> de al lado -- causaba
+   que el texto de la etiqueta se partiera letra por letra en vertical. */
+.field input:not([type="checkbox"]):not([type="radio"]), .field select, .field textarea {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 10px 12px;
@@ -345,7 +355,14 @@ button {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px rgba(4, 107, 210, 0.12);
 }
-.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+/* minmax(0, 1fr) en vez de 1fr: una columna "1fr" sola no puede achicarse
+   más allá del contenido mínimo de lo que tiene adentro -- con texto largo
+   sin salto natural (ej. la etiqueta de "Delegado temporal", que además
+   tiene word-break:break-word), ese mínimo termina siendo el ancho de una
+   sola letra, y la columna entera colapsa a eso, partiendo el texto letra
+   por letra en vertical. minmax(0, 1fr) le permite a la columna encogerse
+   normalmente en vez de quedar atada al contenido. */
+.field-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
 
 .password-field { position: relative; }
 .password-field input { width: 100%; padding-right: 44px; }
