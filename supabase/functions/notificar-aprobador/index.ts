@@ -34,6 +34,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
+import { esAprobadorEfectivo } from "../_shared/auth.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -75,7 +76,7 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
   const anon = createClient(SUPABASE_URL, ANON_KEY);
   const { data: userRes, error: userErr } = await anon.auth.getUser(jwt);
   if (userErr || !userRes?.user) throw new Error("Sesión inválida o expirada.");
-  const { data: profile, error: profileErr } = await admin.from("profiles").select("id, nombre, rol, activo").eq("id", userRes.user.id).maybeSingle();
+  const { data: profile, error: profileErr } = await admin.from("profiles").select("id, nombre, rol, activo, delegado_activo, delegado_hasta").eq("id", userRes.user.id).maybeSingle();
   if (profileErr) throw profileErr;
   if (!profile) throw new Error("Perfil no encontrado.");
   // Las policies de la base ya bloquean a alguien desactivado a nivel de
@@ -176,7 +177,7 @@ Deno.serve(async (req: Request) => {
     const tabla = esSolicitud ? "solicitudes_fondos" : "rendiciones";
     const { data: row, error: errRow } = await admin.from(tabla).select("*").eq("id", rendicion_id).maybeSingle();
     if (errRow || !row) throw new Error("No se encontró la rendición/solicitud.");
-    if (row.empleado_id !== caller.id && !["admin", "aprobador"].includes(caller.rol)) {
+    if (row.empleado_id !== caller.id && !esAprobadorEfectivo(caller)) {
       throw new Error("No autorizado para notificar sobre esta rendición/solicitud.");
     }
 
@@ -225,20 +226,45 @@ Deno.serve(async (req: Request) => {
       ? `Nueva solicitud de fondos pendiente · ${folioFmt} · ${empleado_nombre}`
       : `Nueva rendición pendiente · ${folioFmt} · ${empleado_nombre}`;
     const linkDetalle = `${APP_URL}/#${esSolicitud ? "detalle-solicitud" : "detalle"}/${rendicion_id}`;
+    const hoyFmt = new Date().toLocaleDateString("es-CL", { day: "numeric", month: "long", year: "numeric" });
+    const filaDato = (label: string, valor: string) => `
+      <tr>
+        <td style="padding:9px 0;color:#9aa4ae;font-size:12px;text-transform:uppercase;letter-spacing:0.03em;width:44%;">${label}</td>
+        <td style="padding:9px 0;color:#1a1f27;font-size:14px;font-weight:600;">${valor}</td>
+      </tr>`;
     const html = `
-      <div style="font-family: Arial, sans-serif; color: #1a1f27;">
-        <h2 style="margin-bottom: 4px;">${esSolicitud ? "Nueva solicitud de fondos para aprobar" : "Nueva rendición para aprobar"}</h2>
-        <p style="color: #5b6472; margin-top: 0;">RindeWellness · Grupo Wellness</p>
-        <table style="border-collapse: collapse; margin: 16px 0;">
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Folio</td><td><strong>${escapeHtml(folioFmt)}</strong></td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empleado</td><td>${escapeHtml(empleado_nombre)}</td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">Empresa</td><td>${escapeHtml(empresa || "-")}</td></tr>
-          <tr><td style="padding: 4px 12px 4px 0; color: #5b6472;">${esSolicitud ? "Monto solicitado" : "Monto total"}</td><td><strong>${montoFmt}</strong></td></tr>
-          ${comentario ? `<tr><td style="padding: 4px 12px 4px 0; color: #5b6472; vertical-align:top;">${esSolicitud ? "Motivo" : "Comentario"}</td><td>${escapeHtml(comentario)}</td></tr>` : ""}
-        </table>
-        <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:6px;background:#046bd2;">
-          <a href="${linkDetalle}" style="display:inline-block;padding:10px 20px;color:#ffffff;text-decoration:none;font-weight:bold;">Revisar y aprobar</a>
-        </td></tr></table>
+      <div style="font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background:#eef1f5; padding:32px 16px;">
+        <div style="max-width:560px; margin:0 auto;">
+          <div style="text-align:center;margin-bottom:16px;">
+            <img src="${APP_URL}/assets/logo-gw.png" alt="Grupo Wellness" height="28" style="height:28px;width:auto;" />
+          </div>
+
+          <div style="background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid #e2e8f0; box-shadow:0 1px 2px rgba(28,39,51,0.06);">
+            <div style="background:linear-gradient(135deg,#046bd2,#0456a8); padding:26px 28px;">
+              <p style="margin:0; color:#ffffff; font-size:12px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; opacity:0.8;">RindeWellness</p>
+              <h1 style="margin:6px 0 0; color:#ffffff; font-size:20px;">${esSolicitud ? "Nueva solicitud de fondos" : "Nueva rendición"} para aprobar</h1>
+              <p style="margin:4px 0 0; color:#ffffff; font-size:12.5px; opacity:0.85;">${hoyFmt}</p>
+            </div>
+
+            <div style="padding:26px 28px;">
+              <table style="border-collapse:collapse; width:100%; margin-bottom:24px;">
+                ${filaDato("Folio", escapeHtml(folioFmt))}
+                ${filaDato("Empleado", escapeHtml(empleado_nombre))}
+                ${filaDato("Empresa", escapeHtml(empresa || "-"))}
+                ${filaDato(esSolicitud ? "Monto solicitado" : "Monto total", montoFmt)}
+                ${comentario ? filaDato(esSolicitud ? "Motivo" : "Comentario", escapeHtml(comentario)) : ""}
+              </table>
+
+              <div style="text-align:center;">
+                <a href="${linkDetalle}" style="display:inline-block; padding:13px 32px; background:#046bd2; color:#ffffff; text-decoration:none; font-weight:700; font-size:14px; border-radius:8px;">Revisar y aprobar</a>
+              </div>
+            </div>
+
+            <div style="background:#f4f7fb; padding:14px 28px; border-top:1px solid #e2e8f0;">
+              <p style="margin:0; color:#9aa4ae; font-size:11px;">RindeWellness · Grupo Wellness</p>
+            </div>
+          </div>
+        </div>
       </div>
     `;
 

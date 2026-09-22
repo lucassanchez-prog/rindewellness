@@ -22,6 +22,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent } from "../_shared/logging.ts";
+import { esAprobadorEfectivo } from "../_shared/auth.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -49,11 +50,11 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
   const anon = createClient(SUPABASE_URL, ANON_KEY);
   const { data: userRes, error: userErr } = await anon.auth.getUser(jwt);
   if (userErr || !userRes?.user) throw new Error("Sesión inválida o expirada.");
-  const { data: profile, error: profileErr } = await admin.from("profiles").select("id, nombre, rol, activo").eq("id", userRes.user.id).maybeSingle();
+  const { data: profile, error: profileErr } = await admin.from("profiles").select("id, nombre, rol, activo, delegado_activo, delegado_hasta").eq("id", userRes.user.id).maybeSingle();
   if (profileErr) throw profileErr;
   if (!profile) throw new Error("Perfil no encontrado.");
   if (profile.activo === false) throw new Error("Tu cuenta fue desactivada.");
-  if (!["admin", "aprobador"].includes(profile.rol)) throw new Error("Solo un aprobador o admin puede enviar recordatorios.");
+  if (!esAprobadorEfectivo(profile)) throw new Error("Solo un aprobador o admin puede enviar recordatorios.");
   return profile;
 }
 
@@ -115,33 +116,103 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // Días de antigüedad (no solo la fecha) -- da una idea de urgencia de
+    // un vistazo, sin tener que restar fechas a mano. Se muestra como
+    // pastilla de color (ámbar desde el mínimo, rojo desde los 10 días)
+    // para que la fila más urgente salte a la vista sin leer el número.
+    const diasDesde = (fechaIso: string) => Math.floor((Date.now() - new Date(fechaIso).getTime()) / (24 * 60 * 60 * 1000));
+    const pillAntiguedad = (dias: number) => {
+      const urgente = dias >= 10;
+      const bg = urgente ? "#fbeaea" : "#fbf1e2";
+      const color = urgente ? "#b3261e" : "#8a6d00";
+      return `<span style="display:inline-block;padding:3px 10px;border-radius:999px;background:${bg};color:${color};font-size:12px;font-weight:600;white-space:nowrap;">${dias} día${dias === 1 ? "" : "s"}</span>`;
+    };
+
     const filaRendicion = (r: any) => `
-      <tr>
-        <td style="padding:4px 10px 4px 0;">N° ${escapeHtml(r.folio)}</td>
-        <td style="padding:4px 10px;">${escapeHtml(r.empleado_nombre)}</td>
-        <td style="padding:4px 10px;">$${Math.round(Number(r.monto_total) || 0).toLocaleString("es-CL")}</td>
-        <td style="padding:4px 0;"><a href="${APP_URL}/#detalle/${r.id}">Ver</a></td>
+      <tr style="border-bottom:1px solid #eef1f5;">
+        <td style="padding:12px;color:#1a1f27;font-weight:600;">N° ${escapeHtml(r.folio)}</td>
+        <td style="padding:12px;color:#1a1f27;">${escapeHtml(r.empleado_nombre)}</td>
+        <td style="padding:12px;">${pillAntiguedad(diasDesde(r.created_at))}</td>
+        <td style="padding:12px;text-align:right;font-weight:700;color:#1a1f27;white-space:nowrap;">$${Math.round(Number(r.monto_total) || 0).toLocaleString("es-CL")}</td>
+        <td style="padding:12px;text-align:right;"><a href="${APP_URL}/#detalle/${r.id}" style="color:#046bd2;text-decoration:none;font-weight:700;font-size:13px;">Revisar →</a></td>
       </tr>`;
     const filaSolicitud = (s: any) => `
-      <tr>
-        <td style="padding:4px 10px 4px 0;">S-${escapeHtml(s.folio)}</td>
-        <td style="padding:4px 10px;">${escapeHtml(s.empleado_nombre)}</td>
-        <td style="padding:4px 10px;">$${Math.round(Number(s.monto_solicitado) || 0).toLocaleString("es-CL")}</td>
-        <td style="padding:4px 0;"><a href="${APP_URL}/#detalle-solicitud/${s.id}">Ver</a></td>
+      <tr style="border-bottom:1px solid #eef1f5;">
+        <td style="padding:12px;color:#1a1f27;font-weight:600;">S-${escapeHtml(s.folio)}</td>
+        <td style="padding:12px;color:#1a1f27;">${escapeHtml(s.empleado_nombre)}</td>
+        <td style="padding:12px;">${pillAntiguedad(diasDesde(s.created_at))}</td>
+        <td style="padding:12px;text-align:right;font-weight:700;color:#1a1f27;white-space:nowrap;">$${Math.round(Number(s.monto_solicitado) || 0).toLocaleString("es-CL")}</td>
+        <td style="padding:12px;text-align:right;"><a href="${APP_URL}/#detalle-solicitud/${s.id}" style="color:#046bd2;text-decoration:none;font-weight:700;font-size:13px;">Revisar →</a></td>
       </tr>`;
 
+    const cabeceraTabla = (col1: string) => `
+      <thead>
+        <tr>
+          <th style="padding:0 12px 8px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#9aa4ae;border-bottom:2px solid #eef1f5;">${col1}</th>
+          <th style="padding:0 12px 8px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#9aa4ae;border-bottom:2px solid #eef1f5;">Empleado</th>
+          <th style="padding:0 12px 8px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#9aa4ae;border-bottom:2px solid #eef1f5;">Antigüedad</th>
+          <th style="padding:0 12px 8px;text-align:right;font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#9aa4ae;border-bottom:2px solid #eef1f5;">Monto</th>
+          <th style="border-bottom:2px solid #eef1f5;"></th>
+        </tr>
+      </thead>`;
+
+    const montoTotalPendiente =
+      (rendiciones || []).reduce((s, r) => s + (Number(r.monto_total) || 0), 0) +
+      (solicitudes || []).reduce((s, r) => s + (Number(r.monto_solicitado) || 0), 0);
+    const montoTotalFmt = "$" + Math.round(montoTotalPendiente).toLocaleString("es-CL");
+    const hoyFmt = new Date().toLocaleDateString("es-CL", { day: "numeric", month: "long", year: "numeric" });
+
     const html = `
-      <div style="font-family: Arial, sans-serif; color: #1a1f27;">
-        <h2 style="margin-bottom: 4px;">Pendientes hace más de ${DIAS_PARA_RECORDAR} días</h2>
-        <p style="color: #5b6472; margin-top: 0;">RindeWellness · Grupo Wellness</p>
-        ${rendiciones && rendiciones.length ? `
-          <p style="font-weight:600;margin-bottom:4px;">Rendiciones (${rendiciones.length})</p>
-          <table style="border-collapse: collapse; margin-bottom:16px;">${rendiciones.map(filaRendicion).join("")}</table>
-        ` : ""}
-        ${solicitudes && solicitudes.length ? `
-          <p style="font-weight:600;margin-bottom:4px;">Solicitudes de fondos (${solicitudes.length})</p>
-          <table style="border-collapse: collapse;">${solicitudes.map(filaSolicitud).join("")}</table>
-        ` : ""}
+      <div style="font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background:#eef1f5; padding:32px 16px;">
+        <!-- Texto de vista previa: no se ve en el correo abierto, pero es lo primero que muestra la bandeja de entrada junto al asunto. -->
+        <div style="display:none;max-height:0;overflow:hidden;">${totalPendientes} pendiente(s) por un total de ${montoTotalFmt} esperan revisión.</div>
+
+        <div style="max-width:600px; margin:0 auto;">
+          <div style="text-align:center;margin-bottom:16px;">
+            <img src="${APP_URL}/assets/logo-gw.png" alt="Grupo Wellness" height="28" style="height:28px;width:auto;" />
+          </div>
+
+          <div style="background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid #e2e8f0; box-shadow:0 1px 2px rgba(28,39,51,0.06);">
+            <div style="background:linear-gradient(135deg,#046bd2,#0456a8); padding:26px 28px;">
+              <p style="margin:0; color:#ffffff; font-size:12px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; opacity:0.8;">RindeWellness</p>
+              <h1 style="margin:6px 0 0; color:#ffffff; font-size:21px;">Resumen de pendientes</h1>
+              <p style="margin:4px 0 0; color:#ffffff; font-size:12.5px; opacity:0.85;">${hoyFmt}</p>
+            </div>
+
+            <div style="padding:26px 28px;">
+              <div style="background:#f4f7fb; border-radius:10px; padding:16px 20px; margin-bottom:24px; display:flex; align-items:center; justify-content:space-between;">
+                <span style="color:#5b6472; font-size:13.5px;">
+                  <strong style="color:#1a1f27; font-size:15px;">${totalPendientes}</strong> esperando revisión<br/>hace más de ${DIAS_PARA_RECORDAR} días
+                </span>
+                <span style="color:#046bd2; font-size:22px; font-weight:700; white-space:nowrap;">${montoTotalFmt}</span>
+              </div>
+
+              ${rendiciones && rendiciones.length ? `
+                <p style="font-weight:700; font-size:13px; color:#1a1f27; margin:0 0 6px;">Rendiciones (${rendiciones.length})</p>
+                <table style="border-collapse:collapse; width:100%; margin-bottom:24px;">
+                  ${cabeceraTabla("Folio")}
+                  <tbody>${rendiciones.map(filaRendicion).join("")}</tbody>
+                </table>
+              ` : ""}
+
+              ${solicitudes && solicitudes.length ? `
+                <p style="font-weight:700; font-size:13px; color:#1a1f27; margin:0 0 6px;">Solicitudes de fondos (${solicitudes.length})</p>
+                <table style="border-collapse:collapse; width:100%; margin-bottom:8px;">
+                  ${cabeceraTabla("Folio")}
+                  <tbody>${solicitudes.map(filaSolicitud).join("")}</tbody>
+                </table>
+              ` : ""}
+
+              <div style="text-align:center; margin-top:26px;">
+                <a href="${APP_URL}/#dashboard" style="display:inline-block; padding:13px 32px; background:#046bd2; color:#ffffff; text-decoration:none; font-weight:700; font-size:14px; border-radius:8px;">Ir a Aprobaciones pendientes</a>
+              </div>
+            </div>
+
+            <div style="background:#f4f7fb; padding:14px 28px; border-top:1px solid #e2e8f0;">
+              <p style="margin:0; color:#9aa4ae; font-size:11px;">Recordatorio manual enviado desde el panel de Usuarios · RindeWellness</p>
+            </div>
+          </div>
+        </div>
       </div>
     `;
 

@@ -155,6 +155,20 @@ begin
     end if;
   end if;
 
+  -- cuenta_contable queda AFUERA de la lista de arriba a propósito -- un
+  -- aprobador/admin puede seguir corrigiéndola después de aprobar (la usa
+  -- "Verificar en contabilidad"). Pero la policy items_update_approver deja
+  -- actualizar la fila a SU DUEÑO en cualquier momento (sin mirar el estado
+  -- de la rendición) -- sin este chequeo aparte, el propio empleado podía
+  -- reescribir la cuenta contable de su gasto YA aprobado con un UPDATE
+  -- directo a la API, sin pasar por "Verificar en contabilidad" ni dejar
+  -- rastro (encontrado en una revisión de seguridad posterior al deploy).
+  if new.cuenta_contable is distinct from old.cuenta_contable
+     and estado_rendicion is distinct from 'Pendiente'
+     and not public.is_admin_or_aprobador() then
+    raise exception 'La rendición de este ítem ya fue procesada y no se puede modificar (estado actual: %).', estado_rendicion;
+  end if;
+
   return new;
 end;
 $$;
@@ -284,15 +298,23 @@ alter table public.system_events enable row level security;
 
 drop policy if exists "system_events_select_admin" on public.system_events;
 drop policy if exists "system_events_insert_own" on public.system_events;
+drop policy if exists "system_events_insert_admin" on public.system_events;
 
 create policy "system_events_select_admin" on public.system_events
   for select using (public.is_admin());
 
--- Las Edge Functions insertan con el service role (salta RLS), pero
--- esta policy también deja que el propio frontend registre sus
--- fallos de red/OCR directamente (ver analizarComprobante en app.js).
-create policy "system_events_insert_own" on public.system_events
-  for insert with check (usuario_id = auth.uid());
+-- Las Edge Functions insertan con el service role (salta RLS, así que esta
+-- policy no las afecta). El frontend NUNCA inserta acá directo (no llegó a
+-- implementarse esa parte) -- así que "usuario_id = auth.uid()" quedaba
+-- como una policy de insert abierta a cualquier autenticado, sin relación
+-- real con la fila, sin ningún llamador legítimo que la necesitara. Un
+-- authenticated cualquiera podía insertar un evento falso (ej.
+-- "notificar_aprobador_ok" para el rendicion_id de otra persona) y usarlo
+-- para pisar el límite de frecuencia y suprimir el aviso real por correo
+-- (encontrado en una revisión de seguridad posterior al deploy). Se cierra
+-- del todo: solo el service role (que salta RLS) puede insertar.
+create policy "system_events_insert_admin" on public.system_events
+  for insert with check (public.is_admin());
 
 -- ------------------------------------------------------------
 -- 5) Detector de comprobantes duplicados: mismo RUT proveedor + N°

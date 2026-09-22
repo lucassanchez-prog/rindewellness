@@ -5,7 +5,7 @@
 // navegador ni Supabase: corren con "npm test" (node --test).
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue } = require("../pure.js");
+const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo } = require("../pure.js");
 
 test("formatearRut agrega puntos de miles y guión", () => {
   assert.equal(formatearRut("213153226"), "21.315.322-6");
@@ -59,4 +59,23 @@ test("parseMoneyValue extrae solo los dígitos de un input formateado", () => {
   assert.equal(parseMoneyValue("$45.000"), 45000);
   assert.equal(parseMoneyValue(""), 0);
   assert.equal(parseMoneyValue(null), 0);
+});
+
+test("esAprobadorEfectivo reconoce aprobador y admin por rol", () => {
+  assert.equal(esAprobadorEfectivo({ rol: "aprobador" }), true);
+  assert.equal(esAprobadorEfectivo({ rol: "admin" }), true);
+  assert.equal(esAprobadorEfectivo({ rol: "empleado" }), false);
+  assert.equal(esAprobadorEfectivo(null), false);
+});
+
+test("esAprobadorEfectivo reconoce un delegado temporal vigente", () => {
+  assert.equal(esAprobadorEfectivo({ rol: "empleado", delegado_activo: true, delegado_hasta: null }), true);
+  const manana = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  assert.equal(esAprobadorEfectivo({ rol: "empleado", delegado_activo: true, delegado_hasta: manana }), true);
+});
+
+test("esAprobadorEfectivo rechaza un delegado vencido o inactivo", () => {
+  const ayer = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  assert.equal(esAprobadorEfectivo({ rol: "empleado", delegado_activo: true, delegado_hasta: ayer }), false);
+  assert.equal(esAprobadorEfectivo({ rol: "empleado", delegado_activo: false, delegado_hasta: null }), false);
 });

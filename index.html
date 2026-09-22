@@ -3,8 +3,12 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#046bd2" />
 <title>RindeWellness</title>
-<link rel="stylesheet" href="styles.css" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="assets/logo-gw.png" />
+<link rel="apple-touch-icon" href="assets/logo-gw.png" />
+<link rel="stylesheet" href="styles.css?v=2" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -79,6 +83,7 @@
 
   <!-- RECUPERAR CONTRASEÑA (pedir el link) -->
   <div id="view-recuperar" class="view">
+    <button class="btn btn-ghost theme-toggle" title="Cambiar tema" type="button">🌙</button>
     <div class="login-wrap">
       <div class="login-card">
         <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
@@ -103,6 +108,7 @@
 
   <!-- DEFINIR NUEVA CONTRASEÑA (al volver del link del correo) -->
   <div id="view-nueva-clave" class="view">
+    <button class="btn btn-ghost theme-toggle" title="Cambiar tema" type="button">🌙</button>
     <div class="login-wrap">
       <div class="login-card">
         <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
@@ -112,11 +118,17 @@
         <form id="form-nueva-clave">
           <div class="field">
             <label for="nueva-clave-1">Nueva contraseña</label>
-            <input type="password" id="nueva-clave-1" required autocomplete="new-password" />
+            <div class="password-field">
+              <input type="password" id="nueva-clave-1" required autocomplete="new-password" />
+              <button type="button" class="btn-ver-password" aria-label="Mostrar contraseña">👁</button>
+            </div>
           </div>
           <div class="field">
             <label for="nueva-clave-2">Confirmar contraseña</label>
-            <input type="password" id="nueva-clave-2" required autocomplete="new-password" />
+            <div class="password-field">
+              <input type="password" id="nueva-clave-2" required autocomplete="new-password" />
+              <button type="button" class="btn-ver-password" aria-label="Mostrar contraseña">👁</button>
+            </div>
           </div>
           <button type="submit" class="btn btn-primary btn-block" id="btn-nueva-clave-submit">Guardar contraseña</button>
           <div class="login-error" id="nueva-clave-error"></div>
@@ -315,6 +327,7 @@
           <div><h1>Usuarios</h1><p>Administra los permisos de cada persona del grupo</p></div>
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
             <button class="btn btn-secondary" id="btn-recordatorios" type="button">Enviar recordatorios ahora</button>
+            <button class="btn btn-secondary" id="btn-limpiar-storage" type="button">Limpiar archivos huérfanos</button>
             <button class="btn btn-secondary" id="btn-ir-plantillas" type="button">Plantillas de perfil</button>
           </div>
         </div>

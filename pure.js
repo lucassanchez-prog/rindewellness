@@ -65,7 +65,22 @@
     return Number(String(str || "").replace(/\D/g, "")) || 0;
   }
 
-  const RindeCore = { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue };
+  // Misma regla que is_admin_or_aprobador() en la base (ver
+  // migracion_mejoras_v2.sql): un perfil cuenta como aprobador si su rol es
+  // aprobador/admin, O si tiene una delegación temporal activa y vigente
+  // (delegado_hasta null = indefinida). Duplicar la regla acá (en vez de
+  // solo confiar en RLS) es necesario porque la UI también necesita saber
+  // esto para decidir qué mostrar -- sin esto, un delegado con permiso real
+  // en la base nunca vería los botones para ejercerlo.
+  function esAprobadorEfectivo(profile) {
+    if (!profile) return false;
+    if (profile.rol === "aprobador" || profile.rol === "admin") return true;
+    if (!profile.delegado_activo) return false;
+    if (!profile.delegado_hasta) return true;
+    return new Date(profile.delegado_hasta).getTime() > Date.now();
+  }
+
+  const RindeCore = { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

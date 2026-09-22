@@ -1,0 +1,13 @@
+{
+  "name": "RindeWellness",
+  "short_name": "RindeWellness",
+  "description": "Rendición de gastos de Grupo Wellness",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f7fb",
+  "theme_color": "#046bd2",
+  "icons": [
+    { "src": "assets/logo-gw.png", "sizes": "any", "type": "image/png", "purpose": "any" }
+  ]
+}

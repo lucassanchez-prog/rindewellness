@@ -6,7 +6,7 @@
 // viven en pure.js (cargado antes que este archivo, ver index.html) -- son
 // funciones puras sin DOM ni red, separadas para poder testearlas con Node
 // (ver tests/pure.test.js) sin arrastrar el resto de la app.
-const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue } = window.RindeCore;
+const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo } = window.RindeCore;
 
 const CFG = window.RINDE_WELLNESS_CONFIG || {};
 let db = null; // proyecto propio de la app (lectura/escritura)
@@ -257,10 +257,7 @@ function applyThemeIcon() {
   const current = document.documentElement.getAttribute("data-theme");
   const isDark = current === "dark" || (!current && window.matchMedia("(prefers-color-scheme: dark)").matches);
   const icon = isDark ? "☀️" : "🌙";
-  const a = document.getElementById("btn-theme-toggle");
-  const b = document.getElementById("btn-theme-toggle-login");
-  if (a) a.textContent = icon;
-  if (b) b.textContent = icon;
+  document.querySelectorAll(".theme-toggle").forEach((b) => { b.textContent = icon; });
 }
 function toggleTheme() {
   const current = document.documentElement.getAttribute("data-theme");
@@ -270,10 +267,44 @@ function toggleTheme() {
   try { localStorage.setItem("rw-theme", next); } catch (e) {}
   applyThemeIcon();
 }
+// Un solo listener por clase (".theme-toggle"), no por id -- antes había un
+// id fijo por pantalla ("btn-theme-toggle-login"), así que agregar el botón
+// a una pantalla nueva (ej. "Recuperar contraseña", que no lo tenía --
+// hallazgo de una prueba visual en mobile) significaba acordarse de cablear
+// un tercer addEventListener a mano. Así, cualquier botón con esta clase
+// funciona solo con agregarlo al HTML.
 function wireTheme() {
   applyThemeIcon();
-  document.getElementById("btn-theme-toggle")?.addEventListener("click", toggleTheme);
-  document.getElementById("btn-theme-toggle-login")?.addEventListener("click", toggleTheme);
+  document.querySelectorAll(".theme-toggle").forEach((b) => b.addEventListener("click", toggleTheme));
+}
+
+// Muestra/oculta cualquier campo de contraseña marcado con
+// class="btn-ver-password" -- generalizado (antes solo existía el de
+// login) para poder reusarlo también en "Crea tu nueva contraseña", que no
+// tenía forma de verificar lo tipeado antes de guardar (hallazgo de una
+// prueba visual en mobile). Cada botón controla el <input> que tiene al
+// lado dentro de su mismo .password-field, no un id fijo.
+function wirePasswordToggles() {
+  document.querySelectorAll(".btn-ver-password").forEach((btn) => {
+    const input = btn.previousElementSibling;
+    if (!input || input.tagName !== "INPUT") return;
+    btn.addEventListener("click", () => {
+      const verEmpezar = input.type === "password";
+      input.type = verEmpezar ? "text" : "password";
+      btn.textContent = verEmpezar ? "🙈" : "👁";
+      btn.setAttribute("aria-label", verEmpezar ? "Ocultar contraseña" : "Mostrar contraseña");
+    });
+  });
+}
+
+// Registra el service worker (ver sw.js) para poder "Agregar a la
+// pantalla de inicio" y tener una pantalla mínima si se abre sin señal --
+// nunca bloquea la carga de la app si falla o si el navegador no lo
+// soporta (ej. algunos navegadores in-app de WhatsApp/Instagram).
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch((err) => console.error("No se pudo registrar el service worker:", err));
+  });
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -361,14 +392,7 @@ function wireLoginForm() {
     }
   });
 
-  document.getElementById("btn-ver-password").addEventListener("click", () => {
-    const input = document.getElementById("login-password");
-    const btn = document.getElementById("btn-ver-password");
-    const verEmpezar = input.type === "password";
-    input.type = verEmpezar ? "text" : "password";
-    btn.textContent = verEmpezar ? "🙈" : "👁";
-    btn.setAttribute("aria-label", verEmpezar ? "Ocultar contraseña" : "Mostrar contraseña");
-  });
+  wirePasswordToggles();
 
   document.getElementById("form-login").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -532,18 +556,24 @@ async function onLoggedIn(user) {
 
   document.getElementById("user-name").textContent = `${profile?.nombre || user.email} · ${profile?.rol || "empleado"}`;
   document.getElementById("app-shell").style.display = "block";
+  // esAprobadorEfectivo() (no solo profile.rol) para que un "delegado
+  // temporal" (ver renderEditarPerfilPanel) de verdad pueda ejercer el
+  // permiso que ya tiene en la base -- si esto solo mirara el rol, un
+  // delegado nunca vería los tabs/botones para aprobar nada, aunque la
+  // base ya lo dejara. "Usuarios" y "Reportes" siguen siendo solo-admin a
+  // propósito: la delegación cubre aprobar, no administrar usuarios.
   document.getElementById("tab-aprobaciones").style.display =
-    profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
+    esAprobadorEfectivo(profile) ? "inline-block" : "none";
   document.getElementById("tab-solicitudes-aprobacion").style.display =
-    profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
+    esAprobadorEfectivo(profile) ? "inline-block" : "none";
   document.getElementById("btn-admin-usuarios").style.display =
     profile && profile.rol === "admin" ? "inline-block" : "none";
   document.getElementById("btn-reportes").style.display =
     profile && profile.rol === "admin" ? "inline-block" : "none";
   document.getElementById("btn-exportar-excel").style.display =
-    profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
+    esAprobadorEfectivo(profile) ? "inline-block" : "none";
   document.getElementById("btn-comprobante-rango").style.display =
-    profile && (profile.rol === "aprobador" || profile.rol === "admin") ? "inline-block" : "none";
+    esAprobadorEfectivo(profile) ? "inline-block" : "none";
 
   await cargarCuentasPermitidas();
 
@@ -641,24 +671,40 @@ function wireDashboard() {
 // Cache de la última carga, para poder filtrar sin volver a golpear la base.
 const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [] };
 
+// Tope de seguridad para las listas de "Mis rendiciones"/"Mis solicitudes"
+// -- sin esto, el historial de alguien con años de antigüedad crece sin
+// límite y cada carga del dashboard se pone más lenta con el tiempo. OJO:
+// a propósito NO se le pone límite a la consulta de "aprobaciones" que ve
+// el admin más abajo -- Reportes (openReportes/renderReportes) depende de
+// que dashboardData.aprobaciones tenga TODO el histórico para calcular
+// tendencias, anomalías y presupuestos; limitarla rompería esos cálculos
+// en silencio, sin ningún error que lo delate. Si esto llega a pesar
+// demasiado, la solución real es una consulta de agregación server-side
+// para Reportes (no depender de traer todas las filas al navegador), no
+// un límite acá.
+const TOPE_LISTA_PROPIA = 300;
+
 async function loadDashboard() {
   const { data: mias } = await db
     .from("rendiciones")
     .select("*")
     .eq("empleado_id", currentUser.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(TOPE_LISTA_PROPIA);
   dashboardData.mias = mias || [];
 
   const { data: solicitudesMias } = await db
     .from("solicitudes_fondos")
     .select("*")
     .eq("empleado_id", currentUser.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(TOPE_LISTA_PROPIA);
   dashboardData.solicitudesMias = solicitudesMias || [];
 
-  if (currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin")) {
+  if (esAprobadorEfectivo(currentProfile)) {
     // El admin (usuario maestro) ve todas las rendiciones de todo el grupo;
-    // un aprobador normal solo ve las pendientes de aprobar.
+    // un aprobador normal (o un delegado temporal) solo ve las pendientes
+    // de aprobar.
     let query = db.from("rendiciones").select("*");
     query = currentProfile.rol === "admin"
       ? query.order("created_at", { ascending: false })
@@ -850,40 +896,78 @@ async function openReportes(pushHistory = true) {
   renderReportes();
 }
 
+// Suma cuánto lleva aprobado una empresa en cada mes calendario, usando
+// TODO el histórico ya cargado en dashboardData.aprobaciones (no depende
+// del rango elegido) -- lo usa calcularAnomalias() para comparar el rango
+// actual contra el promedio de los 3 meses previos.
+function montoMensualPorEmpresa() {
+  const porEmpresaMes = {};
+  dashboardData.aprobaciones.forEach((r) => {
+    if (r.estado !== "Aprobado") return;
+    const empresa = r.empresa || "Sin empresa";
+    const mesKey = String(r.created_at).slice(0, 7);
+    if (!porEmpresaMes[empresa]) porEmpresaMes[empresa] = {};
+    porEmpresaMes[empresa][mesKey] = (porEmpresaMes[empresa][mesKey] || 0) + Number(r.monto_total || 0);
+  });
+  return porEmpresaMes;
+}
+
+// Compara el gasto del rango elegido (normalizado a "por mes", para poder
+// comparar rangos de cualquier largo) contra el promedio de los 3 meses
+// calendario previos al "hasta" -- si supera ese promedio en 30% o más, se
+// marca como algo que vale la pena que un humano revise. Con menos de una
+// semana de rango no se calcula nada: normalizar un par de días a "por mes"
+// multiplica cualquier ruido y da falsos positivos.
+function calcularAnomalias(porEmpresaRango, desdeMs, hastaMs) {
+  const diasRango = (hastaMs - desdeMs) / (24 * 60 * 60 * 1000);
+  if (!isFinite(diasRango) || diasRango < 7) return [];
+  const factorMensual = 30 / diasRango;
+  const porEmpresaMes = montoMensualPorEmpresa();
+  const mesHasta = new Date(hastaMs);
+  const resultados = [];
+  Object.entries(porEmpresaRango).forEach(([empresa, montoRango]) => {
+    const meses = porEmpresaMes[empresa] || {};
+    const mesesPrevios = [1, 2, 3].map((i) => {
+      const d = new Date(mesHasta.getFullYear(), mesHasta.getMonth() - i, 1);
+      return meses[d.toISOString().slice(0, 7)] || 0;
+    }).filter((v) => v > 0);
+    if (!mesesPrevios.length) return;
+    const promedio = mesesPrevios.reduce((s, v) => s + v, 0) / mesesPrevios.length;
+    if (promedio <= 0) return;
+    const montoNormalizado = montoRango * factorMensual;
+    const variacion = (montoNormalizado - promedio) / promedio;
+    if (variacion >= 0.3) resultados.push({ empresa, variacion, promedio, montoNormalizado });
+  });
+  return resultados.sort((a, b) => b.variacion - a.variacion);
+}
+
 async function renderReportes() {
   const cont = document.getElementById("reportes-contenido");
   const desde = document.getElementById("reportes-desde").value;
   const hasta = document.getElementById("reportes-hasta").value;
   const desdeMs = desde ? new Date(desde + "T00:00:00").getTime() : -Infinity;
   const hastaMs = hasta ? new Date(hasta + "T23:59:59").getTime() : Infinity;
-
-  const rendicionesEnRango = dashboardData.aprobaciones.filter((r) => {
+  const enRango = (r, dMs, hMs) => {
     const t = new Date(r.created_at).getTime();
-    return r.estado === "Aprobado" && t >= desdeMs && t <= hastaMs;
-  });
+    return t >= dMs && t <= hMs;
+  };
+
+  const rendicionesEnRango = dashboardData.aprobaciones.filter((r) => r.estado === "Aprobado" && enRango(r, desdeMs, hastaMs));
+
+  const { data: presupuestosData, error: errPresupuestos } = await db.from("presupuestos").select("*");
+  if (errPresupuestos) console.error("Error cargando presupuestos:", errPresupuestos);
+  const presupuestoPorEmpresa = {};
+  (presupuestosData || []).forEach((p) => { presupuestoPorEmpresa[p.empresa] = p.monto_limite_mensual; });
 
   cont.innerHTML = "";
-  if (!rendicionesEnRango.length) {
-    cont.appendChild(el("div", { class: "empty-state" }, "No hay rendiciones aprobadas en este rango de fechas."));
-    return;
-  }
 
-  const porEmpresa = {};
-  rendicionesEnRango.forEach((r) => {
-    const clave = r.empresa || "Sin empresa";
-    porEmpresa[clave] = (porEmpresa[clave] || 0) + Number(r.monto_total || 0);
-  });
-
-  const totalGeneral = Object.values(porEmpresa).reduce((s, v) => s + v, 0);
-  cont.appendChild(el("div", { class: "totals-bar", style: "margin-bottom:18px;" }, [
-    el("span", {}, `Total aprobado (${rendicionesEnRango.length} rendición(es))`),
-    el("span", { class: "amount" }, fmtCLP(totalGeneral)),
-  ]));
-
-  const tablaEmpresa = (titulo, datos) => {
+  // Tabla genérica "nombre · monto", ordenada de mayor a menor -- la
+  // reusan casi todos los reportes de abajo (empresa, categoría, cuenta
+  // contable, centro de costo, empleado, tipo de rendición).
+  const tabla = (titulo, datos) => {
     cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, titulo));
-    const tabla = el("table", { class: "items-table" });
-    tabla.appendChild(el("thead", {}, [el("tr", {}, [el("th", {}, "Nombre"), el("th", { class: "right" }, "Monto")])]));
+    const t = el("table", { class: "items-table" });
+    t.appendChild(el("thead", {}, [el("tr", {}, [el("th", {}, "Nombre"), el("th", { class: "right" }, "Monto")])]));
     const tbody = el("tbody");
     Object.entries(datos).sort((a, b) => b[1] - a[1]).forEach(([nombre, monto]) => {
       tbody.appendChild(el("tr", {}, [
@@ -891,29 +975,377 @@ async function renderReportes() {
         el("td", { class: "monto", "data-label": "Monto" }, fmtCLP(monto)),
       ]));
     });
-    tabla.appendChild(tbody);
-    cont.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+    t.appendChild(tbody);
+    cont.appendChild(el("div", { class: "table-scroll" }, [t]));
   };
 
-  tablaEmpresa("Por empresa", porEmpresa);
+  if (!rendicionesEnRango.length) {
+    cont.appendChild(el("div", { class: "empty-state" }, "No hay rendiciones aprobadas en este rango de fechas."));
+  } else {
+    const totalGeneral = rendicionesEnRango.reduce((s, r) => s + Number(r.monto_total || 0), 0);
 
-  // Por categoría hace falta el detalle de ítems, que dashboardData no
-  // trae (solo cabeceras de rendiciones) -- se pide una sola vez acá, ya
-  // filtrado por las rendiciones del rango, en vez de traer TODOS los
-  // ítems de la base.
-  const { data: items, error } = await db
+    // Comparación contra el período inmediatamente anterior, de igual
+    // duración -- ej. si el rango es "últimos 30 días", se compara contra
+    // los 30 días antes de eso. Sin esto, un número suelto ("$237.690
+    // aprobado") no dice si eso es mucho o poco comparado con lo normal.
+    const duracionMs = hastaMs - desdeMs;
+    let deltaTexto = null;
+    if (isFinite(duracionMs) && duracionMs > 0) {
+      const hastaAnteriorMs = desdeMs - 1;
+      const desdeAnteriorMs = hastaAnteriorMs - duracionMs;
+      const totalAnterior = dashboardData.aprobaciones
+        .filter((r) => r.estado === "Aprobado" && enRango(r, desdeAnteriorMs, hastaAnteriorMs))
+        .reduce((s, r) => s + Number(r.monto_total || 0), 0);
+      if (totalAnterior > 0) {
+        const variacion = ((totalGeneral - totalAnterior) / totalAnterior) * 100;
+        deltaTexto = `${variacion >= 0 ? "+" : ""}${variacion.toFixed(0)}% vs. período anterior (${fmtCLP(totalAnterior)})`;
+      } else if (totalGeneral > 0) {
+        deltaTexto = "Sin gasto aprobado en el período anterior equivalente.";
+      }
+    }
+
+    cont.appendChild(el("div", { class: "totals-bar", style: "margin-bottom:4px;" }, [
+      el("span", {}, `Total aprobado (${rendicionesEnRango.length} rendición(es))`),
+      el("span", { class: "amount" }, fmtCLP(totalGeneral)),
+    ]));
+    if (deltaTexto) {
+      cont.appendChild(el("p", { style: "margin:0 0 10px;color:var(--ink-soft);font-size:0.85rem;" }, deltaTexto));
+    }
+
+    // El contenido real se arma más abajo (después de la consulta a
+    // rendicion_items) -- el botón ya queda visible acá arriba, pero el
+    // clic recién lee "csvContenido" al momento de apretarlo, cuando ya
+    // está listo.
+    let csvContenido = "";
+    const btnCSV = el("button", { class: "btn btn-secondary btn-sm", type: "button", style: "margin-bottom:18px;" }, "Descargar CSV");
+    btnCSV.addEventListener("click", () => {
+      if (!csvContenido) { toast("Todavía se está armando el reporte, espera un segundo."); return; }
+      const blob = new Blob(["﻿" + csvContenido], { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `reportes_${desde || "inicio"}_a_${hasta || "hoy"}.csv`;
+      a.click();
+    });
+    cont.appendChild(btnCSV);
+
+    // Agrupaciones que salen directo de rendicionesEnRango, sin pedir nada
+    // nuevo a la base (ya está todo cargado en dashboardData).
+    const porEmpresa = {};
+    const porEmpleado = {};
+    const porTipoRendicion = {};
+    const porMes = {};
+    rendicionesEnRango.forEach((r) => {
+      const monto = Number(r.monto_total || 0);
+      const empresa = r.empresa || "Sin empresa";
+      porEmpresa[empresa] = (porEmpresa[empresa] || 0) + monto;
+      porEmpleado[r.empleado_nombre || "Sin nombre"] = (porEmpleado[r.empleado_nombre || "Sin nombre"] || 0) + monto;
+      const tipoLabel = r.tipo_rendicion === "FondoPorRendir" ? "Fondo por Rendir" : "Reembolso";
+      porTipoRendicion[tipoLabel] = (porTipoRendicion[tipoLabel] || 0) + monto;
+      porMes[String(r.created_at).slice(0, 7)] = (porMes[String(r.created_at).slice(0, 7)] || 0) + monto;
+    });
+
+    // Top 5 como tarjetas compactas, para ver lo más importante de un
+    // vistazo antes de bajar a las tablas completas.
+    const tarjetaTop = (titulo, datos) => el("div", { class: "card", style: "flex:1;min-width:220px;" }, [
+      el("p", { style: "margin:0 0 10px;font-weight:600;font-size:0.85rem;color:var(--ink-soft);" }, titulo),
+      ...Object.entries(datos).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([nombre, monto], i) =>
+        el("p", { style: "margin:0 0 6px;font-size:0.85rem;display:flex;justify-content:space-between;gap:10px;" }, [
+          el("span", { style: "color:var(--ink-soft);" }, `${i + 1}. ${nombre}`),
+          el("strong", {}, fmtCLP(monto)),
+        ])
+      ),
+    ]);
+    cont.appendChild(el("div", { style: "display:flex;gap:14px;flex-wrap:wrap;margin-bottom:18px;" }, [
+      tarjetaTop("Top 5 empresas", porEmpresa),
+      tarjetaTop("Top 5 empleados", porEmpleado),
+    ]));
+
+    // Aviso si alguna empresa gastó notoriamente más de lo normal en el
+    // rango elegido -- mismo estilo que la tarjeta de "Pendientes hace +7
+    // días" del dashboard, para que se note sin tener que leer las tablas.
+    const anomalias = calcularAnomalias(porEmpresa, desdeMs, hastaMs);
+    anomalias.forEach(({ empresa, variacion, promedio }) => {
+      cont.appendChild(el("div", { class: "card", style: "border:1px solid var(--warn);margin-bottom:10px;" }, [
+        el("p", { style: "margin:0;font-size:0.85rem;" }, [
+          "⚠ ", el("strong", {}, empresa), ` gastó ${Math.round(variacion * 100)}% más de lo normal en este período `,
+          `(promedio de los últimos 3 meses: ${fmtCLP(promedio)}/mes).`,
+        ]),
+      ]));
+    });
+
+    // "Por empresa" con presupuesto: a diferencia de las demás tablas
+    // (que solo muestran el monto), esta agrega el límite mensual (si el
+    // admin configuró uno para esa empresa, ver "Configurar presupuestos"
+    // más abajo) y una barra de progreso simple -- OJO: el presupuesto es
+    // MENSUAL, así que la comparación es más precisa cuando el rango
+    // elegido arriba cubre ~1 mes; para rangos más largos/cortos igual se
+    // muestra, pero es una referencia menos exacta (se avisa en la etiqueta).
+    cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, "Por empresa"));
+    const tablaEmp = el("table", { class: "items-table" });
+    tablaEmp.appendChild(el("thead", {}, [el("tr", {}, ["Nombre", "Monto", "Presupuesto mensual"].map((c) => el("th", { class: c === "Nombre" ? "" : "right" }, c)))]));
+    const tbodyEmp = el("tbody");
+    Object.entries(porEmpresa).sort((a, b) => b[1] - a[1]).forEach(([nombre, monto]) => {
+      const limite = presupuestoPorEmpresa[nombre];
+      let celdaPresupuesto;
+      if (limite) {
+        const pct = Math.min(999, Math.round((monto / limite) * 100));
+        const color = pct >= 100 ? "var(--danger)" : pct >= 80 ? "var(--warn)" : "var(--success)";
+        celdaPresupuesto = el("div", {}, [
+          el("div", { style: "font-size:0.78rem;color:var(--ink-soft);margin-bottom:3px;" }, `${fmtCLP(limite)} (${pct}%)`),
+          el("div", { style: "height:6px;border-radius:3px;background:var(--line);overflow:hidden;" }, [
+            el("div", { style: `height:100%;border-radius:3px;background:${color};width:${Math.min(100, pct)}%;` }),
+          ]),
+        ]);
+      } else {
+        celdaPresupuesto = "Sin definir";
+      }
+      tbodyEmp.appendChild(el("tr", {}, [
+        el("td", { "data-label": "Nombre" }, nombre),
+        el("td", { class: "monto", "data-label": "Monto" }, fmtCLP(monto)),
+        el("td", { class: "right", "data-label": "Presupuesto mensual", style: "min-width:140px;" }, celdaPresupuesto),
+      ]));
+    });
+    tablaEmp.appendChild(tbodyEmp);
+    cont.appendChild(el("div", { class: "table-scroll" }, [tablaEmp]));
+
+    // Panel para editar los presupuestos, colapsado por default -- Reportes
+    // ya es una vista solo-admin, así que no hace falta otro chequeo de rol.
+    const presupuestosBox = el("div", { style: "display:none; margin:10px 0 16px;" });
+    const btnConfigPresupuestos = el("button", { class: "btn btn-secondary btn-sm", type: "button", style: "margin-bottom:16px;" }, "Configurar presupuestos");
+    btnConfigPresupuestos.addEventListener("click", () => {
+      presupuestosBox.style.display = presupuestosBox.style.display === "none" ? "block" : "none";
+    });
+    EMPRESAS.forEach((empresa) => {
+      const input = el("input", { type: "text", inputmode: "numeric", placeholder: "Sin límite", style: "width:140px;" });
+      if (presupuestoPorEmpresa[empresa]) input.value = Number(presupuestoPorEmpresa[empresa]).toLocaleString("es-CL");
+      input.addEventListener("input", () => formatearInputMoney(input));
+      const btnGuardar = el("button", { class: "btn btn-sm", type: "button" }, "Guardar");
+      btnGuardar.addEventListener("click", async () => {
+        const monto = parseMoneyValue(input.value);
+        if (!monto) {
+          const { error } = await db.from("presupuestos").delete().eq("empresa", empresa);
+          if (error) { toast(mensajeErrorAmigable(error)); return; }
+          delete presupuestoPorEmpresa[empresa];
+          toast(`Presupuesto de ${empresa} eliminado.`);
+        } else {
+          const { error } = await db.from("presupuestos").upsert({ empresa, monto_limite_mensual: monto, updated_at: new Date().toISOString() }, { onConflict: "empresa" });
+          if (error) { toast(mensajeErrorAmigable(error)); return; }
+          presupuestoPorEmpresa[empresa] = monto;
+          toast(`Presupuesto de ${empresa} actualizado.`);
+        }
+        renderReportes();
+      });
+      presupuestosBox.appendChild(el("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;" }, [
+        el("span", { style: "flex:1;font-size:0.85rem;" }, empresa),
+        input,
+        btnGuardar,
+      ]));
+    });
+    cont.appendChild(btnConfigPresupuestos);
+    cont.appendChild(presupuestosBox);
+
+    tabla("Por empleado", porEmpleado);
+    tabla("Reembolso vs. Fondo por Rendir", porTipoRendicion);
+
+    // Tendencia mensual: a diferencia de las demás, esta va ordenada
+    // cronológicamente (no de mayor a menor monto) para poder leerla como
+    // una serie de tiempo.
+    cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, "Tendencia mensual"));
+    const tablaMes = el("table", { class: "items-table" });
+    tablaMes.appendChild(el("thead", {}, [el("tr", {}, [el("th", {}, "Mes"), el("th", { class: "right" }, "Monto")])]));
+    const tbodyMes = el("tbody");
+    const maxMes = Math.max(...Object.values(porMes));
+    Object.entries(porMes).sort((a, b) => a[0].localeCompare(b[0])).forEach(([mes, monto]) => {
+      const [y, m] = mes.split("-");
+      const etiquetaMes = new Date(Number(y), Number(m) - 1, 1).toLocaleDateString("es-CL", { month: "long", year: "numeric" });
+      tbodyMes.appendChild(el("tr", {}, [
+        el("td", { "data-label": "Mes" }, [
+          etiquetaMes,
+          // Barra simple con CSS puro (sin librería de gráficos) para ver
+          // el peso relativo de cada mes de un vistazo.
+          el("div", { style: `height:4px;border-radius:2px;background:var(--blue);margin-top:4px;width:${Math.max(4, (monto / maxMes) * 100)}%;` }),
+        ]),
+        el("td", { class: "monto", "data-label": "Monto" }, fmtCLP(monto)),
+      ]));
+    });
+    tablaMes.appendChild(tbodyMes);
+    cont.appendChild(el("div", { class: "table-scroll" }, [tablaMes]));
+
+    // Por categoría / cuenta contable / centro de costo hace falta el
+    // detalle de ítems, que dashboardData no trae (solo cabeceras de
+    // rendiciones) -- se pide una sola vez, ya filtrado por las
+    // rendiciones del rango, y se reusa para los tres reportes en vez de
+    // repetir la consulta.
+    const { data: items, error } = await db
+      .from("rendicion_items")
+      .select("categoria, monto, empresa, tipo_item, estado, cuenta_contable, centro_costo")
+      .in("rendicion_id", rendicionesEnRango.map((r) => r.id))
+      .eq("estado", "Aprobado");
+    if (error) {
+      console.error("Error cargando ítems para reportes:", error);
+    } else {
+      const porCategoria = {};
+      const porCuenta = {};
+      const porCentroCosto = {};
+      (items || []).forEach((it) => {
+        // Ahora "Documento electrónico" también puede tener categoría
+        // propia (ver buildConDocumentoFields) -- si la tiene, se agrupa
+        // por esa; si no (ítems viejos, de antes de este cambio), cae al
+        // rótulo genérico de siempre.
+        const claveCategoria = it.categoria || (it.tipo_item === "SinDocumento" ? "Sin categoría" : "Documento electrónico (sin categoría)");
+        porCategoria[claveCategoria] = (porCategoria[claveCategoria] || 0) + Number(it.monto || 0);
+        if (it.cuenta_contable) {
+          const nombre = nombreCuenta(it.cuenta_contable);
+          const claveCuenta = `${it.cuenta_contable}${nombre ? " · " + nombre : ""}`;
+          porCuenta[claveCuenta] = (porCuenta[claveCuenta] || 0) + Number(it.monto || 0);
+        }
+        const claveCC = it.centro_costo || "Sin centro de costo";
+        porCentroCosto[claveCC] = (porCentroCosto[claveCC] || 0) + Number(it.monto || 0);
+      });
+      tabla("Por categoría", porCategoria);
+      tabla("Por cuenta contable (código Kame)", porCuenta);
+      tabla("Por centro de costo", porCentroCosto);
+
+      // Arma el CSV para el botón "Descargar CSV" -- se calcula acá porque
+      // recién en este punto están listos porCategoria/porCuenta/
+      // porCentroCosto (dependen de la consulta a rendicion_items de más
+      // arriba); csvContenido se declaró antes, así que el botón (ya
+      // insertado en pantalla más arriba) simplemente lee esta variable al
+      // momento del clic, sin importar en qué orden se calculó cada cosa.
+      const seccionCSV = (titulo, datos) => {
+        const filas = [[titulo], ["Nombre", "Monto"]];
+        Object.entries(datos).sort((a, b) => b[1] - a[1]).forEach(([n, m]) => filas.push([n, Math.round(m)]));
+        filas.push([]);
+        return filas;
+      };
+      const todasLasFilas = [
+        ["Reporte RindeWellness", `${desde || "inicio"} a ${hasta || "hoy"}`], [],
+        ...seccionCSV("Por empresa", porEmpresa),
+        ...seccionCSV("Por empleado", porEmpleado),
+        ...seccionCSV("Reembolso vs. Fondo por Rendir", porTipoRendicion),
+        ...seccionCSV("Por categoría", porCategoria),
+        ...seccionCSV("Por cuenta contable", porCuenta),
+        ...seccionCSV("Por centro de costo", porCentroCosto),
+        ...seccionCSV("Tendencia mensual", porMes),
+      ];
+      csvContenido = todasLasFilas.map((fila) => fila.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    }
+
+    // Métricas de aprobación: tiempo promedio y % de rechazo por
+    // aprobador, sobre lo procesado (Aprobado + Rechazado) en el rango --
+    // a diferencia del resto de los reportes de esta pantalla, este SÍ
+    // necesita mirar también lo Rechazado, no solo lo Aprobado.
+    const procesadasEnRango = dashboardData.aprobaciones.filter((r) =>
+      (r.estado === "Aprobado" || r.estado === "Rechazado") && r.fecha_aprobacion && enRango(r, desdeMs, hastaMs)
+    );
+    if (procesadasEnRango.length) {
+      const porAprobador = {};
+      procesadasEnRango.forEach((r) => {
+        const nombre = r.aprobador_nombre || "Sin asignar";
+        if (!porAprobador[nombre]) porAprobador[nombre] = { total: 0, rechazadas: 0, sumaDias: 0 };
+        const dias = (new Date(r.fecha_aprobacion).getTime() - new Date(r.created_at).getTime()) / (24 * 60 * 60 * 1000);
+        porAprobador[nombre].total++;
+        porAprobador[nombre].sumaDias += Math.max(0, dias);
+        if (r.estado === "Rechazado") porAprobador[nombre].rechazadas++;
+      });
+      cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, "Métricas de aprobación"));
+      const tablaAprob = el("table", { class: "items-table" });
+      tablaAprob.appendChild(el("thead", {}, [el("tr", {}, ["Aprobador", "Procesadas", "Días promedio", "% rechazo"].map((c) => el("th", { class: c === "Aprobador" ? "" : "right" }, c)))]));
+      const tbodyAprob = el("tbody");
+      Object.entries(porAprobador).sort((a, b) => b[1].total - a[1].total).forEach(([nombre, d]) => {
+        tbodyAprob.appendChild(el("tr", {}, [
+          el("td", { "data-label": "Aprobador" }, nombre),
+          el("td", { class: "right", "data-label": "Procesadas" }, String(d.total)),
+          el("td", { class: "right", "data-label": "Días promedio" }, (d.sumaDias / d.total).toFixed(1)),
+          el("td", { class: "right", "data-label": "% rechazo" }, `${Math.round((d.rechazadas / d.total) * 100)}%`),
+        ]));
+      });
+      tablaAprob.appendChild(tbodyAprob);
+      cont.appendChild(el("div", { class: "table-scroll" }, [tablaAprob]));
+    }
+  }
+
+  // Saldo de Fondos por Rendir: cuánto de lo ya ENTREGADO (solicitudes
+  // Aprobadas) sigue sin justificar con una rendición Aprobada -- es un
+  // saldo a una fecha (como un pasivo), no algo del rango elegido arriba,
+  // así que se muestra siempre, incluso si no hay rendiciones aprobadas
+  // en el rango. Misma fórmula que calcularSplitFondo, pero consolidada
+  // para todas las personas en vez de una solicitud a la vez.
+  const solicitudesAprobadas = dashboardData.solicitudesAprobacion.filter((s) => s.estado === "Aprobado");
+  if (solicitudesAprobadas.length) {
+    cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, "Saldo de Fondos por Rendir"));
+    const tablaFondos = el("table", { class: "items-table" });
+    tablaFondos.appendChild(el("thead", {}, [el("tr", {}, ["Empleado", "Empresa", "Otorgado", "Rendido", "Saldo"].map((c) => el("th", { class: ["Empleado", "Empresa"].includes(c) ? "" : "right" }, c)))]));
+    const tbodyFondos = el("tbody");
+    solicitudesAprobadas
+      .map((s) => {
+        const rendido = dashboardData.aprobaciones
+          .filter((r) => r.solicitud_fondo_id === s.id && r.estado === "Aprobado")
+          .reduce((sum, r) => sum + Number(r.monto_total || 0), 0);
+        return { s, rendido, saldo: Number(s.monto_solicitado) - rendido };
+      })
+      .filter(({ saldo }) => saldo > 0)
+      .sort((a, b) => b.saldo - a.saldo)
+      .forEach(({ s, rendido, saldo }) => {
+        tbodyFondos.appendChild(el("tr", {}, [
+          el("td", { "data-label": "Empleado" }, s.empleado_nombre || "-"),
+          el("td", { "data-label": "Empresa" }, s.empresa || "-"),
+          el("td", { class: "monto", "data-label": "Otorgado" }, fmtCLP(s.monto_solicitado)),
+          el("td", { class: "monto", "data-label": "Rendido" }, fmtCLP(rendido)),
+          el("td", { class: "monto", "data-label": "Saldo" }, fmtCLP(saldo)),
+        ]));
+      });
+    tablaFondos.appendChild(tbodyFondos);
+    cont.appendChild(el("div", { class: "table-scroll" }, [tablaFondos]));
+  }
+
+  // Posibles gastos recurrentes: mismo proveedor apareciendo en 3 o más
+  // meses distintos entre los "Gasto directo" -- candidato a pasar a
+  // gasto fijo de la empresa en vez de reembolso manual todos los meses.
+  // Independiente del rango de fechas elegido arriba (mira TODO el
+  // histórico aprobado), porque el patrón solo se ve mirando varios meses
+  // a la vez -- por eso es una consulta aparte, no reusa "items" de arriba.
+  const { data: itemsHistoricos, error: errHistoricos } = await db
     .from("rendicion_items")
-    .select("categoria, monto, empresa, tipo_item, estado")
-    .in("rendicion_id", rendicionesEnRango.map((r) => r.id))
-    .eq("estado", "Aprobado");
-  if (error) { console.error("Error cargando ítems para reportes:", error); return; }
-
-  const porCategoria = {};
-  (items || []).forEach((it) => {
-    const clave = it.tipo_item === "SinDocumento" ? (it.categoria || "Sin categoría") : "Documento electrónico";
-    porCategoria[clave] = (porCategoria[clave] || 0) + Number(it.monto || 0);
-  });
-  tablaEmpresa("Por categoría", porCategoria);
+    .select("nombre_proveedor, monto, rendiciones!inner(created_at, estado)")
+    .eq("tipo_item", "SinDocumento")
+    .eq("estado", "Aprobado")
+    .eq("rendiciones.estado", "Aprobado")
+    .not("nombre_proveedor", "is", null);
+  if (errHistoricos) {
+    console.error("Error buscando gastos recurrentes:", errHistoricos);
+  } else if (itemsHistoricos && itemsHistoricos.length) {
+    const porProveedor = {};
+    itemsHistoricos.forEach((it) => {
+      const clave = String(it.nombre_proveedor).trim().toLowerCase();
+      if (!clave) return;
+      if (!porProveedor[clave]) porProveedor[clave] = { nombre: it.nombre_proveedor, meses: new Set(), total: 0, cantidad: 0 };
+      porProveedor[clave].meses.add(String(it.rendiciones.created_at).slice(0, 7));
+      porProveedor[clave].total += Number(it.monto || 0);
+      porProveedor[clave].cantidad++;
+    });
+    const recurrentes = Object.values(porProveedor)
+      .filter((p) => p.meses.size >= 3)
+      .sort((a, b) => b.meses.size - a.meses.size);
+    if (recurrentes.length) {
+      cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, "Posibles gastos recurrentes"));
+      cont.appendChild(el("p", { style: "margin:0 0 8px;color:var(--ink-soft);font-size:0.82rem;" },
+        "Mismo proveedor en 3 o más meses distintos -- podría convenir pasarlo a gasto fijo de la empresa en vez de reembolso manual cada vez."));
+      const tablaRec = el("table", { class: "items-table" });
+      tablaRec.appendChild(el("thead", {}, [el("tr", {}, ["Proveedor", "Meses distintos", "Promedio", "Total histórico"].map((c) => el("th", { class: c === "Proveedor" ? "" : "right" }, c)))]));
+      const tbodyRec = el("tbody");
+      recurrentes.forEach((p) => {
+        tbodyRec.appendChild(el("tr", {}, [
+          el("td", { "data-label": "Proveedor" }, p.nombre),
+          el("td", { class: "right", "data-label": "Meses distintos" }, String(p.meses.size)),
+          el("td", { class: "monto", "data-label": "Promedio" }, fmtCLP(p.total / p.cantidad)),
+          el("td", { class: "monto", "data-label": "Total histórico" }, fmtCLP(p.total)),
+        ]));
+      });
+      tablaRec.appendChild(tbodyRec);
+      cont.appendChild(el("div", { class: "table-scroll" }, [tablaRec]));
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -967,6 +1399,42 @@ async function openAdminUsuarios(pushHistory = true) {
     btnRecordatorios.disabled = false;
     btnRecordatorios.textContent = textoOriginal;
   };
+
+  const btnLimpiarStorage = document.getElementById("btn-limpiar-storage");
+  btnLimpiarStorage.onclick = async () => {
+    if (!confirm("¿Borrar comprobantes en Storage que ya no están referenciados por ningún ítem? Solo se borran archivos de más de 24 horas, esto no se puede deshacer.")) return;
+    btnLimpiarStorage.disabled = true;
+    const textoOriginal = btnLimpiarStorage.textContent;
+    btnLimpiarStorage.textContent = "Limpiando...";
+    const { data, error } = await db.functions.invoke("limpiar-storage-huerfano", {});
+    if (error || !data?.ok) {
+      toast("No se pudo limpiar: " + (error?.message || data?.error || "revisa los logs de la función en Supabase."));
+    } else {
+      toast(data.borrados ? `Se borraron ${data.borrados} archivo(s) huérfano(s).` : (data.nota || "No había archivos huérfanos."));
+    }
+    btnLimpiarStorage.disabled = false;
+    btnLimpiarStorage.textContent = textoOriginal;
+  };
+
+  // Salud del sistema: cuántos fallos de OCR/correo dejó registrados
+  // system_events en los últimos 7 días -- sin esto, nadie tenía ningún
+  // motivo para pensar en ir a mirar esa tabla directamente en Supabase.
+  db.from("system_events")
+    .select("tipo")
+    .gte("created_at", new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+    .like("tipo", "%_fail")
+    .then(({ data: eventos, error: errEventos }) => {
+      if (errEventos || !eventos || !eventos.length) return;
+      const conteo = {};
+      eventos.forEach((e) => { conteo[e.tipo] = (conteo[e.tipo] || 0) + 1; });
+      const resumen = Object.entries(conteo).sort((a, b) => b[1] - a[1]).map(([tipo, n]) => `${tipo} (${n})`).join(" · ");
+      list.insertBefore(
+        el("div", { class: "card", style: "border:1px solid var(--warn);margin-bottom:16px;" }, [
+          el("p", { style: "margin:0;font-size:0.85rem;" }, `⚠ Salud del sistema (últimos 7 días): ${resumen}`),
+        ]),
+        list.firstChild
+      );
+    });
 
   const filtroRol = document.getElementById("filtro-usuarios-rol");
   const filtroTexto = document.getElementById("filtro-usuarios-texto");
@@ -1115,7 +1583,7 @@ function renderEditarPerfilPanel(cell, usuario, nombreCell) {
   delegadoHastaField.querySelector("input").value = usuario.delegado_hasta ? String(usuario.delegado_hasta).slice(0, 10) : "";
   const delegadoBox = el("div", { class: "field-row", style: "align-items:flex-end;" }, [
     el("div", { class: "field" }, [
-      el("label", { for: "edit-perfil-delegado", style: "display:flex;align-items:center;gap:6px;" }, [delegadoCheckbox, "Delegado temporal (puede aprobar)"]),
+      el("label", { for: "edit-perfil-delegado", class: "cuenta-check" }, [delegadoCheckbox, el("span", {}, "Delegado temporal (puede aprobar)")]),
     ]),
     delegadoHastaField,
   ]);
@@ -1538,11 +2006,11 @@ function actualizarCentroCostoRendicion() {
   opciones.forEach((o) => sel.appendChild(el("option", { value: o }, o)));
   sel.value = opciones.includes(valorActual) ? valorActual : opciones[0];
 
-  // Los ítems "Boleta" ya cargados también se refrescan: si su Centro de
-  // Costo actual sigue siendo válido para la nueva empresa se mantiene, si
-  // no, se cae al del encabezado (que la persona igual puede volver a
-  // cambiar por ítem).
-  document.querySelectorAll('.sin-documento select[id$="-cc"]').forEach((itemSel) => {
+  // Los ítems "Boleta" y "Documento electrónico" ya cargados también se
+  // refrescan: si su Centro de Costo actual sigue siendo válido para la
+  // nueva empresa se mantiene, si no, se cae al del encabezado (que la
+  // persona igual puede volver a cambiar por ítem).
+  document.querySelectorAll('.sin-documento select[id$="-cc"], .con-documento select[id$="-cccon"]').forEach((itemSel) => {
     const valorItem = itemSel.value;
     itemSel.innerHTML = "";
     opciones.forEach((o) => itemSel.appendChild(el("option", { value: o }, o)));
@@ -1622,6 +2090,11 @@ function addItemRow() {
   wrap.appendChild(bodyConDoc);
   wrap.appendChild(bodySinDoc);
   document.getElementById("items-container").appendChild(wrap);
+  // itemSeq solo sigue subiendo (nunca vuelve atrás, para que los ids del
+  // DOM no se repitan) -- si antes se quitó un ítem, el título inicial de
+  // uno nuevo ("Ítem 5") puede no coincidir con su posición real en la
+  // lista ("Ítem 3"). renumerarItems() lo corrige apenas se agrega.
+  renumerarItems();
 }
 
 function buildConDocumentoFields(id) {
@@ -1639,6 +2112,43 @@ function buildConDocumentoFields(id) {
     fieldInput(`${id}-venc`, "Fecha del documento", "date"),
     fieldInputMoney(`${id}-monto`, "Monto"),
   ]);
+  // Categoría del gasto: NO reemplaza la cuenta contable derivada del tipo
+  // de documento (esa sigue siendo 2.01.07.01/03 para cuadrar con Kame,
+  // ver CUENTA_POR_TIPO_DOC) -- es una clasificación aparte, la misma idea
+  // que ya existía para "Boleta"/Gasto directo, ahora también acá, porque
+  // un Documento electrónico (ej. una factura de supermercado) igual es
+  // útil poder categorizarlo para Reportes ("Beneficios del Personal",
+  // etc.), no solo saber que es una factura.
+  //
+  // Centro de Costo por ítem: antes un "Documento electrónico" SIEMPRE
+  // quedaba con el Centro de Costo del encabezado de la rendición, sin
+  // forma de cambiarlo -- una rendición con más de una factura de sedes
+  // distintas (ej. una en Chicureo, otra en Mall Sport) no tenía cómo
+  // reflejar eso. "Boleta"/Gasto directo ya lo permitía por ítem, esto lo
+  // iguala. OJO: el id NO puede ser "${id}-cc" -- ese ya lo usa el campo
+  // equivalente de Boleta/SinDocumento, y las dos secciones (Documento
+  // electrónico / Boleta) conviven SIEMPRE en el DOM de la misma tarjeta
+  // (una queda con display:none, pero sigue ahí) -- reusar el id
+  // chocaría con document.getElementById en otro lugar de la tarjeta.
+  // NO se manda al comprobante de Kame para este tipo de ítem (ver el
+  // comentario en construirFilasCSV) -- es solo para Reportes/Excel.
+  const empresaActualCon = document.getElementById("nr-empresa")?.value || EMPRESAS[0];
+  const opcionesCCCon = CENTROS_COSTO_POR_EMPRESA[empresaActualCon] || ["Casa Matriz"];
+  const ccHeaderActualCon = document.getElementById("nr-cc")?.value;
+  // OJO: id "-categoriacon", NO "-categoria" -- ese lo usa el select de
+  // categoría de Boleta/SinDocumento más abajo (buildSinDocumentoFields),
+  // y las dos secciones conviven en el mismo DOM de la tarjeta (una queda
+  // con display:none). Reusar el id hacía que document.getElementById
+  // siempre devolviera el de acá (el primero en el DOM), corrompiendo en
+  // silencio la categoría guardada de cualquier ítem "Boleta" que no
+  // dejara la primera opción del desplegable (bug encontrado en revisión
+  // posterior a este mismo cambio) -- mismo motivo que ya se documentó
+  // para "-cccon" más arriba.
+  const row3b = el("div", { class: "field-row" }, [
+    fieldSelectCategoria(`${id}-categoriacon`),
+    fieldSelect(`${id}-cccon`, "Centro de Costo (Unidad de Negocio)", opcionesCCCon),
+  ]);
+  row3b.querySelector("select[id$='-cccon']").value = opcionesCCCon.includes(ccHeaderActualCon) ? ccHeaderActualCon : opcionesCCCon[0];
   const row4 = el("div", { class: "field-row" }, [
     fieldInput(`${id}-desc`, "Descripción", "text"),
   ]);
@@ -1650,6 +2160,7 @@ function buildConDocumentoFields(id) {
   box.appendChild(row2);
   box.appendChild(dupStatus);
   box.appendChild(row3);
+  box.appendChild(row3b);
   box.appendChild(row4);
   box.appendChild(foto);
   // La verificación contra contabilidad la hace quien aprueba, no quien carga el gasto
@@ -1659,8 +2170,9 @@ function buildConDocumentoFields(id) {
   );
 
   const fotoInput = foto.querySelector("input[type=file]");
-  fotoInput.addEventListener("change", () => {
+  fotoInput.addEventListener("change", async () => {
     if (!validarTamanoArchivo(fotoInput)) return;
+    await reemplazarConVersionComprimida(fotoInput);
     if (fotoInput.files && fotoInput.files[0]) analizarComprobante(id, fotoInput.files[0], ocrStatus);
   });
 
@@ -1714,6 +2226,18 @@ function buildConDocumentoFields(id) {
 // Común a "Con documento" y "Gasto directo": lee el archivo, se lo manda a
 // la Edge Function ocr-recibo y devuelve los datos extraídos. Cada caller
 // mapea el resultado a sus propios campos (son formularios distintos).
+// Sin esto, una llamada de red que se cuelga (señal mala en terreno, no un
+// error real -- nunca responde ni falla) dejaba el botón pegado en
+// "Analizando..."/"Guardando..." indefinidamente, sin ningún mensaje ni
+// forma de reintentar salvo recargar la página y perder lo ya tipeado.
+function conTimeout(promise, ms, mensaje) {
+  let idTimeout;
+  const timeout = new Promise((_, reject) => {
+    idTimeout = setTimeout(() => reject(new Error(mensaje)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(idTimeout));
+}
+
 async function llamarOcrRecibo(file) {
   const imageBase64 = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1722,9 +2246,11 @@ async function llamarOcrRecibo(file) {
     reader.readAsDataURL(file);
   });
 
-  const { data, error } = await db.functions.invoke("ocr-recibo", {
-    body: { imageBase64, mimeType: file.type || "image/jpeg" },
-  });
+  const { data, error } = await conTimeout(
+    db.functions.invoke("ocr-recibo", { body: { imageBase64, mimeType: file.type || "image/jpeg" } }),
+    30000,
+    "Se agotó el tiempo de espera leyendo el comprobante (conexión muy lenta o caída). Completa los datos a mano, o inténtalo de nuevo."
+  );
   if (error) throw error;
   if (data?.error) throw new Error(data.error);
   return data;
@@ -1755,6 +2281,14 @@ async function analizarComprobante(id, file, statusEl) {
       const montoInput = document.getElementById(`${id}-monto`);
       montoInput.value = Number(data.monto).toLocaleString("es-CL");
     }
+    // Igual que en "Gasto directo": solo se aplica si existe tal cual en
+    // el desplegable, el campo queda visible y editable para confirmarla.
+    if (data.categoria_sugerida) {
+      const catSelect = document.getElementById(`${id}-categoriacon`);
+      if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+        catSelect.value = data.categoria_sugerida;
+      }
+    }
     recalcTotal();
 
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
@@ -1773,13 +2307,51 @@ async function analizarComprobante(id, file, statusEl) {
 // comunes que van directo al gasto): solo autocompleta monto y descripción,
 // que es lo único que ese formulario tiene y lo único que se puede leer con
 // certeza de una boleta (la categoría/CC las define la persona).
+// Busca en QUÉ categorías esta misma persona clasificó antes compras al
+// mismo proveedor (comparación por nombre, sin distinguir mayúsculas --
+// "Gasto directo" no siempre tiene RUT del proveedor, solo el nombre que
+// se tipeó o que leyó el OCR). Solo mira las rendiciones del propio
+// usuario (RLS igual lo exigiría del lado del servidor).
+async function buscarHistorialCategoriasProveedor(nombreProveedor) {
+  if (!nombreProveedor || !nombreProveedor.trim()) return [];
+  const { data, error } = await db
+    .from("rendicion_items")
+    .select("categoria, rendiciones!inner(empleado_id)")
+    .eq("tipo_item", "SinDocumento")
+    .eq("rendiciones.empleado_id", currentUser.id)
+    .ilike("nombre_proveedor", nombreProveedor.trim())
+    .not("categoria", "is", null);
+  if (error) { console.error("Error buscando historial de proveedor:", error); return []; }
+  return data || [];
+}
+
+// Muestra el aviso de historial -- NO cambia el <select> de categoría ni
+// nada más, es puramente informativo. Con 0 o 1 antecedente no hay ningún
+// patrón real que mostrar, así que no se dice nada (evita ruido).
+async function mostrarHistorialProveedor(id, nombreProveedor) {
+  const hint = document.getElementById(`${id}-historial-hint`);
+  if (!hint) return;
+  hint.className = "ocr-status";
+  hint.textContent = "";
+  const historial = await buscarHistorialCategoriasProveedor(nombreProveedor);
+  if (historial.length < 2) return;
+  const conteo = {};
+  historial.forEach((h) => { conteo[h.categoria] = (conteo[h.categoria] || 0) + 1; });
+  const resumen = Object.entries(conteo).sort((a, b) => b[1] - a[1]).map(([cat, n]) => `${cat} (${n})`).join(", ");
+  hint.textContent = `📋 Antes clasificaste compras de "${nombreProveedor}" como: ${resumen}. Elige la que corresponda esta vez, no siempre es la misma.`;
+  hint.className = "ocr-status show";
+}
+
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
     const data = await llamarOcrRecibo(file);
 
-    if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
+    if (data.nombre_proveedor) {
+      document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
+      mostrarHistorialProveedor(id, data.nombre_proveedor);
+    }
     if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
     if (data.monto) {
       const montoInput = document.getElementById(`${id}-monto2`);
@@ -1812,10 +2384,17 @@ function buildSinDocumentoFields(id) {
   const rowProv = el("div", { class: "field-row" }, [
     fieldInput(`${id}-nombreprov2`, "Proveedor / Local", "text"),
   ]);
+  rowProv.querySelector("input").addEventListener("blur", (e) => mostrarHistorialProveedor(id, e.target.value));
   const row1 = el("div", { class: "field-row" }, [
     fieldSelectCategoria(`${id}-categoria`),
     fieldInput(`${id}-cuenta`, "Cuenta contable", "text", "4.01.03.xx"),
   ]);
+  // Aviso informativo (no una regla automática): un mismo proveedor puede
+  // ser para cosas distintas cada vez (ej. una ferretería: a veces
+  // materiales, a veces mantención), así que en vez de forzar la
+  // categoría más repetida, se muestra el historial real de ESTA persona
+  // con ESTE proveedor y la persona decide con ese contexto de más.
+  const historialHint = el("p", { class: "ocr-status", id: `${id}-historial-hint` });
   // El Centro de Costo por defecto es el que se eligió en el encabezado de
   // la rendición (campo "nr-cc"), pero queda editable por ítem: una misma
   // empresa puede tener boletas de sedes distintas dentro de una misma
@@ -1837,13 +2416,15 @@ function buildSinDocumentoFields(id) {
 
   box.appendChild(rowProv);
   box.appendChild(row1);
+  box.appendChild(historialHint);
   box.appendChild(row2);
   box.appendChild(row3);
   box.appendChild(foto);
 
   const fotoInput2 = foto.querySelector("input[type=file]");
-  fotoInput2.addEventListener("change", () => {
+  fotoInput2.addEventListener("change", async () => {
     if (!validarTamanoArchivo(fotoInput2)) return;
+    await reemplazarConVersionComprimida(fotoInput2);
     if (fotoInput2.files && fotoInput2.files[0]) analizarComprobanteGastoDirecto(id, fotoInput2.files[0], ocrStatus);
   });
 
@@ -1894,6 +2475,49 @@ function fieldInputMoney(id, label) {
 // mandarlo a OCR, da un mensaje claro en vez de que la persona espere un
 // buen rato en una conexión de campo (celular, terreno) para recién
 // enterarse por un error crudo de la API que el archivo era muy pesado.
+// Reescala/recomprime una foto ANTES de usarla para OCR y para subirla a
+// Storage -- se comprime una sola vez y el mismo archivo comprimido sirve
+// para las dos cosas (antes se mandaba la foto completa dos veces por la
+// red del usuario: una en base64 al OCR, otra al subir el original a
+// Storage -- el doble de datos móviles por el mismo comprobante). Los PDF
+// no se tocan (no se pueden procesar con canvas). Si algo falla (formato
+// raro, navegador sin soporte), se usa el archivo original tal cual --
+// nunca bloquea el flujo de carga por esto.
+async function comprimirImagenSiCorresponde(file) {
+  if (!file.type || !file.type.startsWith("image/") || file.type === "image/svg+xml") return file;
+  try {
+    const bitmap = await createImageBitmap(file);
+    const LADO_MAXIMO = 1600;
+    const escala = Math.min(1, LADO_MAXIMO / Math.max(bitmap.width, bitmap.height));
+    const w = Math.round(bitmap.width * escala);
+    const h = Math.round(bitmap.height * escala);
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.75));
+    if (!blob || blob.size >= file.size) return file; // no vale la pena si no achica
+    return new File([blob], file.name.replace(/\.\w+$/, "") + ".jpg", { type: "image/jpeg" });
+  } catch (err) {
+    console.error("No se pudo comprimir la imagen, se usa el archivo original:", err);
+    return file;
+  }
+}
+
+// Reemplaza el archivo de un <input type=file> por uno ya comprimido, para
+// que tanto el OCR como submitRendicion() (que lee fotoInput.files[0] más
+// tarde) usen la misma versión liviana. DataTransfer es la única forma
+// estándar de reescribir la FileList de un input desde JS.
+async function reemplazarConVersionComprimida(input) {
+  const original = input.files && input.files[0];
+  if (!original) return;
+  const comprimido = await comprimirImagenSiCorresponde(original);
+  if (comprimido === original) return;
+  const dt = new DataTransfer();
+  dt.items.add(comprimido);
+  input.files = dt.files;
+}
+
 const TAMANO_MAXIMO_ARCHIVO = 15 * 1024 * 1024;
 function validarTamanoArchivo(input) {
   const file = input.files && input.files[0];
@@ -1907,7 +2531,12 @@ function validarTamanoArchivo(input) {
 function fieldFile(id, label) {
   return el("div", { class: "field" }, [
     el("label", { for: id }, label),
-    el("input", { id, type: "file", accept: "image/*,application/pdf" }),
+    // capture="environment": en el celular, abre la cámara trasera directo
+    // en vez del selector genérico (Cámara / Galería / Archivos) -- un
+    // empleado parado frente al comprobante ahorra un tap cada vez que
+    // carga un gasto. Si elige un PDF (no se puede "capturar" con cámara),
+    // los navegadores igual dejan volver al selector normal de archivos.
+    el("input", { id, type: "file", accept: "image/*,application/pdf", capture: "environment" }),
   ]);
 }
 function fieldSelect(id, label, options) {
@@ -2078,8 +2707,8 @@ async function submitRendicion() {
         comprobante_contable_encontrado: null,
         existe_en_contabilidad: null,
         empresa: empresaRendicion,
-        centro_costo: centroCostoRendicion,
-        categoria: null,
+        centro_costo: document.getElementById(`${id}-cccon`)?.value?.trim() || centroCostoRendicion,
+        categoria: document.getElementById(`${id}-categoriacon`)?.value || null,
         monto,
         descripcion: document.getElementById(`${id}-desc`).value.trim(),
         _fotoInput: fotoInput,
@@ -2152,7 +2781,22 @@ async function submitRendicion() {
         // milisegundo -- upload() no sobreescribe en silencio (falla con
         // 409), pero total es gratis evitarlo del todo.
         const path = `${currentUser.id}/${rendicionId}-${idx}-${Date.now()}-${nombreSeguro}`;
-        const { error: upErr } = await db.storage.from("comprobantes").upload(path, file);
+        // Timeout propio (no solo el de conTimeout) para que un archivo
+        // colgado no aborte tratar de subir el resto de los ítems -- se
+        // captura acá mismo, no se deja propagar al try/catch general de
+        // toda la función, que si no habría cortado en seco el envío
+        // completo en vez de seguir con los ítems que sí van bien.
+        let upErr = null;
+        try {
+          const resp = await conTimeout(
+            db.storage.from("comprobantes").upload(path, file),
+            45000,
+            "Se agotó el tiempo de espera subiendo el archivo (conexión muy lenta o caída)."
+          );
+          upErr = resp.error;
+        } catch (timeoutErr) {
+          upErr = timeoutErr;
+        }
         if (upErr) {
           console.error("Error subiendo comprobante:", upErr);
           erroresItems.push(`Ítem ${idx + 1}: no se pudo subir el comprobante (${upErr.message}).`);
@@ -2332,7 +2976,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     replaceView("view-dashboard");
     return;
   }
-  const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
+  const esAprobadorViewer = esAprobadorEfectivo(currentProfile);
   const esPropia = s.empleado_id === currentUser.id;
   const puedeAprobar = esAprobadorViewer && s.estado === "Pendiente" && !esPropia;
 
@@ -2522,7 +3166,7 @@ async function openDetalle(id, pushHistory = true) {
   ]);
   const itemsConMontoEditado = new Set((montosEditados || []).map((h) => h.item_id));
 
-  const esAprobadorViewer = currentProfile && (currentProfile.rol === "aprobador" || currentProfile.rol === "admin");
+  const esAprobadorViewer = esAprobadorEfectivo(currentProfile);
   const esPropia = r.empleado_id === currentUser.id;
   const puedeAprobar = esAprobadorViewer && r.estado === "Pendiente" && !esPropia;
 
@@ -2570,7 +3214,7 @@ async function openDetalle(id, pushHistory = true) {
 
     const celdas = [
       el("td", {}, tipoItemLabel(it.tipo_item)),
-      el("td", { class: "wrap" }, esCon ? (it.nombre_proveedor || "-") : [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
+      el("td", { class: "wrap" }, [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
       el("td", {}, esCon ? (it.rut_proveedor || "-") : "-"),
       el("td", {}, esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-"),
       el("td", {}, esCon && it.fecha_vencimiento ? fmtDate(it.fecha_vencimiento) : "-"),
@@ -2731,7 +3375,7 @@ async function openDetalle(id, pushHistory = true) {
         // pura fricción -- este botón aprueba de un golpe todos los que
         // sigan Pendientes (no toca los que ya se marcaron Aprobado o
         // Rechazado a mano).
-        const btnAprobarTodos = el("button", { class: "btn btn-success btn-sm", style: "margin-top:8px;" }, `Aprobar los ${pendientes} ítems pendientes`);
+        const btnAprobarTodos = el("button", { class: "btn btn-success", style: "margin-top:8px;" }, `Aprobar los ${pendientes} ítems pendientes`);
         btnAprobarTodos.addEventListener("click", async () => {
           if (!confirm(`¿Aprobar de una vez los ${pendientes} ítem(s) que siguen Pendientes de esta rendición?`)) return;
           btnAprobarTodos.disabled = true;
@@ -3060,6 +3704,9 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
     tipoDocumento: it.tipo_item === "ConDocumento" && it.tipo_documento ? it.tipo_documento : TIPOS_DOCUMENTO[0],
     nroDocumento: it.tipo_item === "ConDocumento" ? (it.nro_documento || "") : "",
     fechaVencimiento: it.tipo_item === "ConDocumento" ? (it.fecha_vencimiento || "") : "",
+    // Categoría propia de Documento electrónico (ver buildConDocumentoFields
+    // -- no reemplaza cuentaContable, es una clasificación aparte).
+    categoria: it.tipo_item === "ConDocumento" ? it.categoria : null,
   };
   const draftSin = {
     nombreProveedor: it.tipo_item === "SinDocumento" ? (it.nombre_proveedor || "") : "",
@@ -3091,6 +3738,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
       draftCon.tipoDocumento = v(`#${pfx}tipodoc`) ?? draftCon.tipoDocumento;
       draftCon.nroDocumento = v(`#${pfx}nrodoc`)?.trim() ?? draftCon.nroDocumento;
       draftCon.fechaVencimiento = v(`#${pfx}venc`) ?? draftCon.fechaVencimiento;
+      draftCon.categoria = v(`#${pfx}categoria`) ?? draftCon.categoria;
     } else {
       const v = (sel) => lineWrap.querySelector(sel)?.value;
       draftSin.nombreProveedor = v(`#${pfx}nombreprov2`)?.trim() ?? draftSin.nombreProveedor;
@@ -3126,6 +3774,13 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
       const venc = fieldInput(`${pfx}venc`, "Fecha del documento", "date");
       venc.querySelector("input").value = draftCon.fechaVencimiento || "";
 
+      const catDoc = fieldSelectCategoria(`${pfx}categoria`);
+      const catDocSel = catDoc.querySelector("select");
+      if (draftCon.categoria && [...catDocSel.options].some((o) => o.value === draftCon.categoria)) {
+        catDocSel.value = draftCon.categoria;
+      }
+      camposTipo.appendChild(el("div", { class: "field-row" }, [catDoc]));
+
       if (esAprobadorViewer) {
         const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
         const cuentaInput = cuenta.querySelector("input");
@@ -3133,6 +3788,23 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
         const nombreHint = el("p", { class: "ocr-status show", id: `${pfx}cuenta-nombre` }, nombreCuenta(cuentaInput.value));
         cuentaInput.addEventListener("input", () => { nombreHint.textContent = nombreCuenta(cuentaInput.value) || "Cuenta no reconocida"; });
         cuenta.appendChild(nombreHint);
+        // Sugerencia de cuenta de GASTO según la categoría elegida (no
+        // reemplaza la cuenta de arriba, que sigue siendo la de pasivo
+        // -- Proveedores/Honorarios por Pagar -- fija según el tipo de
+        // documento, para no descuadrar el comprobante de Kame). Es solo
+        // una ayuda para quien aprueba y registra la factura, ya que es
+        // quien decide con qué cuenta real contabilizarla -- por eso NO
+        // se auto-aplica a ningún campo, solo se muestra como texto.
+        const sugerenciaCuenta = el("p", { class: "ocr-status show", id: `${pfx}cuenta-sugerida` });
+        const actualizarSugerenciaCuenta = () => {
+          const cat = CATEGORIAS_GASTO.find((c) => c.nombre === catDocSel.value);
+          sugerenciaCuenta.textContent = cat && cat.cuenta
+            ? `💡 Sugerencia según la categoría: ${cat.cuenta} · ${cat.nombre} (la cuenta de arriba es la de Proveedores/Honorarios por Pagar por defecto).`
+            : "";
+        };
+        catDocSel.addEventListener("change", actualizarSugerenciaCuenta);
+        actualizarSugerenciaCuenta();
+        cuenta.appendChild(sugerenciaCuenta);
         camposTipo.appendChild(el("div", { class: "field-row" }, [venc, cuenta]));
       } else {
         camposTipo.appendChild(el("div", { class: "field-row" }, [venc]));
@@ -3148,18 +3820,26 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
       const catSelect = fieldSelectCategoria(`${pfx}categoria`);
       const sel = catSelect.querySelector("select");
       const cuenta = fieldInput(`${pfx}cuenta`, "Cuenta contable", "text");
+      const cuentaInput = cuenta.querySelector("input");
+      // Mismo criterio que actualizarCuenta() en buildSinDocumentoFields (el
+      // formulario de creación): la cuenta solo se puede tipear a mano
+      // cuando la categoría es "Otro" -- antes acá quedaba SIEMPRE
+      // readOnly, así que un ítem cargado con categoría "Otro" y una cuenta
+      // manual no se podía corregir, y encima si se tocaba el desplegable
+      // de categoría y se volvía a "Otro" la cuenta quedaba en blanco sin
+      // forma de volver a tipearla (bug encontrado en revisión posterior).
+      const actualizarCuentaEdit = (preservarValorGuardado) => {
+        const found = CATEGORIAS_GASTO.find((c) => c.nombre === sel.value);
+        const esManual = !!found && found.cuenta === "";
+        cuentaInput.readOnly = !esManual;
+        if (esManual) cuentaInput.value = preservarValorGuardado ? (draftSin.cuentaContable || "") : "";
+        else cuentaInput.value = found ? found.cuenta : "";
+      };
       if (draftSin.categoria && [...sel.options].some((o) => o.value === draftSin.categoria)) {
         sel.value = draftSin.categoria;
-        cuenta.querySelector("input").value = draftSin.cuentaContable || "";
-      } else {
-        const found = CATEGORIAS_GASTO.find((c) => c.nombre === sel.value);
-        cuenta.querySelector("input").value = found ? found.cuenta : "";
       }
-      cuenta.querySelector("input").readOnly = true;
-      sel.addEventListener("change", () => {
-        const found = CATEGORIAS_GASTO.find((c) => c.nombre === sel.value);
-        cuenta.querySelector("input").value = found ? found.cuenta : "";
-      });
+      actualizarCuentaEdit(true);
+      sel.addEventListener("change", () => actualizarCuentaEdit(false));
       camposTipo.appendChild(el("div", { class: "field-row" }, [catSelect, cuenta]));
       const cc = fieldSelect(`${pfx}cc`, "Centro de Costo (Unidad de Negocio)", opcionesCC);
       cc.querySelector("select").value = centroCostoDraft || opcionesCC[0];
@@ -3207,8 +3887,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           cambios.nro_documento = lineWrap.querySelector(`#${pfx}nrodoc`).value.trim();
           cambios.fecha_vencimiento = lineWrap.querySelector(`#${pfx}venc`).value || null;
           if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
-          // Sale de "Boleta": la categoría ya no aplica.
-          cambios.categoria = null;
+          cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`)?.value || null;
         } else {
           cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov2`).value.trim();
           cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`).value;
@@ -3528,7 +4207,7 @@ async function generarInformePDF(rendicion, items) {
         return [
           i + 1,
           tipoItemLabel(it.tipo_item),
-          esCon ? (it.nombre_proveedor || "-") : ([it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-"),
+          [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-",
           esCon ? (it.rut_proveedor || "-") : "-",
           esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-",
           it.centro_costo || "-",

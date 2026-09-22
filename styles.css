@@ -21,6 +21,12 @@
   --warn-bg: #fbf1e2;
   --radius: 12px;
   --shadow: 0 1px 2px rgba(28, 39, 51, 0.06), 0 8px 24px -12px rgba(28, 39, 51, 0.18);
+  /* Antes la foto de fondo del login usaba el mismo overlay oscuro fijo en
+     los dos temas -- en modo claro, una tarjeta blanca sobre una foto muy
+     oscura se sentía "fuera de lugar", como si el tema no hubiera cambiado
+     de verdad (hallazgo de una revisión visual). Overlay más liviano acá,
+     más oscuro en el bloque dark de abajo. */
+  --login-overlay: rgba(20, 32, 46, 0.4);
   color-scheme: light;
 }
 
@@ -43,6 +49,7 @@
     --warn: #e3b567;
     --warn-bg: #3a2f16;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+    --login-overlay: rgba(6, 10, 14, 0.62);
     color-scheme: dark;
   }
 }
@@ -64,6 +71,7 @@
   --warn: #e3b567;
   --warn-bg: #3a2f16;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+  --login-overlay: rgba(6, 10, 14, 0.62);
   color-scheme: dark;
 }
 
@@ -340,11 +348,16 @@ button {
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 
 .password-field { position: relative; }
-.password-field input { width: 100%; padding-right: 40px; }
+.password-field input { width: 100%; padding-right: 44px; }
 .btn-ver-password {
-  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  position: absolute; right: 0; top: 50%; transform: translateY(-50%);
   background: none; border: none; cursor: pointer; font-size: 1rem;
-  padding: 6px 8px; opacity: 0.6; line-height: 1;
+  opacity: 0.6; line-height: 1;
+  /* min-width/height en vez de más padding: agranda el área táctil real
+     (antes ~32x28px, por debajo del mínimo recomendado de ~44px) sin
+     agrandar el ícono mismo -- hallazgo de una prueba visual en mobile. */
+  min-width: 44px; min-height: 44px;
+  display: flex; align-items: center; justify-content: center;
 }
 .btn-ver-password:hover { opacity: 1; }
 @media (max-width: 640px) { .field-row { grid-template-columns: 1fr; } }
