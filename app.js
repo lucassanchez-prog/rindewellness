@@ -2309,7 +2309,12 @@ async function llamarOcrRecibo(file) {
 
   const { data, error } = await conTimeout(
     db.functions.invoke("ocr-recibo", { body: { imageBase64, mimeType: file.type || "image/jpeg" } }),
-    30000,
+    // ocr-recibo ahora puede probar varios modelos de Gemini en cadena antes
+    // de responder (hasta ~22s de presupuesto propio, ver TIEMPO_MAX_TOTAL_MS
+    // en esa función) -- 30s dejaba muy poco margen de red por encima de eso,
+    // así que se sube un poco sin dejar que una API realmente caída deje a
+    // la persona mirando el spinner por más de medio minuto.
+    35000,
     "Se agotó el tiempo de espera leyendo el comprobante (conexión muy lenta o caída). Completa los datos a mano, o inténtalo de nuevo."
   );
   if (error) {

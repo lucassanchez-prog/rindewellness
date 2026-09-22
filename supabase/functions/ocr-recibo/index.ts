@@ -36,20 +36,27 @@ async function requireUser(req: Request) {
 }
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
-// Configurable por si Google renombra/da de baja el alias del modelo --
-// antes estaba fijo en el código, así que un cambio de Google rompía el OCR
-// para todos por igual, sin forma de corregirlo sin un redeploy.
-const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-3.6-flash";
-// Los modelos "gemini-3.x" recién lanzados sufren picos de demanda de Google
-// que a veces duran minutos, no segundos (503 "high demand" sostenido, no
-// un error puntual) -- reintentar contra el mismo modelo saturado no sirve
-// de nada en ese caso. Si el modelo principal sigue sin responder tras sus
-// reintentos, se prueba una vez más contra otro modelo con menos demanda.
-// OJO: Google está retirando el acceso a modelos pre-3.x para API keys
-// nuevas ("gemini-2.5-flash" ya no está disponible para keys nuevas, según
-// el propio mensaje de error de la API) -- el respaldo debe ser otro modelo
-// de la familia 3.x, no uno anterior.
-const GEMINI_MODEL_FALLBACK = Deno.env.get("GEMINI_MODEL_FALLBACK") || "gemini-3.5-flash";
+// Lista ordenada de modelos a probar, en vez de un único "primario" +
+// "fallback" fijos en el código -- ya nos pasó dos veces seguidas el mismo
+// día: primero gemini-3.6-flash (recién lanzado) estuvo saturado por Google
+// durante más de 30 minutos seguidos (503 "high demand" sostenido, no un
+// error puntual), y el respaldo que elegimos a mano para ese caso
+// (gemini-2.5-flash) resultó estar dado de baja para cuentas nuevas ("no
+// longer available to new users"). Adivinar a mano cuál modelo está vivo hoy
+// no escala; se prueban varios candidatos en orden y se sigue al próximo
+// automáticamente cuando el anterior falla por un motivo relacionado al
+// modelo (ver esErrorDeModelo más abajo). Todos de la familia 3.x (Google
+// está retirando el acceso pre-3.x para API keys nuevas) y de nivel "flash"
+// -- rápidos/baratos, apropiados para esta extracción estructurada -- salvo
+// el último (gemini-3.1-pro), que es más lento/caro pero es el último
+// recurso antes de rendirse y su capacidad en Google suele ser independiente
+// de la de los modelos "flash". Configurable por si Google vuelve a cambiar
+// la disponibilidad de alguno, para ajustar el orden sin esperar un
+// redeploy del código.
+const GEMINI_MODELS_ORDEN = (Deno.env.get("GEMINI_MODELS_ORDEN") || "gemini-3.6-flash,gemini-3.5-flash,gemini-3.7-flash,gemini-3.1-pro")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
 const geminiUrl = (modelo: string) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -142,11 +149,31 @@ Deno.serve(async (req: Request) => {
       generationConfig: { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192 },
     };
 
-    // Gemini a veces devuelve "high demand" de forma transitoria (picos de uso),
-    // y la capa gratuita tiene un límite de solicitudes POR MINUTO ("quota
-    // exceeded") que se libera solo unos segundos después -- ambos casos se
-    // solucionan reintentando con espera, no son errores permanentes.
-    async function llamarGemini(modelo: string, intentosMax: number) {
+    // Gemini a veces devuelve "high demand" de forma transitoria (picos de
+    // uso), la capa gratuita tiene un límite de solicitudes POR MINUTO
+    // ("quota exceeded") que se libera solo unos segundos después, y a veces
+    // un modelo completo deja de estar disponible para esta cuenta (dado de
+    // baja, restringido, etc.) -- los tres casos se resuelven pasando al
+    // siguiente modelo candidato, no son errores permanentes de la llamada
+    // en sí. OJO: el mensaje real de Google para "modelo dado de baja" es
+    // "no longer available to new users", que NO contiene la palabra
+    // "unavailable" -- por eso va listado aparte acá; nos pasó exactamente
+    // este caso con gemini-2.5-flash. Un error genuinamente permanente (API
+    // key inválida, contenido bloqueado por seguridad, request malformado)
+    // NO matchea ninguno de estos patrones, así que corta altiro en vez de
+    // gastar tiempo probando cada candidato de la lista para nada.
+    const esErrorDeModelo = (mensaje: string) =>
+      /high demand|unavailable|overloaded|quota|rate.?limit|no longer available|not found|is not supported|deprecated/i.test(mensaje);
+
+    // Tope de tiempo total (sumando todos los modelos candidatos y sus
+    // reintentos) para no superar el timeout que tiene el frontend para esta
+    // llamada completa (ver conTimeout en llamarOcrRecibo, app.js) -- sin
+    // este tope, con varios candidatos y backoff entre reintentos, la
+    // función podía seguir probando modelos mucho después de que el usuario
+    // ya hubiera visto el timeout y perdido la espera.
+    const TIEMPO_MAX_TOTAL_MS = 22_000;
+
+    async function llamarGemini(modelo: string, intentosMax: number, inicio: number) {
       let ultimoError: Error = new Error("Error consultando Gemini");
       for (let intento = 1; intento <= intentosMax; intento++) {
         const resp = await fetch(geminiUrl(modelo), {
@@ -159,33 +186,40 @@ Deno.serve(async (req: Request) => {
 
         const mensaje = respData?.error?.message || "Error consultando Gemini";
         ultimoError = new Error(mensaje);
-        const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensaje);
-        if (!esTransitorio || intento === intentosMax) throw ultimoError;
+        const tiempoRestante = TIEMPO_MAX_TOTAL_MS - (Date.now() - inicio);
+        if (!esErrorDeModelo(mensaje) || intento === intentosMax || tiempoRestante <= 0) throw ultimoError;
         // El error de cuota trae su propio "retry in Ns"; si no lo trae, usamos
-        // el backoff normal. Esperamos un poco más que lo pedido por margen.
+        // el backoff normal. Nunca esperamos más que el presupuesto de tiempo
+        // que queda, para dejarle margen a los próximos candidatos.
         const retrySugerido = /retry in ([\d.]+)s/i.exec(mensaje);
-        const espera = retrySugerido ? Math.min(Number(retrySugerido[1]) * 1000 + 1000, 4000) : 1200 * intento;
-        await new Promise((r) => setTimeout(r, espera));
+        const esperaSugerida = retrySugerido ? Math.min(Number(retrySugerido[1]) * 1000 + 1000, 3000) : 1200 * intento;
+        await new Promise((r) => setTimeout(r, Math.min(esperaSugerida, tiempoRestante)));
       }
       throw ultimoError;
     }
 
-    let data;
-    try {
-      data = await llamarGemini(GEMINI_MODEL, 2);
-    } catch (errPrimario) {
-      // Google a veces satura un modelo recién lanzado (gemini-3.x) por
-      // minutos, no segundos -- reintentar contra el mismo modelo no sirve
-      // en ese caso. Si el motivo fue sobrecarga/demanda (no otro error), se
-      // prueba una vez con un modelo GA más establecido antes de rendirse.
-      const mensajePrimario = String(errPrimario instanceof Error ? errPrimario.message : errPrimario);
-      const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensajePrimario);
-      if (esTransitorio && GEMINI_MODEL_FALLBACK && GEMINI_MODEL_FALLBACK !== GEMINI_MODEL) {
-        data = await llamarGemini(GEMINI_MODEL_FALLBACK, 2);
-      } else {
-        throw errPrimario;
+    // Se prueba cada modelo de GEMINI_MODELS_ORDEN en orden hasta que uno
+    // responda. Al primer candidato se le dan 2 intentos (por si fue un
+    // tropiezo puntual, no necesariamente el modelo entero caído); a los
+    // siguientes 1 solo, para no gastar el presupuesto de tiempo
+    // reintentando dos veces un modelo cuando todavía quedan otros
+    // candidatos por probar.
+    async function llamarGeminiConCandidatos() {
+      const inicio = Date.now();
+      let ultimoError: Error = new Error("No hay modelos de Gemini configurados (GEMINI_MODELS_ORDEN).");
+      for (let i = 0; i < GEMINI_MODELS_ORDEN.length; i++) {
+        if (Date.now() - inicio >= TIEMPO_MAX_TOTAL_MS) break; // sin margen de tiempo para probar otro modelo más
+        try {
+          return await llamarGemini(GEMINI_MODELS_ORDEN[i], i === 0 ? 2 : 1, inicio);
+        } catch (err) {
+          ultimoError = err instanceof Error ? err : new Error(String(err));
+          if (!esErrorDeModelo(ultimoError.message)) throw ultimoError; // error permanente, no relacionado al modelo: no seguir probando candidatos
+        }
       }
+      throw ultimoError;
     }
+
+    const data = await llamarGeminiConCandidatos();
 
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) {
