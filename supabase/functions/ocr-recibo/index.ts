@@ -41,23 +41,24 @@ async function requireUser(req: Request) {
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 // Lista ordenada de modelos a probar, en vez de un único "primario" +
-// "fallback" fijos en el código -- ya nos pasó dos veces seguidas el mismo
-// día: primero gemini-3.6-flash (recién lanzado) estuvo saturado por Google
-// durante más de 30 minutos seguidos (503 "high demand" sostenido, no un
-// error puntual), y el respaldo que elegimos a mano para ese caso
-// (gemini-2.5-flash) resultó estar dado de baja para cuentas nuevas ("no
-// longer available to new users"). Adivinar a mano cuál modelo está vivo hoy
-// no escala; se prueban varios candidatos en orden y se sigue al próximo
-// automáticamente cuando el anterior falla por un motivo relacionado al
-// modelo (ver esErrorDeModelo más abajo). Todos de la familia 3.x (Google
-// está retirando el acceso pre-3.x para API keys nuevas) y de nivel "flash"
-// -- rápidos/baratos, apropiados para esta extracción estructurada -- salvo
-// el último (gemini-3.1-pro), que es más lento/caro pero es el último
-// recurso antes de rendirse y su capacidad en Google suele ser independiente
-// de la de los modelos "flash". Configurable por si Google vuelve a cambiar
-// la disponibilidad de alguno, para ajustar el orden sin esperar un
-// redeploy del código.
-const GEMINI_MODELS_ORDEN = (Deno.env.get("GEMINI_MODELS_ORDEN") || "gemini-3.6-flash,gemini-3.5-flash,gemini-3.7-flash,gemini-3.1-pro")
+// "fallback" fijos en el código -- adivinar a mano un nombre de modelo por
+// blog posts/changelog público de Google ya nos falló DOS veces el mismo
+// día: "gemini-2.5-flash" resultó dado de baja para esta cuenta ("no longer
+// available to new users"), y "gemini-3.1-pro" directamente nunca existió
+// como ID (el real es "gemini-3.1-pro-preview", que es OTRO modelo). La
+// lista de acá abajo SÍ está verificada -- se confirmó contra la API real
+// de Google (GET /v1beta/models con esta misma GEMINI_API_KEY, ver el
+// diagnóstico que se puede activar con {listarModelos:true} en el body).
+// Todos "flash" -- rápidos/baratos, apropiados para esta extracción
+// estructurada -- salvo el último, "gemini-flash-latest", que es un ALIAS
+// que Google mantiene apuntando al flash vigente en cada momento (nunca
+// hay que actualizarlo a mano cuando Google lance un modelo nuevo), como
+// último recurso antes de rendirse. Se prueban en orden y se sigue al
+// próximo automáticamente cuando el anterior falla por un motivo
+// relacionado al modelo (ver esErrorDeModelo más abajo). Configurable por
+// si Google vuelve a cambiar la disponibilidad de alguno, para ajustar el
+// orden sin esperar un redeploy del código.
+const GEMINI_MODELS_ORDEN = (Deno.env.get("GEMINI_MODELS_ORDEN") || "gemini-3.6-flash,gemini-3.5-flash,gemini-3.7-flash,gemini-flash-latest")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
@@ -114,29 +115,7 @@ Deno.serve(async (req: Request) => {
     userId = user.id;
     if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
 
-    const { imageBase64, mimeType, listarModelos } = await req.json();
-
-    // Diagnóstico temporal (solo admin, no cuenta como llamada de OCR real):
-    // ya nos pasó dos veces en el mismo día que un modelo elegido a mano por
-    // nombre (guiándose por blog posts/changelog público de Google) resultó
-    // no estar disponible para ESTA cuenta específica -- "gemini-2.5-flash"
-    // estaba dado de baja, y ahora "gemini-3.1-pro" ni siquiera existe como
-    // ID válido ("not found for API version v1beta"). En vez de seguir
-    // adivinando, esto devuelve la lista REAL de modelos habilitados para
-    // este GEMINI_API_KEY, directo desde la API de Google. Sacar una vez que
-    // se haya usado para corregir GEMINI_MODELS_ORDEN con datos reales.
-    if (listarModelos) {
-      const { data: perfilCaller, error: errPerfilCaller } = await admin.from("profiles").select("rol").eq("id", userId).maybeSingle();
-      if (errPerfilCaller) throw errPerfilCaller;
-      if (perfilCaller?.rol !== "admin") throw new Error("Solo un admin puede listar los modelos.");
-      const respModelos = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
-      const dataModelos = await respModelos.json();
-      if (!respModelos.ok) throw new Error(dataModelos?.error?.message || "Error consultando la lista de modelos de Gemini.");
-      const modelos = (dataModelos?.models || [])
-        .filter((m: any) => (m.supportedGenerationMethods || []).includes("generateContent"))
-        .map((m: any) => ({ name: m.name, displayName: m.displayName }));
-      return new Response(JSON.stringify({ modelos }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-    }
+    const { imageBase64, mimeType } = await req.json();
 
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
