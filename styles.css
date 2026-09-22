@@ -650,6 +650,17 @@ button {
   border-radius: 10px;
   padding: 0;
 }
+/* El botón de tema del topbar (una vez logueado) es uno más de los que ya
+   están en el flujo normal de ".user" (junto a "Usuarios"/"Salir") -- el
+   position:fixed de arriba es solo para cuando el botón está SOLO en una
+   pantalla (login, recuperar contraseña), donde no hay ningún topbar que lo
+   contenga. Sin este reset, el mismo botón quedaba flotando fijo en la
+   esquina de la ventana en vez de junto a "Salir", tapándolo.
+*/
+.topbar .theme-toggle {
+  position: static;
+  box-shadow: none;
+}
 
 .spinner {
   width: 16px; height: 16px; border-radius: 50%;
