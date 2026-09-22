@@ -2335,6 +2335,21 @@ async function llamarOcrRecibo(file) {
   return data;
 }
 
+// Evita que la respuesta de una llamada de OCR vieja pise a una más nueva
+// para el mismo ítem -- puede pasar si la persona reselecciona el archivo
+// (o pulsa "reintenta con IA") mientras la llamada anterior todavía está en
+// vuelo: antes, cualquiera de las dos que respondiera último ganaba, sin
+// importar si correspondía al archivo que en realidad quedó adjunto.
+const ocrGeneracion = new Map();
+function nuevaGeneracionOcr(id) {
+  const gen = (ocrGeneracion.get(id) || 0) + 1;
+  ocrGeneracion.set(id, gen);
+  return gen;
+}
+function esGeneracionVigenteOcr(id, gen) {
+  return ocrGeneracion.get(id) === gen;
+}
+
 // El comprobante ya quedó adjunto en el <input type=file> antes de llamar a
 // esto (fotoInput/fotoInput2 lo retienen aunque el OCR falle -- ver
 // addItemRow / buildSinDocumentoFields), así que reintentar no requiere que
@@ -2358,10 +2373,12 @@ function mostrarErrorOcr(statusEl, err, reintentar) {
 }
 
 async function analizarComprobante(id, file, statusEl) {
+  const gen = nuevaGeneracionOcr(id);
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
     const data = await llamarOcrRecibo(file);
+    if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
 
     if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
     if (data.rut_proveedor) {
@@ -2370,7 +2387,7 @@ async function analizarComprobante(id, file, statusEl) {
       // Si ese RUT ya está en la contabilidad, su razón social real le gana
       // a lo que la IA haya alcanzado a leer de la imagen.
       const nombreReal = await buscarNombreProveedorPorRut(rutFormateado);
-      if (nombreReal) document.getElementById(`${id}-nombreprov`).value = nombreReal;
+      if (nombreReal && esGeneracionVigenteOcr(id, gen)) document.getElementById(`${id}-nombreprov`).value = nombreReal;
     }
     if (data.tipo_documento && TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
       document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
@@ -2378,7 +2395,10 @@ async function analizarComprobante(id, file, statusEl) {
     if (data.nro_documento) document.getElementById(`${id}-folio`).value = data.nro_documento;
     if (data.fecha) document.getElementById(`${id}-venc`).value = data.fecha;
     if (data.descripcion) document.getElementById(`${id}-desc`).value = data.descripcion;
-    if (data.monto) {
+    // Number.isFinite: aunque ocr-recibo ya descarta un monto que no sea un
+    // número válido, un segundo chequeo acá es gratis y evita mostrar
+    // literalmente "NaN" en el campo si algo cambiara del lado del servidor.
+    if (data.monto && Number.isFinite(Number(data.monto))) {
       const montoInput = document.getElementById(`${id}-monto`);
       montoInput.value = Number(data.monto).toLocaleString("es-CL");
     }
@@ -2395,6 +2415,7 @@ async function analizarComprobante(id, file, statusEl) {
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
   } catch (err) {
+    if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
     // Antes se mostraba siempre el mismo mensaje genérico, así que un PDF
     // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
@@ -2443,17 +2464,22 @@ async function mostrarHistorialProveedor(id, nombreProveedor) {
 }
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
+  const gen = nuevaGeneracionOcr(id);
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
     const data = await llamarOcrRecibo(file);
+    if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
 
     if (data.nombre_proveedor) {
       document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
       mostrarHistorialProveedor(id, data.nombre_proveedor);
     }
     if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
-    if (data.monto) {
+    // Number.isFinite: aunque ocr-recibo ya descarta un monto que no sea un
+    // número válido, un segundo chequeo acá es gratis y evita mostrar
+    // literalmente "NaN" en el campo si algo cambiara del lado del servidor.
+    if (data.monto && Number.isFinite(Number(data.monto))) {
       const montoInput = document.getElementById(`${id}-monto2`);
       montoInput.value = Number(data.monto).toLocaleString("es-CL");
     }
@@ -2463,7 +2489,10 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     // persona la confirme o la cambie, nunca se oculta.
     if (data.categoria_sugerida) {
       const catSelect = document.getElementById(`${id}-categoria`);
-      if ([...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+      // El "&&" con catSelect: hoy siempre existe (ver buildSinDocumentoFields),
+      // pero analizarComprobante (su par) sí lo chequea -- consistencia entre
+      // ambas, para no reventar acá si algún día deja de ser cierto.
+      if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
         catSelect.value = data.categoria_sugerida;
         catSelect.dispatchEvent(new Event("change"));
       }
@@ -2473,6 +2502,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
   } catch (err) {
+    if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
     mostrarErrorOcr(statusEl, err, () => analizarComprobanteGastoDirecto(id, file, statusEl));
   }

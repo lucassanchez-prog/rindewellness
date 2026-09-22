@@ -30,7 +30,11 @@ async function requireUser(req: Request) {
   // cuenta desactivada con una sesión todavía viva podía seguir consumiendo
   // la cuota paga de Gemini.
   const asUser = createClient(SUPABASE_URL, ANON_KEY, { global: { headers: { Authorization: authHeader } } });
-  const { data: profile } = await asUser.from("profiles").select("activo").eq("id", data.user.id).maybeSingle();
+  const { data: profile, error: profileErr } = await asUser.from("profiles").select("activo").eq("id", data.user.id).maybeSingle();
+  // Antes esto descartaba el error de la consulta -- si la query fallaba por
+  // cualquier motivo, "profile" quedaba undefined y el chequeo de abajo
+  // dejaba pasar a una cuenta desactivada sin loguear nada. Falla cerrado.
+  if (profileErr) throw profileErr;
   if (profile?.activo === false) throw new Error("Tu cuenta fue desactivada.");
   return data.user;
 }
@@ -112,10 +116,15 @@ Deno.serve(async (req: Request) => {
 
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
-    // paga de Gemini sin control. 40 comprobantes por hora es bastante más
-    // de lo que alguien carga a mano en una rendición real.
+    // paga de Gemini sin control. Un intento fallido (ej. Gemini caído)
+    // cuenta igual que uno exitoso contra este tope -- es decir, durante una
+    // caída real de Gemini, cada reintento de la persona le come cupo por
+    // algo que no es su culpa. 60/hora (subido de 40) deja margen real para
+    // reintentar unas cuantas veces durante un incidente sin llegar a
+    // trabarse, sin dejar de ser un tope muy por encima de lo que alguien
+    // carga a mano en una rendición real.
     const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
-    if (llamadasRecientes >= 40) {
+    if (llamadasRecientes >= 60) {
       throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
     }
     await logEvent(admin, "ocr_call", { usuarioId: userId });
@@ -176,18 +185,47 @@ Deno.serve(async (req: Request) => {
     async function llamarGemini(modelo: string, intentosMax: number, inicio: number) {
       let ultimoError: Error = new Error("Error consultando Gemini");
       for (let intento = 1; intento <= intentosMax; intento++) {
-        const resp = await fetch(geminiUrl(modelo), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const respData = await resp.json();
-        if (resp.ok) return respData;
+        let mensaje: string;
+        let esErrorDeRed = false;
+        try {
+          // Timeout explícito por llamada -- sin esto, un fetch colgado (no
+          // un error de Gemini, sino la red misma sin responder) no cuenta
+          // como intento fallido y se come todo el presupuesto de tiempo sin
+          // pasar nunca al siguiente modelo candidato.
+          const resp = await fetch(geminiUrl(modelo), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(12_000),
+          });
+          const respData = await resp.json();
+          if (resp.ok) return respData;
+          mensaje = respData?.error?.message || "Error consultando Gemini";
+        } catch (errRed) {
+          // fetch()/resp.json() pueden lanzar directo (corte de conexión,
+          // respuesta no-JSON como una página de error HTML del gateway
+          // durante un pico de demanda, timeout del AbortSignal de arriba) --
+          // antes esto se escapaba del reintento Y del paso al siguiente
+          // modelo por completo, así que el caso más común de "Gemini está
+          // fallando" terminaba siendo el peor manejado de todos. Se marca
+          // aparte como retryable (no depende de que el texto del error
+          // matchee esErrorDeModelo, que espera mensajes de Gemini, no
+          // excepciones de red/timeout de fetch).
+          esErrorDeRed = true;
+          mensaje = errRed instanceof Error && errRed.name === "TimeoutError"
+            ? "Tiempo de espera agotado consultando Gemini."
+            : `Error de red consultando Gemini: ${String(errRed instanceof Error ? errRed.message : errRed)}`;
+        }
 
-        const mensaje = respData?.error?.message || "Error consultando Gemini";
         ultimoError = new Error(mensaje);
+        // Se marca en el propio objeto Error (no solo en una variable local)
+        // porque llamarGeminiConCandidatos también necesita saber, al
+        // recibir la excepción de acá, si vale la pena pasar al siguiente
+        // modelo candidato -- un error de red no trae ningún texto que
+        // esErrorDeModelo pueda reconocer por sí solo.
+        (ultimoError as Error & { reintentable?: boolean }).reintentable = esErrorDeRed || esErrorDeModelo(mensaje);
         const tiempoRestante = TIEMPO_MAX_TOTAL_MS - (Date.now() - inicio);
-        if (!esErrorDeModelo(mensaje) || intento === intentosMax || tiempoRestante <= 0) throw ultimoError;
+        if (!(ultimoError as Error & { reintentable?: boolean }).reintentable || intento === intentosMax || tiempoRestante <= 0) throw ultimoError;
         // El error de cuota trae su propio "retry in Ns"; si no lo trae, usamos
         // el backoff normal. Nunca esperamos más que el presupuesto de tiempo
         // que queda, para dejarle margen a los próximos candidatos.
@@ -213,7 +251,11 @@ Deno.serve(async (req: Request) => {
           return await llamarGemini(GEMINI_MODELS_ORDEN[i], i === 0 ? 2 : 1, inicio);
         } catch (err) {
           ultimoError = err instanceof Error ? err : new Error(String(err));
-          if (!esErrorDeModelo(ultimoError.message)) throw ultimoError; // error permanente, no relacionado al modelo: no seguir probando candidatos
+          // .reintentable ya viene calculado desde llamarGemini (cubre tanto
+          // errores de Gemini como de red/timeout); si no está presente
+          // (excepción de otro origen), se recalcula sobre el mensaje.
+          const reintentable = (ultimoError as Error & { reintentable?: boolean }).reintentable ?? esErrorDeModelo(ultimoError.message);
+          if (!reintentable) throw ultimoError; // error permanente, no relacionado al modelo: no seguir probando candidatos
         }
       }
       throw ultimoError;
@@ -244,6 +286,27 @@ Deno.serve(async (req: Request) => {
     // app, se descarta en vez de guardar una categoría inexistente.
     if (parsed.categoria_sugerida && !CATEGORIAS.includes(parsed.categoria_sugerida)) {
       parsed.categoria_sugerida = null;
+    }
+
+    // El prompt le pide a Gemini un número limpio (sin puntos de miles),
+    // pero nada lo obliga a respetarlo -- un monto chileno como "15.000" si
+    // llegara tal cual, sin este chequeo, el frontend lo interpreta como
+    // Number("15.000") = 15 y autocompleta un monto mil veces más chico sin
+    // ningún error visible. Se descarta (no se adivina el formato) en vez de
+    // arriesgar un dato silenciosamente incorrecto.
+    if (parsed.monto !== null && parsed.monto !== undefined && !Number.isFinite(Number(parsed.monto))) {
+      parsed.monto = null;
+    }
+
+    // "200 OK con {} o casi vacío" es un resultado válido para Gemini pero
+    // inútil para la persona, y hasta ahora no quedaba ningún rastro de que
+    // había pasado -- indistinguible de "el comprobante realmente no traía
+    // nada legible" versus "el modelo está degradando en silencio". Se
+    // loguea (no se trata como fallo: la función igual responde 200) para
+    // que quede visibilidad si empieza a pasar seguido.
+    const tieneDatosUtiles = ["nombre_proveedor", "rut_proveedor", "monto", "nro_documento"].some((campo) => parsed[campo]);
+    if (!tieneDatosUtiles) {
+      await logEvent(admin, "ocr_vacio", { usuarioId: userId });
     }
 
     return new Response(JSON.stringify(parsed), {
