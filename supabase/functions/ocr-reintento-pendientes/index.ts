@@ -267,7 +267,13 @@ Deno.serve(async (req: Request) => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
-    const mensaje = String(err instanceof Error ? err.message : err);
+    // Los errores de Postgrest (ej. throw errPend más arriba) son objetos
+    // planos con .message, no instancias de Error -- String(objeto) da
+    // "[object Object]" en vez del mensaje real, así que hay que
+    // extraerlo a mano en vez de solo chequear "instanceof Error".
+    const mensaje = err instanceof Error
+      ? err.message
+      : (typeof err === "object" && err && "message" in err ? String((err as { message: unknown }).message) : String(err));
     if (!/No autorizado/i.test(mensaje)) {
       await logEvent(admin, "ocr_reintento_fail", { detalle: mensaje });
     }
