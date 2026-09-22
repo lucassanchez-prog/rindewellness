@@ -23,6 +23,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent } from "../_shared/logging.ts";
 import { esAprobadorEfectivo } from "../_shared/auth.ts";
+import { construirEmailHTML } from "../_shared/email.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -160,61 +161,34 @@ Deno.serve(async (req: Request) => {
       (rendiciones || []).reduce((s, r) => s + (Number(r.monto_total) || 0), 0) +
       (solicitudes || []).reduce((s, r) => s + (Number(r.monto_solicitado) || 0), 0);
     const montoTotalFmt = "$" + Math.round(montoTotalPendiente).toLocaleString("es-CL");
-    const hoyFmt = new Date().toLocaleDateString("es-CL", { day: "numeric", month: "long", year: "numeric" });
 
-    const html = `
-      <div style="font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background:#eef1f5; padding:32px 16px;">
-        <!-- Texto de vista previa: no se ve en el correo abierto, pero es lo primero que muestra la bandeja de entrada junto al asunto. -->
-        <div style="display:none;max-height:0;overflow:hidden;">${totalPendientes} pendiente(s) por un total de ${montoTotalFmt} esperan revisión.</div>
+    const tablasHtml = `
+      ${rendiciones && rendiciones.length ? `
+        <p style="font-weight:700; font-size:13px; color:#1a1f27; margin:0 0 6px;">Rendiciones (${rendiciones.length})</p>
+        <table style="border-collapse:collapse; width:100%; margin-bottom:22px;">
+          ${cabeceraTabla("Folio")}
+          <tbody>${rendiciones.map(filaRendicion).join("")}</tbody>
+        </table>
+      ` : ""}
 
-        <div style="max-width:600px; margin:0 auto;">
-          <div style="text-align:center;margin-bottom:16px;">
-            <img src="${APP_URL}/assets/logo-gw.png" alt="Grupo Wellness" height="28" style="height:28px;width:auto;" />
-          </div>
-
-          <div style="background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid #e2e8f0; box-shadow:0 1px 2px rgba(28,39,51,0.06);">
-            <div style="background:linear-gradient(135deg,#046bd2,#0456a8); padding:26px 28px;">
-              <p style="margin:0; color:#ffffff; font-size:12px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; opacity:0.8;">RindeWellness</p>
-              <h1 style="margin:6px 0 0; color:#ffffff; font-size:21px;">Resumen de pendientes</h1>
-              <p style="margin:4px 0 0; color:#ffffff; font-size:12.5px; opacity:0.85;">${hoyFmt}</p>
-            </div>
-
-            <div style="padding:26px 28px;">
-              <div style="background:#f4f7fb; border-radius:10px; padding:16px 20px; margin-bottom:24px; display:flex; align-items:center; justify-content:space-between;">
-                <span style="color:#5b6472; font-size:13.5px;">
-                  <strong style="color:#1a1f27; font-size:15px;">${totalPendientes}</strong> esperando revisión<br/>hace más de ${DIAS_PARA_RECORDAR} días
-                </span>
-                <span style="color:#046bd2; font-size:22px; font-weight:700; white-space:nowrap;">${montoTotalFmt}</span>
-              </div>
-
-              ${rendiciones && rendiciones.length ? `
-                <p style="font-weight:700; font-size:13px; color:#1a1f27; margin:0 0 6px;">Rendiciones (${rendiciones.length})</p>
-                <table style="border-collapse:collapse; width:100%; margin-bottom:24px;">
-                  ${cabeceraTabla("Folio")}
-                  <tbody>${rendiciones.map(filaRendicion).join("")}</tbody>
-                </table>
-              ` : ""}
-
-              ${solicitudes && solicitudes.length ? `
-                <p style="font-weight:700; font-size:13px; color:#1a1f27; margin:0 0 6px;">Solicitudes de fondos (${solicitudes.length})</p>
-                <table style="border-collapse:collapse; width:100%; margin-bottom:8px;">
-                  ${cabeceraTabla("Folio")}
-                  <tbody>${solicitudes.map(filaSolicitud).join("")}</tbody>
-                </table>
-              ` : ""}
-
-              <div style="text-align:center; margin-top:26px;">
-                <a href="${APP_URL}/#dashboard" style="display:inline-block; padding:13px 32px; background:#046bd2; color:#ffffff; text-decoration:none; font-weight:700; font-size:14px; border-radius:8px;">Ir a Aprobaciones pendientes</a>
-              </div>
-            </div>
-
-            <div style="background:#f4f7fb; padding:14px 28px; border-top:1px solid #e2e8f0;">
-              <p style="margin:0; color:#9aa4ae; font-size:11px;">Recordatorio manual enviado desde el panel de Usuarios · RindeWellness</p>
-            </div>
-          </div>
-        </div>
-      </div>
+      ${solicitudes && solicitudes.length ? `
+        <p style="font-weight:700; font-size:13px; color:#1a1f27; margin:0 0 6px;">Solicitudes de fondos (${solicitudes.length})</p>
+        <table style="border-collapse:collapse; width:100%; margin-bottom:22px;">
+          ${cabeceraTabla("Folio")}
+          <tbody>${solicitudes.map(filaSolicitud).join("")}</tbody>
+        </table>
+      ` : ""}
     `;
+
+    const html = construirEmailHTML({
+      appUrl: APP_URL,
+      eyebrow: "RESUMEN DE PENDIENTES",
+      saludo: "Estimado(a),",
+      cuerpo: `Hay <strong>${totalPendientes}</strong> pendiente(s) hace más de ${DIAS_PARA_RECORDAR} días, por un total de <strong>${montoTotalFmt}</strong>.`,
+      extraHtml: tablasHtml,
+      botonTexto: "Ir a Aprobaciones pendientes",
+      botonUrl: `${APP_URL}/#dashboard`,
+    });
 
     let resp = await fetch("https://api.resend.com/emails", {
       method: "POST",

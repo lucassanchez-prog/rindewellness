@@ -35,6 +35,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
 import { esAprobadorEfectivo } from "../_shared/auth.ts";
+import { construirEmailHTML } from "../_shared/email.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -226,47 +227,22 @@ Deno.serve(async (req: Request) => {
       ? `Nueva solicitud de fondos pendiente · ${folioFmt} · ${empleado_nombre}`
       : `Nueva rendición pendiente · ${folioFmt} · ${empleado_nombre}`;
     const linkDetalle = `${APP_URL}/#${esSolicitud ? "detalle-solicitud" : "detalle"}/${rendicion_id}`;
-    const hoyFmt = new Date().toLocaleDateString("es-CL", { day: "numeric", month: "long", year: "numeric" });
-    const filaDato = (label: string, valor: string) => `
-      <tr>
-        <td style="padding:9px 0;color:#9aa4ae;font-size:12px;text-transform:uppercase;letter-spacing:0.03em;width:44%;">${label}</td>
-        <td style="padding:9px 0;color:#1a1f27;font-size:14px;font-weight:600;">${valor}</td>
-      </tr>`;
-    const html = `
-      <div style="font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background:#eef1f5; padding:32px 16px;">
-        <div style="max-width:560px; margin:0 auto;">
-          <div style="text-align:center;margin-bottom:16px;">
-            <img src="${APP_URL}/assets/logo-gw.png" alt="Grupo Wellness" height="28" style="height:28px;width:auto;" />
-          </div>
 
-          <div style="background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid #e2e8f0; box-shadow:0 1px 2px rgba(28,39,51,0.06);">
-            <div style="background:linear-gradient(135deg,#046bd2,#0456a8); padding:26px 28px;">
-              <p style="margin:0; color:#ffffff; font-size:12px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; opacity:0.8;">RindeWellness</p>
-              <h1 style="margin:6px 0 0; color:#ffffff; font-size:20px;">${esSolicitud ? "Nueva solicitud de fondos" : "Nueva rendición"} para aprobar</h1>
-              <p style="margin:4px 0 0; color:#ffffff; font-size:12.5px; opacity:0.85;">${hoyFmt}</p>
-            </div>
-
-            <div style="padding:26px 28px;">
-              <table style="border-collapse:collapse; width:100%; margin-bottom:24px;">
-                ${filaDato("Folio", escapeHtml(folioFmt))}
-                ${filaDato("Empleado", escapeHtml(empleado_nombre))}
-                ${filaDato("Empresa", escapeHtml(empresa || "-"))}
-                ${filaDato(esSolicitud ? "Monto solicitado" : "Monto total", montoFmt)}
-                ${comentario ? filaDato(esSolicitud ? "Motivo" : "Comentario", escapeHtml(comentario)) : ""}
-              </table>
-
-              <div style="text-align:center;">
-                <a href="${linkDetalle}" style="display:inline-block; padding:13px 32px; background:#046bd2; color:#ffffff; text-decoration:none; font-weight:700; font-size:14px; border-radius:8px;">Revisar y aprobar</a>
-              </div>
-            </div>
-
-            <div style="background:#f4f7fb; padding:14px 28px; border-top:1px solid #e2e8f0;">
-              <p style="margin:0; color:#9aa4ae; font-size:11px;">RindeWellness · Grupo Wellness</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
+    const html = construirEmailHTML({
+      appUrl: APP_URL,
+      eyebrow: esSolicitud ? "NUEVA SOLICITUD DE FONDOS" : "NUEVA RENDICIÓN PENDIENTE",
+      saludo: "Estimado(a),",
+      cuerpo: `${escapeHtml(empleado_nombre)} envió ${esSolicitud ? "una solicitud de fondos" : "una rendición"} (<strong>${escapeHtml(folioFmt)}</strong>) que está esperando tu revisión.`,
+      filas: [
+        { label: "Folio", valor: escapeHtml(folioFmt), destacado: true },
+        { label: "Empleado", valor: escapeHtml(empleado_nombre) },
+        { label: "Empresa", valor: escapeHtml(empresa || "-") },
+        { label: esSolicitud ? "Monto solicitado" : "Monto total", valor: montoFmt, destacado: true },
+        ...(comentario ? [{ label: esSolicitud ? "Motivo" : "Comentario", valor: escapeHtml(comentario) }] : []),
+      ],
+      botonTexto: "Revisar y aprobar",
+      botonUrl: linkDetalle,
+    });
 
     const { resp, data } = await enviarConFallback(destinatarios, asunto, html);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
