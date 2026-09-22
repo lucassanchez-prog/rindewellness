@@ -170,14 +170,30 @@ Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la list
 const esErrorDeModelo = (mensaje: string) =>
   /high demand|unavailable|overloaded|quota|rate.?limit|no longer available|not found|is not supported|deprecated/i.test(mensaje);
 
-// Tope de tiempo total (sumando todos los modelos candidatos y sus
-// reintentos). En ocr-recibo esto tiene que caber bajo el timeout del
-// frontend (ver conTimeout en llamarOcrRecibo, app.js); en
-// ocr-reintento-pendientes no hay frontend esperando, pero el mismo tope
-// evita que UN comprobante trabado se coma todo el tiempo del lote entero.
-const TIEMPO_MAX_TOTAL_MS = 22_000;
+// Presupuestos de tiempo. OJO, esto ya nos mordió fuerte: el primer valor
+// que se puso acá fue 12s por llamada / 22s en total, elegido "a ojo" sin
+// medir nunca cuánto tarda de verdad una lectura exitosa -- y resultó ser
+// MÁS CORTO que lo que tarda Gemini en leer un documento. El resultado fue
+// que 9 de cada 10 fallos de la tarde eran nuestro propio timeout cortando
+// llamadas que iban en camino, no un problema de Google: con 4 modelos
+// candidatos y 22s totales, ninguno llegaba a tener una oportunidad real.
+//
+// Por eso ahora son configurables por caller, con valores muy distintos:
+//   - En vivo (ocr-recibo): hay una persona mirando el spinner, así que la
+//     prioridad es NO hacerla esperar de más. Vale más darle a UN modelo
+//     una oportunidad de verdad que repartir migajas entre cuatro. Tiene
+//     que caber bajo el timeout del frontend (35s, ver conTimeout en
+//     llamarOcrRecibo, app.js).
+//   - En segundo plano (ocr-reintento-pendientes): no hay nadie esperando.
+//     Puede darse el lujo de esperar lo que Gemini necesite.
+export interface PresupuestoTiempo {
+  porLlamadaMs: number;
+  totalMs: number;
+}
+export const PRESUPUESTO_EN_VIVO: PresupuestoTiempo = { porLlamadaMs: 28_000, totalMs: 30_000 };
+export const PRESUPUESTO_SEGUNDO_PLANO: PresupuestoTiempo = { porLlamadaMs: 45_000, totalMs: 100_000 };
 
-async function llamarGemini(admin: AdminClient | null, modelo: string, intentosMax: number, inicio: number, body: unknown) {
+async function llamarGemini(admin: AdminClient | null, modelo: string, intentosMax: number, inicio: number, body: unknown, presupuesto: PresupuestoTiempo) {
   let ultimoError: Error = new Error("Error consultando Gemini");
   for (let intento = 1; intento <= intentosMax; intento++) {
     let mensaje: string;
@@ -186,12 +202,13 @@ async function llamarGemini(admin: AdminClient | null, modelo: string, intentosM
       // Timeout explícito por llamada -- sin esto, un fetch colgado (no un
       // error de Gemini, sino la red misma sin responder) no cuenta como
       // intento fallido y se come todo el presupuesto de tiempo sin pasar
-      // nunca al siguiente modelo candidato.
+      // nunca al siguiente modelo candidato. Ver PresupuestoTiempo sobre
+      // por qué este número NO puede ser corto "por las dudas".
       const resp = await fetch(geminiUrl(modelo), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(12_000),
+        signal: AbortSignal.timeout(presupuesto.porLlamadaMs),
       });
       const respData = await resp.json();
       if (resp.ok) {
@@ -215,7 +232,7 @@ async function llamarGemini(admin: AdminClient | null, modelo: string, intentosM
     await registrarIntentoModelo(admin, modelo, false);
     ultimoError = new Error(mensaje);
     (ultimoError as Error & { reintentable?: boolean }).reintentable = esErrorDeRed || esErrorDeModelo(mensaje);
-    const tiempoRestante = TIEMPO_MAX_TOTAL_MS - (Date.now() - inicio);
+    const tiempoRestante = presupuesto.totalMs - (Date.now() - inicio);
     if (!(ultimoError as Error & { reintentable?: boolean }).reintentable || intento === intentosMax || tiempoRestante <= 0) throw ultimoError;
     const retrySugerido = /retry in ([\d.]+)s/i.exec(mensaje);
     const esperaSugerida = retrySugerido ? Math.min(Number(retrySugerido[1]) * 1000 + 1000, 3000) : 1200 * intento;
@@ -224,14 +241,21 @@ async function llamarGemini(admin: AdminClient | null, modelo: string, intentosM
   throw ultimoError;
 }
 
-async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknown) {
+async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknown, presupuesto: PresupuestoTiempo) {
   const inicio = Date.now();
   const modelosOrdenados = await ordenarModelosPorRendimiento(admin);
   let ultimoError: Error = new Error("No hay modelos de Gemini configurados (GEMINI_MODELS_ORDEN).");
   for (let i = 0; i < modelosOrdenados.length; i++) {
-    if (Date.now() - inicio >= TIEMPO_MAX_TOTAL_MS) break;
+    // Solo se empieza con otro candidato si queda tiempo para darle una
+    // oportunidad REAL (no arrancar una llamada que vamos a cortar a los 2
+    // segundos -- ese fue justamente el error del presupuesto anterior).
+    const tiempoRestante = presupuesto.totalMs - (Date.now() - inicio);
+    if (tiempoRestante < Math.min(presupuesto.porLlamadaMs, 10_000)) break;
     try {
-      return await llamarGemini(admin, modelosOrdenados[i], i === 0 ? 2 : 1, inicio, body);
+      // Un solo intento por modelo: con el presupuesto de tiempo realista de
+      // ahora, reintentarle dos veces al mismo modelo saturado cuesta más de
+      // lo que rinde -- es mejor gastar ese tiempo en el siguiente candidato.
+      return await llamarGemini(admin, modelosOrdenados[i], 1, inicio, body, presupuesto);
     } catch (err) {
       ultimoError = err instanceof Error ? err : new Error(String(err));
       const reintentable = (ultimoError as Error & { reintentable?: boolean }).reintentable ?? esErrorDeModelo(ultimoError.message);
@@ -259,7 +283,12 @@ export interface ResultadoOcr {
 // opcional: sin él, simplemente no hay estadística ni reordenamiento (cae
 // al orden base) -- así este módulo también se puede usar/testear sin una
 // conexión real a la base si algún día hiciera falta.
-export async function leerComprobante(admin: AdminClient | null, imageBase64: string, mimeType: string): Promise<ResultadoOcr> {
+export async function leerComprobante(
+  admin: AdminClient | null,
+  imageBase64: string,
+  mimeType: string,
+  presupuesto: PresupuestoTiempo = PRESUPUESTO_EN_VIVO,
+): Promise<ResultadoOcr> {
   if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
 
   const body = {
@@ -281,7 +310,7 @@ export async function leerComprobante(admin: AdminClient | null, imageBase64: st
     generationConfig: { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192 },
   };
 
-  const data = await llamarGeminiConCandidatos(admin, body);
+  const data = await llamarGeminiConCandidatos(admin, body, presupuesto);
 
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {

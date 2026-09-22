@@ -57,7 +57,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent } from "../_shared/logging.ts";
-import { leerComprobante } from "../_shared/gemini-ocr.ts";
+import { leerComprobante, PRESUPUESTO_SEGUNDO_PLANO } from "../_shared/gemini-ocr.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -86,13 +86,18 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Pocos ítems por corrida y por cola (no todos los pendientes de una sola
-// vez): cada uno puede tardar hasta ~22s (ver TIEMPO_MAX_TOTAL_MS en
-// gemini-ocr.ts), y las Edge Functions tienen su propio límite de tiempo
-// total de ejecución -- con dos colas activas en la misma corrida, un lote
-// grande en cada una podría superarlo.
-const LOTE_ITEMS = 4;
-const LOTE_PREVIOS = 3;
+// Pocos comprobantes por corrida y por cola: ahora cada uno puede tardar
+// hasta ~100s (presupuesto de segundo plano, ver PresupuestoTiempo en
+// gemini-ocr.ts -- deliberadamente generoso, porque el presupuesto corto
+// anterior era justamente lo que hacía fallar todo), y las Edge Functions
+// tienen su propio límite de tiempo total de ejecución. Estos números son
+// solo el tope de la consulta; el freno real es TIEMPO_MAX_FUNCION_MS de
+// abajo, que corta antes de EMPEZAR un comprobante más si ya no queda
+// margen -- así la corrida nunca muere a la mitad de uno (que lo dejaría
+// contado como intento sin haberlo procesado de verdad).
+const LOTE_ITEMS = 2;
+const LOTE_PREVIOS = 2;
+const TIEMPO_MAX_FUNCION_MS = 110_000;
 // Tope de reintentos por comprobante -- si lleva 6 pasadas sin éxito (con
 // el cron cada 5 min, más de media hora de intentos reales, no solo un par
 // de segundos), probablemente el problema es el documento en sí (ilegible,
@@ -178,7 +183,10 @@ async function procesarPendiente(
     }
     const base64 = arrayBufferToBase64(await archivo.arrayBuffer());
     const mimeType = archivo.type || mimeTypeDesdeNombre(storagePath);
-    const resultado = await leerComprobante(admin, base64, mimeType);
+    // Presupuesto largo: acá no hay nadie mirando un spinner, así que se le
+    // da a Gemini el tiempo que de verdad necesita para leer un documento
+    // (ver PresupuestoTiempo en _shared/gemini-ocr.ts).
+    const resultado = await leerComprobante(admin, base64, mimeType, PRESUPUESTO_SEGUNDO_PLANO);
 
     await admin.from(tabla).update({
       [col.estado]: "listo",
@@ -220,6 +228,8 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    const inicioCorrida = Date.now();
+    const quedaTiempo = () => Date.now() - inicioCorrida < TIEMPO_MAX_FUNCION_MS;
     let procesados = 0;
     let exitosos = 0;
 
@@ -234,6 +244,7 @@ Deno.serve(async (req: Request) => {
     const { data: previos, error: errPrevios } = await consultaPrevios;
     if (errPrevios) throw errPrevios;
     for (const p of previos || []) {
+      if (!quedaTiempo()) break;
       procesados++;
       if (await procesarPendiente(admin, "ocr_previos", p.id as string, p.storage_path as string, (p.intentos as number) || 0, COL_PREVIOS)) exitosos++;
     }
@@ -254,6 +265,7 @@ Deno.serve(async (req: Request) => {
     const { data: pendientes, error: errPend } = await consultaItems;
     if (errPend) throw errPend;
     for (const item of pendientes || []) {
+      if (!quedaTiempo()) break;
       procesados++;
       if (await procesarPendiente(admin, "rendicion_items", item.id as string, item.adjunto_url as string, (item.ocr_reintento_intentos as number) || 0, COL_ITEMS)) exitosos++;
     }

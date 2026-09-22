@@ -2314,12 +2314,15 @@ async function llamarOcrRecibo(file) {
 
   const { data, error } = await conTimeout(
     db.functions.invoke("ocr-recibo", { body: { imageBase64, mimeType: file.type || "image/jpeg" } }),
-    // ocr-recibo ahora puede probar varios modelos de Gemini en cadena antes
-    // de responder (hasta ~22s de presupuesto propio, ver TIEMPO_MAX_TOTAL_MS
-    // en esa función) -- 30s dejaba muy poco margen de red por encima de eso,
-    // así que se sube un poco sin dejar que una API realmente caída deje a
-    // la persona mirando el spinner por más de medio minuto.
-    35000,
+    // Tiene que ser MAYOR que el presupuesto del servidor (PRESUPUESTO_EN_VIVO
+    // en _shared/gemini-ocr.ts, 30s) más el viaje de red -- si no, cortamos
+    // acá justo antes de que la respuesta buena llegue. Sí, 45s de spinner es
+    // harto, pero leer un documento con visión tarda tranquilamente 15-25s:
+    // el timeout corto de antes (30s de acá con 12s por llamada allá)
+    // garantizaba fallar aunque Gemini estuviera respondiendo bien. Si igual
+    // falla, el agente en segundo plano sigue con el archivo (ver
+    // dispararAgenteYEsperar), así que nadie se queda esperando de verdad.
+    45000,
     "Se agotó el tiempo de espera leyendo el comprobante (conexión muy lenta o caída). Completa los datos a mano, o inténtalo de nuevo."
   );
   if (error) {
