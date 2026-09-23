@@ -72,3 +72,24 @@ create index if not exists idx_ocr_previos_pendiente
 -- solo los campos que faltan y fusiona sin pisar lo determinista.
 -- ------------------------------------------------------------
 alter table public.ocr_previos add column if not exists datos_parciales jsonb;
+
+-- ------------------------------------------------------------
+-- contenido_hash: SHA-256 del contenido del archivo, para no encolar el
+-- mismo comprobante más de una vez.
+--
+-- Antes, cada "Reintentar con IA" que volvía a fallar insertaba una fila
+-- nueva con OTRA copia del archivo en Storage, y el agente en segundo plano
+-- reintentaba cada una por separado: la misma factura leída N veces, una por
+-- cada vez que la persona insistió. Contra una cuota de ~20 solicitudes por
+-- modelo AL DÍA, un solo comprobante difícil podía consumir el cupo de toda
+-- la empresa.
+--
+-- El índice es PARCIAL (solo estado='pendiente') a propósito: dos lecturas
+-- del mismo archivo en momentos distintos son legítimas si la primera ya se
+-- resolvió o se agotó; lo que no tiene sentido es tener dos EN COLA a la vez.
+-- ------------------------------------------------------------
+alter table public.ocr_previos add column if not exists contenido_hash text;
+
+create unique index if not exists idx_ocr_previos_dedup_pendiente
+  on public.ocr_previos (usuario_id, contenido_hash)
+  where estado = 'pendiente' and contenido_hash is not null;

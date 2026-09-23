@@ -153,23 +153,70 @@ Deno.serve(async (req: Request) => {
     if (!esRechazoEsperable && userId && imageBase64) {
       try {
         const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
-        const path = `${userId}/previo-${crypto.randomUUID()}`;
+        const parciales = datosParciales && Object.keys(datosParciales).length ? datosParciales : null;
+
+        // Huella del CONTENIDO del archivo, no del nombre ni de la hora. Sin
+        // esto, cada vez que alguien apretaba "Reintentar con IA" y volvía a
+        // fallar se insertaba una fila nueva, con OTRA copia del mismo
+        // archivo en Storage. El agente en segundo plano después reintentaba
+        // todas esas filas por separado -- misma factura, misma lectura,
+        // multiplicada por la cantidad de veces que la persona insistió. Con
+        // una cuota de ~20 solicitudes por modelo al día, un comprobante
+        // difícil se comía el cupo de toda la empresa él solo.
+        const hashBuffer = await crypto.subtle.digest("SHA-256", bytes);
+        const contenidoHash = Array.from(new Uint8Array(hashBuffer))
+          .map((b) => b.toString(16).padStart(2, "0")).join("");
+
+        const { data: yaEncolado, error: errBusca } = await admin
+          .from("ocr_previos")
+          .select("id, storage_path")
+          .eq("usuario_id", userId)
+          .eq("contenido_hash", contenidoHash)
+          .eq("estado", "pendiente")
+          .maybeSingle();
+        if (errBusca) throw errBusca;
+
+        // Se reutiliza la ruta de Storage de la fila que ya existe en vez de
+        // subir otra copia, y se sobreescribe (upsert) para no depender de
+        // que el objeto anterior siga ahí: la limpieza de huérfanos pudo
+        // haberlo borrado, y una fila apuntando a un archivo inexistente se
+        // agota sola sin haber reintentado nunca de verdad.
+        const path = yaEncolado?.storage_path || `${userId}/previo-${crypto.randomUUID()}`;
         const { error: errUpload } = await admin.storage.from("comprobantes").upload(path, bytes, {
           contentType: mimeType || "application/octet-stream",
+          upsert: true,
         });
         if (errUpload) throw errUpload;
-        const { data: previa, error: errInsert } = await admin.from("ocr_previos").insert({
-          usuario_id: userId,
-          storage_path: path,
-          // Lo que la lectura local ya había sacado del texto del PDF. El
-          // agente en segundo plano arranca de acá en vez de releer el
-          // documento entero (ver procesarPendiente).
-          datos_parciales: datosParciales && Object.keys(datosParciales).length ? datosParciales : null,
-        }).select("id").single();
-        if (errInsert) throw errInsert;
-        previaId = previa.id as string;
+
+        if (yaEncolado) {
+          // Los intentos NO se reinician a propósito: si se reiniciaran,
+          // insistir a mano sería una forma de saltarse MAX_INTENTOS y el
+          // comprobante se reintentaría para siempre. Sí se actualizan los
+          // datos parciales, que pueden haber mejorado.
+          const { error: errUpdate } = await admin.from("ocr_previos")
+            .update({ datos_parciales: parciales })
+            .eq("id", yaEncolado.id);
+          if (errUpdate) throw errUpdate;
+          previaId = yaEncolado.id as string;
+        } else {
+          const { data: previa, error: errInsert } = await admin.from("ocr_previos").insert({
+            usuario_id: userId,
+            storage_path: path,
+            contenido_hash: contenidoHash,
+            // Lo que la lectura local ya había sacado del texto del PDF. El
+            // agente en segundo plano arranca de acá en vez de releer el
+            // documento entero (ver procesarPendiente).
+            datos_parciales: parciales,
+          }).select("id").single();
+          if (errInsert) throw errInsert;
+          previaId = previa.id as string;
+        }
       } catch (errEncolar) {
-        console.error("No se pudo encolar el comprobante en ocr_previos:", errEncolar);
+        // Los errores de PostgREST NO son instancias de Error: String(err)
+        // daría "[object Object]" y el log quedaría inservible, que es
+        // exactamente lo que nos dejó a ciegas durante el incidente de cuota.
+        const detalle = (errEncolar as { message?: string })?.message || String(errEncolar);
+        console.error("No se pudo encolar el comprobante en ocr_previos:", detalle);
       }
     }
 
