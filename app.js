@@ -3672,7 +3672,7 @@ async function aplicarResultadoOcrSin(id, data, gen) {
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
-  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
+  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-cuenta`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -3732,6 +3732,22 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   }
 }
 
+// Pone en "Cuenta contable" la cuenta de gasto que corresponde a la
+// categoría elegida. Se llama tanto cuando la persona cambia el desplegable
+// como cuando lo completa el OCR: asignar select.value por código NO dispara
+// el evento "change", así que sin la llamada explícita una categoría
+// sugerida por la IA dejaba la cuenta vacía.
+function sincronizarCuentaDesdeCategoria(id) {
+  const categoria = document.getElementById(`${id}-categoria`)?.value;
+  const campoCuenta = document.getElementById(`${id}-cuenta`);
+  if (!campoCuenta) return;
+  const match = CATEGORIAS_GASTO.find((c) => c.nombre === categoria);
+  // Si se vuelve a "— elegir —" se limpia: dejar la cuenta de la categoría
+  // anterior sería peor que dejarla vacía, porque ya no se corresponde con
+  // nada de lo que hay en pantalla.
+  campoCuenta.value = match ? match.cuenta : "";
+}
+
 function buildSinDocumentoFields(id) {
   const box = el("div", { class: "sin-documento" });
   const rowProv = el("div", { class: "field-row" }, [
@@ -3742,6 +3758,13 @@ function buildSinDocumentoFields(id) {
     fieldSelectCategoria(`${id}-categoria`),
     fieldInput(`${id}-cuenta`, "Cuenta contable", "text", "4.01.03.xx"),
   ]);
+  // La cuenta sale de la categoría, siempre: CATEGORIAS_GASTO ya trae el par
+  // ("Electricidad" -> 4.01.03.06). Aun así este campo era texto libre y
+  // había que tipear el código a mano, teniendo la app el dato exacto -- una
+  // invitación a equivocarse en un número que después tiene que calzar en la
+  // exportación a Kame. Queda editable igual, para el caso raro que no
+  // corresponda a la categoría elegida.
+  row1.querySelector("select").addEventListener("change", () => sincronizarCuentaDesdeCategoria(id));
   // Aviso informativo (no una regla automática): un mismo proveedor puede
   // ser para cosas distintas cada vez (ej. una ferretería: a veces
   // materiales, a veces mantención), así que en vez de forzar la
