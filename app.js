@@ -2495,6 +2495,30 @@ const RE_RUT_EN_TEXTO = /(\d{1,2}\.?\d{3}\.?\d{3}\s*-\s*[\dkK])/g;
 // facturas reales de emisores y maquetados distintos (Supletech/bsale y
 // Rindegastos/simpledte), y cada regla existe porque una versión anterior
 // se equivocó con una de ellas. Ver los comentarios puntuales.
+// El nombre de la contraparte cuando viene rotulado. Pensado sobre todo para
+// los comprobantes que NO son DTE: una transferencia dice "Destinatario
+// Fulano", un voucher dice el comercio, y ninguno trae RUT. El corte contra
+// la siguiente etiqueta conocida es lo que evita arrastrar media pantalla:
+// en el comprobante real el texto seguía con "Cuenta Corriente N° ...".
+function nombreDesdeEtiqueta(t) {
+  const m = /(?:Destinatario|Beneficiario|Comercio|Raz[oó]n\s*Social|Nombre\s*del?\s*(?:comercio|local))\s*:?\s*(.{3,70})/i.exec(t);
+  if (!m) return null;
+  // Se captura ancho y se corta después, en vez de pedirle al regex que se
+  // detenga solo. Un corte perezoso dentro del propio patrón falla en los
+  // dos extremos: si la etiqueta siguiente no está en la lista se pasa de
+  // largo hasta el tope (el voucher devolvía null), y si el nombre es más
+  // corto que el mínimo se lo salta y se come la etiqueta siguiente
+  // ("Destinatario: 4 Cuenta Corriente" devolvía "4 Cuenta Corriente").
+  const SIGUIENTE_ETIQUETA = /\b(Cuenta|RUT|R\.U\.T|Banco|Motivo|Fecha|Giro|Direcci[oó]n|Monto|C[oó]digo|Total|Autorizaci[oó]n|Tarjeta|Terminal|Folio|N[°º])\b/i;
+  const corte = m[1].search(SIGUIENTE_ETIQUETA);
+  const nombre = (corte >= 0 ? m[1].slice(0, corte) : m[1])
+    .replace(/\s+/g, " ").trim().replace(/[.,;:|\-]+$/, "").trim();
+  // Tiene que empezar con letra y traer una palabra de verdad: lo que quede
+  // en puros números o símbolos es ruido de OCR, no un nombre.
+  if (nombre.length < 3 || !/^[A-Za-zÁÉÍÓÚÑÜáéíóúñü]/.test(nombre) || !/[A-Za-zÁÉÍÓÚÑáéíóúñ]{3}/.test(nombre)) return null;
+  return nombre;
+}
+
 function parsearTextoFactura(texto) {
   const t = texto.replace(/\s+/g, " ");
 
@@ -2676,7 +2700,14 @@ function parsearTextoFactura(texto) {
   else if (mTxt && MESES_ES[mTxt[2].toLowerCase()]) fecha = iso(mTxt[3], MESES_ES[mTxt[2].toLowerCase()], mTxt[1]);
 
   return {
-    nombre_proveedor: null, // se resuelve por RUT contra contabilidad, que es más confiable que leerlo del PDF
+    // Normalmente se resuelve por RUT contra contabilidad, que es más
+    // confiable que leerlo del documento. Pero hay comprobantes que no traen
+    // RUT en absoluto -- una transferencia bancaria no identifica
+    // tributariamente a quien recibe la plata, solo lo nombra. Para esos, el
+    // nombre leído es lo único que hay, y alcanza para buscarle el historial
+    // por nombre y sugerir una categoría. En la fusión igual pierde contra
+    // la razón social real de contabilidad cuando sí hay RUT.
+    nombre_proveedor: nombreDesdeEtiqueta(t),
     rut_proveedor: ruts[0] || null,
     tipo_documento,
     nro_documento: mFolio ? mFolio.valor : null,
@@ -2759,23 +2790,50 @@ const ETIQUETA_CAMPO_OCR = {
 // antes a este proveedor, y qué se cargó la última vez en la propia app.
 // Van juntas y en paralelo porque son independientes entre sí y el
 // formulario está esperando.
-async function resolverDatosContables(rut) {
+// La categoría que esta persona usó más veces para un proveedor, buscando
+// por NOMBRE. Es más débil que la que sale de contabilidad por RUT (la
+// comparación es por texto, y el mismo local puede escribirse de dos formas),
+// así que se exige haberlo clasificado al menos dos veces antes de sugerir
+// algo: con una sola vez es una coincidencia, no un patrón.
+async function categoriaMasUsadaPorNombre(nombre) {
+  try {
+    const historial = await buscarHistorialCategoriasProveedor(nombre);
+    if (!historial || historial.length < 2) return null;
+    const conteo = {};
+    historial.forEach((h) => { if (h.categoria) conteo[h.categoria] = (conteo[h.categoria] || 0) + 1; });
+    const top = Object.entries(conteo).sort((a, b) => b[1] - a[1])[0];
+    return top ? top[0] : null;
+  } catch (err) {
+    console.error("No se pudo buscar el historial por nombre:", err);
+    return null;
+  }
+}
+
+async function resolverDatosContables(rut, nombre) {
   const vacio = { rut: null, nombre_proveedor: null, categoria: null, descripcion: null, desdeContabilidad: false };
-  if (!rut) return vacio;
+  // Sin RUT no hay a quién buscarle el historial contable, pero eso no
+  // significa que no se pueda sugerir nada: los comprobantes que no son DTE
+  // (transferencias, vouchers) no traen RUT NUNCA, y antes quedaban sin
+  // proveedor ni categoría por definición, no por no haberse leído bien.
+  // Con el nombre alcanza para mirar cómo clasificó esta misma persona
+  // compras anteriores al mismo destinatario.
+  if (!rut) return nombre ? { ...vacio, nombre_proveedor: nombre, categoria: await categoriaMasUsadaPorNombre(nombre) } : vacio;
   // El RUT se normaliza ANTES de consultar: la lectura local lo saca con
   // puntos ("77.574.911-3") y la IA suele devolverlo pelado ("77574911-3"),
   // pero las dos bases lo guardan en la forma con puntos (es la que escribe
   // aplicarResultadoOcrCon). Sin esto, el mismo proveedor encontraba
   // historial cuando venía del PDF y no cuando venía de una foto.
   const rutFormateado = formatearRut(rut);
-  const [nombre, categoriaContable, previos] = await Promise.all([
+  const [razonSocial, categoriaContable, previos] = await Promise.all([
     buscarNombreProveedorPorRut(rutFormateado),
     buscarCategoriaEnContabilidad(rutFormateado),
     buscarDatosPreviosPorRut(rutFormateado),
   ]);
   return {
     rut: rutFormateado,
-    nombre_proveedor: nombre,
+    // La razón social real de contabilidad le gana al nombre leído del
+    // documento; si el RUT no está en contabilidad, queda el leído.
+    nombre_proveedor: razonSocial || nombre || null,
     categoria: categoriaContable || previos.categoria,
     descripcion: previos.descripcion,
     // Se distingue la categoría que sale de la CONTABILIDAD REAL (años de
@@ -2913,7 +2971,7 @@ async function completarConIA({ id, file, gen, statusEl, local, contable, datos,
     let contableFinal = contable;
     if (!contableFinal || !contableFinal.rut) {
       if (ia && ia.rut_proveedor) {
-        contableFinal = await resolverDatosContables(ia.rut_proveedor);
+        contableFinal = await resolverDatosContables(ia.rut_proveedor, ia.nombre_proveedor || local?.nombre_proveedor);
         if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
       }
     }
@@ -3486,7 +3544,7 @@ async function analizarComprobante(id, file, statusEl) {
       // CONTABILIDAD (con qué cuenta de gasto se registró antes a este
       // proveedor: años de asientos reales) y del historial de la propia
       // app. Es información que no cuesta ni una solicitud de Gemini.
-      const contable = await resolverDatosContables(datosLocales.rut_proveedor);
+      const contable = await resolverDatosContables(datosLocales.rut_proveedor, datosLocales.nombre_proveedor);
       if (!esGeneracionVigenteOcr(id, gen)) return;
 
       const { datos } = fusionarLecturas(datosLocales, null, contable);
@@ -3529,7 +3587,7 @@ async function analizarComprobante(id, file, statusEl) {
     // arreglaba en uno seguía roto en el otro.
     const ia = await llamarOcrRecibo(file, CAMPOS_OCR_CON, {});
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
-    const contableIA = await resolverDatosContables(ia?.rut_proveedor);
+    const contableIA = await resolverDatosContables(ia?.rut_proveedor, ia?.nombre_proveedor);
     if (!esGeneracionVigenteOcr(id, gen)) return;
     const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
     registrarOrigenOcr(id, "ia", datosIA);
@@ -3572,7 +3630,7 @@ async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
   if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return true;
   if (!local) return false;
 
-  const contable = await resolverDatosContables(local.rut_proveedor);
+  const contable = await resolverDatosContables(local.rut_proveedor, local.nombre_proveedor);
   if (!esGeneracionVigenteOcr(id, gen)) return true;
   const { datos } = fusionarLecturas(local, null, contable);
   registrarOrigenOcr(id, "local", datos);
@@ -3682,7 +3740,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     // igual sirve para resolver proveedor, categoría y descripción.
     const datosLocales = await leerPdfLocal(file);
     if (datosLocales) {
-      const contable = await resolverDatosContables(datosLocales.rut_proveedor);
+      const contable = await resolverDatosContables(datosLocales.rut_proveedor, datosLocales.nombre_proveedor);
       if (!esGeneracionVigenteOcr(id, gen)) return;
       const { datos } = fusionarLecturas(datosLocales, null, contable);
       registrarOrigenOcr(id, "local", datos);
@@ -3712,7 +3770,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
 
     const ia = await llamarOcrRecibo(file, CAMPOS_OCR_SIN, {});
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
-    const contableIA = await resolverDatosContables(ia?.rut_proveedor);
+    const contableIA = await resolverDatosContables(ia?.rut_proveedor, ia?.nombre_proveedor);
     if (!esGeneracionVigenteOcr(id, gen)) return;
     const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
     registrarOrigenOcr(id, "ia", datosIA);
