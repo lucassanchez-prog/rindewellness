@@ -2894,8 +2894,19 @@ function totalPorNetoMasIva(importes) {
       const iva = total - neto;
       if (!valores.includes(iva)) continue;
       const ivaEsperado = Math.round(neto * 0.19);
-      // Tolerancia mínima: el IVA se redondea distinto según el emisor.
-      if (Math.abs(iva - ivaEsperado) > Math.max(2, ivaEsperado * 0.01)) continue;
+      // Tolerancia de 2 PESOS, no de un porcentaje. Antes era
+      // max(2, ivaEsperado * 0.01): para un IVA de $2.700 eso daba 27 pesos
+      // de margen, y ese margen alcanzaba para que un total mal leído
+      // encontrara un neto que lo respaldara. Medido sobre el archivo de
+      // Rindegastos: un comprobante de $16.940 se leyó $16.960 y pasó como
+      // CONFIRMADO por aritmética, que es el peor resultado posible -- el
+      // sello de confianza puesto sobre un número equivocado.
+      //
+      // El IVA chileno es round(neto * 0.19) exacto al peso; la holgura solo
+      // existe para absorber cómo redondea cada emisor, y eso nunca son
+      // decenas de pesos. Apretarlo no pierde facturas buenas y saca de
+      // circulación las coincidencias.
+      if (Math.abs(iva - ivaEsperado) > 2) continue;
       if (!mejor || total > mejor.total) mejor = { total, neto, iva };
     }
   }

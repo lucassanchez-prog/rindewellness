@@ -49,6 +49,22 @@ const CASOS_LECTOR = [
     espera: { monto: 47600, monto_origen: "aritmetica", monto_verificado: true },
   },
   {
+    nombre: "neto + IVA que NO cuadran al peso no confirman nada",
+    // Real. Un comprobante de $16.940 se leyó $16.960 y salió CONFIRMADO por
+    // aritmética: la tolerancia era del 1% del IVA, o sea decenas de pesos,
+    // y ese margen alcanzaba para que el total mal leído encontrara un neto
+    // que lo respaldara. Peor que un número suelto equivocado, porque lleva
+    // el sello de confianza encima. Acá el IVA declarado se aparta 20 pesos
+    // del que corresponde a ese neto.
+    texto: "R.U.T. 96.505.760-9 Neto $ 14.235 IVA 19% $ 2.725 TOTAL $ 16.960",
+    espera: { monto_verificado: false },
+  },
+  {
+    nombre: "neto + IVA exactos sí confirman",
+    texto: "R.U.T. 96.505.760-9 Neto $ 14.235 IVA 19% $ 2.705 TOTAL $ 16.940",
+    espera: { monto: 16940, monto_origen: "aritmetica", monto_verificado: true },
+  },
+  {
     nombre: "tres números de referencia que cuadran por casualidad",
     // 136982 - 115277 = 21705, y round(115277 * 0.19) = 21903: entra en la
     // tolerancia. Sin exigir "$" o etiqueta, la aritmética devolvía $136.982
