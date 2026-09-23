@@ -68,7 +68,7 @@
  */
 
 // Reemplaza esto por tu propio secreto largo antes de publicar.
-const SECRETO = "CAMBIA-ESTO-POR-UN-SECRETO-LARGO";
+const SECRETO = "1f17e11053d86b6b5aad287dd2d9eae445a61dc31939cf39ea07628031bff11f";
 
 // Tope de tamaño. Una foto de celular comprimida ronda 1-2 MB; algo mucho
 // más grande es un error de quien llama, y conviene cortarlo acá antes de
@@ -113,11 +113,28 @@ function textoPorOcr(blob) {
   //     sobre el destino.
   //   - La conversión se pide aparte, con convert:true. Sin eso el archivo se
   //     sube tal cual y no hay documento del que leer texto.
-  const archivo = Drive.Files.insert(
-    { title: "ocr-temporal-" + Date.now() },
-    blob,
-    { convert: true, ocr: true, ocrLanguage: "es" }
-  );
+  // Reintento con espera para "User rate limit exceeded for OCR". Google
+  // limita el OCR de Drive por usuario y ese límite salta con facilidad,
+  // incluso en la primera conversión del día. Suele liberarse en segundos,
+  // así que vale esperar antes de darlo por perdido -- pero son POCOS
+  // intentos a propósito: si el límite es real y no un pico, insistir solo
+  // alarga la espera de quien está mirando la pantalla.
+  let archivo = null, ultimoError = null;
+  for (let intento = 0; intento < 3 && !archivo; intento++) {
+    if (intento > 0) Utilities.sleep(2000 * intento);
+    try {
+      archivo = Drive.Files.insert(
+        { title: "ocr-temporal-" + Date.now() },
+        blob,
+        { convert: true, ocr: true, ocrLanguage: "es" }
+      );
+    } catch (err) {
+      ultimoError = err;
+      // Un error que NO es de límite no se reintenta: no va a mejorar solo.
+      if (String((err && err.message) || err).indexOf("rate limit") === -1) throw err;
+    }
+  }
+  if (!archivo) throw ultimoError;
   try {
     return DocumentApp.openById(archivo.id).getBody().getText();
   } finally {
