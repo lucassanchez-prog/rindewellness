@@ -2358,6 +2358,65 @@ function cargarPdfJs() {
   return pdfjsCargando;
 }
 
+// OCR de fotos en el propio navegador, sin API ni cuota. Es la red de
+// seguridad para el caso que antes no tenía ninguna: una foto cuando Gemini
+// no está disponible no daba absolutamente nada, y el cupo gratuito son ~20
+// solicitudes por modelo al día.
+//
+// Es bastante peor que Gemini leyendo fotos, y por eso NO le compite: solo
+// corre cuando la IA ya falló (ver analizarComprobante). Lo que lo hace
+// seguro pese a ser ruidoso es que el texto que produce pasa por el MISMO
+// parsearTextoFactura que los PDF, y ese parser ya valida lo que extrae: el
+// RUT tiene que pasar su dígito verificador y el monto tiene que cuadrar con
+// neto + IVA. Si el OCR distorsiona un dígito, esas dos comprobaciones
+// fallan y se devuelve null -- que es exactamente lo que se quiere, porque
+// un monto equivocado que nadie revisa es peor que un campo vacío.
+const TESSERACT_URL = "https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/7.0.0/tesseract.min.js";
+let tesseractCargando = null;
+
+// Pesa varios MB (motor WASM + datos del idioma español), así que se carga
+// recién cuando de verdad hace falta: nadie que suba PDF lo descarga, y
+// quien sube fotos tampoco mientras la IA esté respondiendo.
+function cargarTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (tesseractCargando) return tesseractCargando;
+  tesseractCargando = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = TESSERACT_URL;
+    s.onload = () => {
+      // Si el script cargó pero no dejó el global, tirar acá adentro dejaría
+      // la promesa colgada para siempre y el ítem clavado en "Analizando".
+      if (window.Tesseract) resolve(window.Tesseract);
+      else reject(new Error("El lector de fotos cargó incompleto."));
+    };
+    s.onerror = () => reject(new Error("No se pudo cargar el lector de fotos."));
+    document.head.appendChild(s);
+  });
+  // Una promesa rechazada quedaba cacheada para siempre: un corte de red
+  // momentáneo dejaba el lector inutilizable por el resto de la sesión.
+  tesseractCargando.catch(() => { tesseractCargando = null; });
+  return tesseractCargando;
+}
+
+async function leerFotoLocal(file) {
+  if (!(file.type || "").startsWith("image/")) return null;
+  try {
+    const tess = await cargarTesseract();
+    const { data } = await tess.recognize(file, "spa");
+    const texto = data?.text || "";
+    if (texto.replace(/\s/g, "").length < 40) return null; // no salió texto legible
+    const datos = parsearTextoFactura(texto);
+    // Umbral de utilidad: sin un RUT válido ni un monto confirmado por
+    // aritmética, lo que haya salido no es lo bastante confiable como para
+    // ponerlo en campos que van a contabilidad. Vale más dejarlos vacíos.
+    if (!datos.rut_proveedor && !datos.monto_verificado) return null;
+    return datos;
+  } catch (err) {
+    console.error("No se pudo leer la foto localmente:", err);
+    return null;
+  }
+}
+
 const MESES_ES = {
   enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
   julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
@@ -2419,7 +2478,11 @@ function parsearTextoFactura(texto) {
   //    resolución del SII ("Res. Ex. N° 80 de 2014"). Ahora se descartan los
   //    números precedidos por esas etiquetas y se prefiere el que viene
   //    pegado al tipo de documento.
-  const RE_FOLIO = /(N[°º]\.?|No\.?|FOLIO|Folio)\s*:?\s*(\d{2,10})\b/g;
+  // La "N" sola (sin ° ni º) está incluida porque el OCR de fotos pierde el
+  // símbolo de grado muy seguido ("FACTURA ELECTRONICA N 136982"). Va en
+  // mayúscula y sin flag "i" en esa alternativa: con "i" volvería a matchear
+  // la palabra "no" y el folio sería cualquier número detrás de un "no".
+  const RE_FOLIO = /(N[°º]\.?|No\.?|N(?=\s+\d)|FOLIO|Folio)\s*:?\s*(\d{2,10})\b/g;
   const ANTES_NO_ES_FOLIO = /(orden\s+de\s+compra|nota\s+de\s+venta|res(?:oluci[oó]n)?\.?\s*ex\.?|cotizaci[oó]n|gu[ií]a\s+de\s+despacho|contrato|pago)\s*$/i;
   const candidatosFolio = [];
   for (const m of t.matchAll(RE_FOLIO)) {
@@ -3343,12 +3406,52 @@ async function analizarComprobante(id, file, statusEl) {
   } catch (err) {
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
+
+    // Último recurso para las FOTOS: hasta acá, una foto con Gemini caído o
+    // sin cuota no dejaba absolutamente nada y la persona tenía que tipear
+    // todo. El OCR local es peor que la IA, pero entre algo verificado y
+    // nada, gana algo. Solo se aplica si pasó los controles de
+    // leerFotoLocal (RUT con dígito verificador válido, o monto que cuadra
+    // con neto + IVA).
+    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrCon, CAMPOS_OCR_CON)) return;
+
     // Antes se mostraba siempre el mismo mensaje genérico, así que un PDF
     // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
     // se veía exactamente igual que cualquier otro problema.
     mostrarErrorOcr(statusEl, err, () => analizarComprobante(id, file, statusEl));
     dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrCon(id, data, g), statusEl);
   }
+}
+
+// Intenta rescatar una foto leyéndola en el navegador cuando la IA ya falló.
+// Devuelve true si logró llenar algo (y entonces el llamador no muestra el
+// error), false si no hubo nada rescatable y hay que seguir con el camino
+// de error de siempre.
+async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
+  if (!(file.type || "").startsWith("image/")) return false;
+  statusEl.textContent = "🪄 La IA no está disponible. Leyendo la foto acá mismo, puede tardar unos segundos...";
+  statusEl.className = "ocr-status show";
+  const local = await leerFotoLocal(file);
+  if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return true;
+  if (!local) return false;
+
+  const contable = await resolverDatosContables(local.rut_proveedor);
+  if (!esGeneracionVigenteOcr(id, gen)) return true;
+  const { datos } = fusionarLecturas(local, null, contable);
+  registrarOrigenOcr(id, "local", datos);
+  await aplicar(id, datos, gen);
+  if (!esGeneracionVigenteOcr(id, gen)) return true;
+
+  // El mensaje dice explícitamente que esto NO lo leyó la IA y qué hay que
+  // mirar. Una lectura de foto hecha acá es bastante menos confiable que la
+  // de un PDF, y presentarla con el mismo "✔ Datos leídos" de siempre sería
+  // esconder esa diferencia justo donde importa.
+  const faltan = camposAPedirOcr(datos, campos).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
+  statusEl.textContent = `⚠ La IA no está disponible, así que la foto se leyó acá mismo, que es menos preciso.`
+    + (datos.monto_verificado ? " El monto igual quedó confirmado (neto + IVA cuadran con el total)." : "")
+    + (faltan.length ? ` Revisa todo y completa a mano: ${faltan.join(", ")}.` : " Revisa todos los campos antes de enviar.");
+  statusEl.className = "ocr-status show";
+  return true;
 }
 
 // Misma IA que en "Con documento", pero para "Gasto directo" (boletas
@@ -3470,6 +3573,9 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   } catch (err) {
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
+    // Mismo respaldo que en "Documento electrónico": una foto sin IA
+    // disponible se lee acá antes de darse por vencido.
+    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrSin, CAMPOS_OCR_SIN)) return;
     mostrarErrorOcr(statusEl, err, () => analizarComprobanteGastoDirecto(id, file, statusEl));
     dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrSin(id, data, g), statusEl);
   }
