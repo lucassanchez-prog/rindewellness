@@ -3583,7 +3583,12 @@ async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
   // mirar. Una lectura de foto hecha acá es bastante menos confiable que la
   // de un PDF, y presentarla con el mismo "✔ Datos leídos" de siempre sería
   // esconder esa diferencia justo donde importa.
-  const faltan = camposAPedirOcr(datos, campos).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
+  // camposFaltantesOcr y no camposAPedirOcr: son preguntas distintas. A la
+  // IA se le pide también el monto cuando está lleno pero sin confirmar,
+  // para contrastarlo; a la PERSONA hay que nombrarle solo lo que quedó
+  // vacío de verdad. Con el otro, el aviso del comprobante de transferencia
+  // decía "completa a mano: ... monto" con el monto correcto ya en el campo.
+  const faltan = camposFaltantesOcr(datos, campos).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
   statusEl.textContent = `⚠ La IA no está disponible, así que la foto se leyó acá mismo, que es menos preciso.`
     + (datos.monto_verificado ? " El monto igual quedó confirmado (neto + IVA cuadran con el total)." : "")
     + (faltan.length ? ` Revisa todo y completa a mano: ${faltan.join(", ")}.` : " Revisa todos los campos antes de enviar.");
