@@ -2382,17 +2382,32 @@ function parsearTextoFactura(texto) {
   const aNumero = (s) => Number(String(s).replace(/\./g, ""));
   const RE_MONTO = "(\\d{1,3}(?:\\.\\d{3})+|\\d{4,})";
 
-  // 1) El importe etiquetado "Total $". El \\$ es obligatorio y "total" va
-  //    como palabra propia: sin eso matcheaba "SUBTOTAL 1577" (un SKU) y
+  // 1) La mejor fuente: el total CONFIRMADO por la propia aritmética del
+  //    documento (neto + IVA = total, con el IVA al 19%). Cuando ese trío
+  //    aparece, el monto deja de ser una heurística -- queda verificado
+  //    contra los subtotales de la factura, que es justo lo que hace falta
+  //    para un dato que termina en contabilidad.
+  const todosLosImportes = [...sinRuts.matchAll(new RegExp(`\\b${RE_MONTO}\\b`, "g"))]
+    .map((m) => aNumero(m[1]))
+    .filter((n) => n >= 1000);
+  const verificado = totalPorNetoMasIva(todosLosImportes);
+  let monto = verificado ? verificado.total : null;
+
+  // 2) Si no cuadra (factura exenta, sin IVA, o subtotales ilegibles), el
+  //    importe etiquetado "Total $". El \\$ es obligatorio y "total" va como
+  //    palabra propia: sin eso matcheaba "SUBTOTAL 1577" (un SKU) y
   //    "Total 2.40 CLF" (texto de una glosa).
-  const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])total\\s*\\(?\\s*\\$\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
-  let monto = mTotal ? aNumero(mTotal[1]) : null;
-  // 2) Si la etiqueta quedó lejos de su valor (pasa en el formato bsale),
-  //    el mayor importe CON SIGNO $ del documento es el total. El "$" es
+  if (!monto) {
+    const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])total\\s*\\(?\\s*\\$\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
+    monto = mTotal ? aNumero(mTotal[1]) : null;
+  }
+  // 3) Último recurso: si la etiqueta quedó lejos de su valor (pasa en el
+  //    formato bsale), el mayor importe CON SIGNO $ del documento. El "$" es
   //    clave: sin él ganaba un número de referencia de la sección
   //    "Referencias a otros Documentos", que era más grande que el total.
+  //    El ":?" cubre los formatos que escriben "Neto $ : 98.103".
   if (!monto) {
-    const candidatos = [...sinRuts.matchAll(new RegExp(`\\$\\s*${RE_MONTO}`, "g"))]
+    const candidatos = [...sinRuts.matchAll(new RegExp(`\\$\\s*:?\\s*${RE_MONTO}`, "g"))]
       .map((m) => aNumero(m[1]))
       .filter((n) => n >= 1000);
     monto = candidatos.length ? Math.max(...candidatos) : null;
@@ -2412,9 +2427,36 @@ function parsearTextoFactura(texto) {
     nro_documento: mFolio ? mFolio[1] : null,
     fecha,
     monto,
+    // true solo cuando el monto se confirmó con neto + IVA = total. Se usa
+    // para decirle a la persona qué revisar: un monto verificado no necesita
+    // segunda mirada, uno deducido sí.
+    monto_verificado: !!verificado,
     descripcion: descripcionDesdeDetalle(t),
     categoria_sugerida: null,
   };
+}
+
+// Busca el trío neto + IVA = total entre los importes del documento, con el
+// IVA al 19% (tolerancia por redondeo). Es la única forma de CONFIRMAR el
+// monto en vez de deducirlo: si los tres números cuadran entre sí, no hay
+// ambigüedad posible sobre cuál era el total. Devuelve null en facturas
+// exentas (sin IVA) o si los subtotales no se pudieron leer, y ahí se cae a
+// las heurísticas de siempre.
+function totalPorNetoMasIva(importes) {
+  const valores = [...new Set(importes)].sort((a, b) => a - b);
+  let mejor = null;
+  for (const total of valores) {
+    for (const neto of valores) {
+      if (neto >= total) continue;
+      const iva = total - neto;
+      if (!valores.includes(iva)) continue;
+      const ivaEsperado = Math.round(neto * 0.19);
+      // Tolerancia mínima: el IVA se redondea distinto según el emisor.
+      if (Math.abs(iva - ivaEsperado) > Math.max(2, ivaEsperado * 0.01)) continue;
+      if (!mejor || total > mejor.total) mejor = { total, neto, iva };
+    }
+  }
+  return mejor;
 }
 
 // Etiquetas que forman la fila de encabezado de la tabla de detalle. Se usan
@@ -2813,15 +2855,19 @@ async function analizarComprobante(id, file, statusEl) {
 
       await aplicarResultadoOcrCon(id, datosLocales, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
-      // Se distingue de dónde salió la categoría: si viene de contabilidad,
+      // Se dice explícitamente si el monto quedó CONFIRMADO por la
+      // aritmética del documento: sirve para dirigir la revisión al dato que
+      // de verdad la necesita, en vez de pedir que se revise todo por igual.
+      const montoOk = datosLocales.monto_verificado ? " Monto confirmado (neto + IVA cuadran con el total)." : "";
+      // También de dónde salió la categoría: si viene de contabilidad,
       // conviene decirlo -- es un dato más fuerte que el historial de la app
       // y ayuda a que la persona decida si confiar en él o cambiarlo.
       if (categoriaContable) {
-        statusEl.textContent = `✔ Datos leídos del PDF. Categoría sugerida: "${categoriaContable}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalo antes de enviar.`;
+        statusEl.textContent = `✔ Datos leídos del PDF.${montoOk} Categoría sugerida: "${categoriaContable}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalo antes de enviar.`;
       } else if (previos.categoria || previos.descripcion) {
-        statusEl.textContent = "✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor. Revísalos antes de enviar.";
+        statusEl.textContent = `✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor.${montoOk} Revísalos antes de enviar.`;
       } else {
-        statusEl.textContent = "✔ Datos leídos del PDF de la factura. Revísalos antes de enviar.";
+        statusEl.textContent = `✔ Datos leídos del PDF de la factura.${montoOk} Revísalos antes de enviar.`;
       }
       statusEl.className = "ocr-status show ok";
       return;
