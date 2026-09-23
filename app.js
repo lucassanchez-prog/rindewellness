@@ -2429,12 +2429,46 @@ async function prepararImagenParaOcr(file) {
   }
 }
 
+// OCR de Google Drive, vía un Apps Script de la cuenta del usuario (ver
+// apps_script_ocr_drive.gs y la función ocr-drive). Es gratis y lee bastante
+// mejor que Tesseract, así que se intenta ANTES. Si no está configurado o
+// falla, se sigue con Tesseract sin molestar a nadie: es una mejora de la
+// materia prima, no un requisito.
+//
+// Devuelve solo TEXTO. Qué significa cada número lo decide igual
+// parsearTextoFactura, con las mismas reglas y las mismas defensas.
+async function textoPorOcrDeDrive(file) {
+  try {
+    const imageBase64 = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).split(",")[1] || "");
+      r.onerror = () => reject(new Error("No se pudo leer el archivo."));
+      r.readAsDataURL(file);
+    });
+    const { data, error } = await conTimeout(
+      db.functions.invoke("ocr-drive", { body: { imageBase64, mimeType: file.type || "image/jpeg" } }),
+      50000,
+      "Tiempo de espera agotado en el OCR de Drive.",
+    );
+    if (error) return null;
+    return (data && data.texto) || null;
+  } catch (err) {
+    console.error("OCR de Drive no disponible, se usa el lector del navegador:", err);
+    return null;
+  }
+}
+
 async function leerFotoLocal(file) {
   if (!(file.type || "").startsWith("image/")) return null;
   try {
-    const tess = await cargarTesseract();
-    const { data } = await tess.recognize(await prepararImagenParaOcr(file), "spa");
-    const texto = data?.text || "";
+    const preparada = await prepararImagenParaOcr(file);
+    // Primero Drive (mejor lectura), Tesseract como respaldo del respaldo.
+    let texto = await textoPorOcrDeDrive(preparada);
+    if (!texto || texto.replace(/\s/g, "").length < 40) {
+      const tess = await cargarTesseract();
+      const { data } = await tess.recognize(preparada, "spa");
+      texto = data?.text || "";
+    }
     if (texto.replace(/\s/g, "").length < 40) return null; // no salió texto legible
     const datos = parsearTextoFactura(texto);
     // Umbral de utilidad: hace falta AL MENOS un dato con respaldo propio.
