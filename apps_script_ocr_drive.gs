@@ -105,10 +105,18 @@ function doPost(e) {
  * lee el texto y borra el temporal.
  */
 function textoPorOcr(blob) {
+  // OJO con estos parámetros, es el punto donde esto falla si se toca:
+  //   - El "resource" NO lleva mimeType de documento de Google. Pedirle a
+  //     Drive que cree directamente un Doc Y ADEMÁS que aplique OCR falla con
+  //     "OCR is not supported for files of type application/vnd.google-apps.document":
+  //     el OCR se aplica sobre el archivo ORIGINAL (la imagen o el PDF), no
+  //     sobre el destino.
+  //   - La conversión se pide aparte, con convert:true. Sin eso el archivo se
+  //     sube tal cual y no hay documento del que leer texto.
   const archivo = Drive.Files.insert(
-    { title: "ocr-temporal-" + Date.now(), mimeType: "application/vnd.google-apps.document" },
+    { title: "ocr-temporal-" + Date.now() },
     blob,
-    { ocr: true, ocrLanguage: "es" }
+    { convert: true, ocr: true, ocrLanguage: "es" }
   );
   try {
     return DocumentApp.openById(archivo.id).getBody().getText();
