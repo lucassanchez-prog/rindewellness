@@ -2447,6 +2447,71 @@ async function buscarDatosPreviosPorRut(rutProveedor) {
   return { categoria, descripcion };
 }
 
+// Categoría deducida de la CONTABILIDAD REAL: con qué cuenta de gasto se
+// contabilizó históricamente a este proveedor. Es la mejor fuente que hay --
+// son años de asientos hechos por el área contable, contra los pocos ítems
+// que pueda tener la app.
+//
+// El detalle importante: filtrar movimientos por el RUT del proveedor NO
+// devuelve la cuenta de gasto. Por partida doble, la compra genera dos
+// líneas -- el gasto (4.01.03.xx) y el pasivo (2.01.07.01 Proveedores
+// Nacionales) -- y solo esta última lleva la ficha del proveedor. Hay que
+// saltar del proveedor a su comprobante, y del comprobante a la línea de
+// gasto del mismo asiento. Además el número de comprobante se repite entre
+// empresas, así que hay que cruzar por empresa también o se mezclan asientos
+// ajenos (probado: sin ese filtro aparecían "Banco Santander" y "Comisión
+// Transbank" de otras empresas).
+const cacheCategoriaContable = new Map();
+
+async function buscarCategoriaEnContabilidad(rut) {
+  if (!rut || !dbContabilidad) return null;
+  if (cacheCategoriaContable.has(rut)) return cacheCategoriaContable.get(rut);
+  try {
+    const { data: lineasProveedor } = await dbContabilidad
+      .from("movimientos")
+      .select(`${MOVIMIENTOS_COLS.comprobante}, ${MOVIMIENTOS_COLS.empresa}`)
+      .eq(MOVIMIENTOS_COLS.rutFicha, rut)
+      .not(MOVIMIENTOS_COLS.comprobante, "is", null)
+      .limit(25);
+    if (!lineasProveedor?.length) { cacheCategoriaContable.set(rut, null); return null; }
+
+    const comprobantesPorEmpresa = {};
+    lineasProveedor.forEach((l) => {
+      const empresa = l[MOVIMIENTOS_COLS.empresa];
+      (comprobantesPorEmpresa[empresa] ||= new Set()).add(l[MOVIMIENTOS_COLS.comprobante]);
+    });
+
+    // En paralelo, no en serie: un proveedor puede aparecer en varias de las
+    // ~10 empresas del grupo, y encadenar una consulta por cada una hace que
+    // el formulario espere de más justo cuando se cargan varias facturas.
+    const resultados = await Promise.all(
+      Object.entries(comprobantesPorEmpresa).map(([empresa, comprobantes]) =>
+        dbContabilidad
+          .from("movimientos")
+          .select(MOVIMIENTOS_COLS.cuentaCod)
+          .eq(MOVIMIENTOS_COLS.empresa, empresa)
+          .in(MOVIMIENTOS_COLS.comprobante, [...comprobantes].slice(0, 15))
+          .limit(200)
+      )
+    );
+
+    const conteo = {};
+    resultados.forEach(({ data }) => {
+      (data || []).forEach((m) => {
+        const cod = m[MOVIMIENTOS_COLS.cuentaCod];
+        if (String(cod || "").startsWith("4.01.03")) conteo[cod] = (conteo[cod] || 0) + 1;
+      });
+    });
+
+    const codGanador = Object.entries(conteo).sort((a, b) => b[1] - a[1])[0]?.[0];
+    const categoria = codGanador ? (CATEGORIAS_GASTO.find((c) => c.cuenta === codGanador)?.nombre || null) : null;
+    cacheCategoriaContable.set(rut, categoria);
+    return categoria;
+  } catch {
+    return null;
+  }
+}
+
 // El folio a veces no se puede sacar del texto del PDF porque su etiqueta
 // ("Nº") queda separada del número en el flujo. Pero los sistemas de
 // facturación suelen ponerlo en el NOMBRE del archivo ("Factura N9893
@@ -2677,19 +2742,30 @@ async function analizarComprobante(id, file, statusEl) {
       // El folio, cuando no se pudo leer del texto, suele venir en el nombre
       // del archivo.
       if (!datosLocales.nro_documento) datosLocales.nro_documento = folioDesdeNombreArchivo(file.name);
-      // Categoría y descripción no salen del PDF, pero sí del historial de
-      // este mismo proveedor -- así el aprobador igual recibe su sugerencia
-      // de cuenta contable aunque la IA no haya intervenido en nada.
-      const previos = await buscarDatosPreviosPorRut(datosLocales.rut_proveedor);
-      datosLocales.categoria_sugerida = previos.categoria;
+      // Categoría y descripción no salen del PDF. La categoría se busca
+      // primero en la CONTABILIDAD (con qué cuenta de gasto se registró
+      // antes a este proveedor: años de asientos reales) y, si ahí no hay
+      // nada, en el historial de la propia app. La descripción sale del
+      // último ítem cargado para este proveedor.
+      const [categoriaContable, previos] = await Promise.all([
+        buscarCategoriaEnContabilidad(datosLocales.rut_proveedor),
+        buscarDatosPreviosPorRut(datosLocales.rut_proveedor),
+      ]);
+      datosLocales.categoria_sugerida = categoriaContable || previos.categoria;
       datosLocales.descripcion = previos.descripcion;
 
       await aplicarResultadoOcrCon(id, datosLocales, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
-      const conHistorial = previos.categoria || previos.descripcion;
-      statusEl.textContent = conHistorial
-        ? "✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor. Revísalos antes de enviar."
-        : "✔ Datos leídos del PDF de la factura. Revísalos antes de enviar.";
+      // Se distingue de dónde salió la categoría: si viene de contabilidad,
+      // conviene decirlo -- es un dato más fuerte que el historial de la app
+      // y ayuda a que la persona decida si confiar en él o cambiarlo.
+      if (categoriaContable) {
+        statusEl.textContent = `✔ Datos leídos del PDF. Categoría sugerida: "${categoriaContable}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalo antes de enviar.`;
+      } else if (previos.categoria || previos.descripcion) {
+        statusEl.textContent = "✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor. Revísalos antes de enviar.";
+      } else {
+        statusEl.textContent = "✔ Datos leídos del PDF de la factura. Revísalos antes de enviar.";
+      }
       statusEl.className = "ocr-status show ok";
       return;
     }
