@@ -89,26 +89,36 @@ async function registrarIntentoModelo(admin: AdminClient | null, modelo: string,
   if (!admin) return;
   try {
     const ahora = new Date();
-    const { data: fila } = await admin.from("gemini_modelo_stats").select("intentos_ok, intentos_fail").eq("modelo", modelo).maybeSingle();
     // Si el fallo fue por cuota, se anota hasta cuándo no vale la pena
     // volver a llamarlo -- ver ordenarModelosPorRendimiento, que directamente
-    // lo saca de la lista hasta esa hora. Un éxito limpia el enfriamiento.
+    // lo saca de la lista hasta esa hora.
     const enfriamiento = !exito && mensajeError && esErrorDeCuota(mensajeError)
       ? new Date(ahora.getTime() + calcularEnfriamiento(mensajeError)).toISOString()
       : null;
-    await admin.from("gemini_modelo_stats").upsert({
-      modelo,
-      intentos_ok: (fila?.intentos_ok || 0) + (exito ? 1 : 0),
-      intentos_fail: (fila?.intentos_fail || 0) + (exito ? 0 : 1),
-      ultimo_resultado: exito ? "ok" : "fail",
-      ultimo_intento: ahora.toISOString(),
+    // Vía RPC y no con select + upsert desde acá, por dos motivos que la
+    // versión anterior tenía mal:
+    //  - Los contadores se leían y se volvían a escribir en dos pasos, así
+    //    que dos invocaciones concurrentes (que es lo normal: la lectura en
+    //    vivo y el agente de segundo plano corren a la vez) se pisaban los
+    //    incrementos entre sí. Ahora el incremento pasa entero dentro de la
+    //    base, en una sola sentencia.
+    //  - "disponible_desde" se escribía SIEMPRE, con null cuando el fallo no
+    //    era de cuota. Es decir, un timeout o un error de red cualquiera
+    //    BORRABA un enfriamiento activo, y el modelo que estaba sin cuota
+    //    volvía a la lista para gastar solicitudes en recibir el mismo
+    //    rechazo. Ahora el éxito lo limpia, un fallo de cuota lo fija, y
+    //    cualquier otro fallo lo deja como estaba.
+    const { error } = await admin.rpc("registrar_intento_gemini", {
+      p_modelo: modelo,
+      p_exito: exito,
       // El mensaje crudo POR MODELO. Sin esto solo quedaba en console.error
       // de la Edge Function (que no se puede consultar desde acá), y hubo
       // que deducir qué estaba fallando mirando los tiempos entre intentos
       // -- costó horas de diagnóstico a ciegas.
-      ultimo_error: exito ? null : (mensajeError || null),
-      disponible_desde: enfriamiento,
+      p_error: mensajeError || null,
+      p_enfriamiento: enfriamiento,
     });
+    if (error) throw error;
   } catch (err) {
     console.error(`No se pudo registrar estadística de Gemini para ${modelo}:`, err);
   }

@@ -114,3 +114,78 @@ select cron.schedule(
 -- Verificación rápida: esto debería devolver una fila con
 -- jobname='ocr-reintento-pendientes' y schedule='*/5 * * * *'.
 -- select * from cron.job where jobname = 'ocr-reintento-pendientes';
+
+-- ------------------------------------------------------------
+-- registrar_intento_gemini: el incremento de estadística, atómico.
+--
+-- Antes esto se hacía desde la Edge Function con un select seguido de un
+-- upsert, y tenía dos problemas:
+--   1. Dos invocaciones concurrentes (la lectura en vivo y el agente de
+--      segundo plano corren a la vez de forma rutinaria) leían el mismo
+--      contador y se pisaban el incremento.
+--   2. disponible_desde se escribía SIEMPRE, con null cuando el fallo no era
+--      de cuota -- o sea que un timeout cualquiera BORRABA el enfriamiento de
+--      un modelo que estaba sin cuota, y volvía a la lista a gastar
+--      solicitudes para recibir el mismo rechazo.
+--
+-- Acá el éxito limpia el enfriamiento, un fallo de cuota lo fija, y cualquier
+-- otro fallo lo deja como estaba.
+-- ------------------------------------------------------------
+create or replace function public.registrar_intento_gemini(
+  p_modelo text,
+  p_exito boolean,
+  p_error text,
+  p_enfriamiento timestamptz
+) returns void
+language sql
+security definer
+set search_path = public
+as $$
+  insert into public.gemini_modelo_stats as g (
+    modelo, intentos_ok, intentos_fail, ultimo_resultado, ultimo_intento,
+    ultimo_error, disponible_desde, updated_at
+  ) values (
+    p_modelo,
+    case when p_exito then 1 else 0 end,
+    case when p_exito then 0 else 1 end,
+    case when p_exito then 'ok' else 'fail' end,
+    now(),
+    case when p_exito then null else p_error end,
+    p_enfriamiento,
+    now()
+  )
+  on conflict (modelo) do update set
+    intentos_ok   = g.intentos_ok   + case when p_exito then 1 else 0 end,
+    intentos_fail = g.intentos_fail + case when p_exito then 0 else 1 end,
+    ultimo_resultado = case when p_exito then 'ok' else 'fail' end,
+    ultimo_intento = now(),
+    ultimo_error = case when p_exito then null else p_error end,
+    disponible_desde = case
+      when p_exito then null                      -- respondió: ya no hay por qué enfriarlo
+      when p_enfriamiento is not null then p_enfriamiento
+      else g.disponible_desde                     -- fallo NO de cuota: no tocar
+    end,
+    updated_at = now();
+$$;
+
+-- Solo las Edge Functions (service role) la llaman; nadie más necesita poder
+-- escribir estadística de modelos.
+revoke execute on function public.registrar_intento_gemini(text, boolean, text, timestamptz) from public, anon, authenticated;
+
+-- ------------------------------------------------------------
+-- Procedencia y confiabilidad del dato, guardadas junto al ítem.
+--
+--   monto_verificado: el total se confirmó con la aritmética del propio
+--     documento (neto + IVA = total, IVA 19%). Quien aprueba necesita poder
+--     distinguir eso de un monto deducido por heurística; hasta ahora se
+--     mostraba en pantalla al cargar y se perdía.
+--   ocr_origen: de dónde salieron los datos ('local', 'ia', 'local+ia').
+--     Sin esto no había forma de notar que el parser local se degradó (ej.
+--     un proveedor cambió el formato de su factura): simplemente empezarían
+--     a llegar más comprobantes a la IA, se acabaría la cuota antes y nadie
+--     sabría por qué. Se guarda acá, junto al ítem, en vez de con una
+--     llamada de red aparte: no cuesta ninguna solicitud extra.
+-- ------------------------------------------------------------
+alter table public.rendicion_items add column if not exists monto_verificado boolean;
+alter table public.rendicion_items add column if not exists ocr_origen text
+  check (ocr_origen in ('local', 'ia', 'local+ia'));

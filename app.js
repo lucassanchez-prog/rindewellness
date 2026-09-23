@@ -2048,6 +2048,8 @@ function openNuevaRendicion(pushHistory = true) {
   //    segundo plano nunca lo toma, sin ninguna señal visible.
   ocrGeneracion.clear();
   ocrExitoso.clear();
+  ocrOrigen.clear();
+  ocrMonto.clear();
   addItemRow();
   if (pushHistory) pushView("view-nueva"); else show("view-nueva");
 }
@@ -2737,9 +2739,14 @@ async function completarConIA({ id, file, gen, statusEl, local, contable, datos,
       }
     }
 
-    const { aporteIA, avisos } = fusionarLecturas(local, ia, contableFinal);
+    const { datos: fusion, aporteIA, avisos } = fusionarLecturas(local, ia, contableFinal);
     await aplicar(id, aporteIA, gen);
     if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+    // La IA aportó algo: queda registrado como origen mixto. Y el monto pudo
+    // pasar a confirmado justo acá, si los dos lectores leyeron el mismo
+    // total -- dos fuentes independientes que coinciden valen tanto como la
+    // aritmética del documento.
+    registrarOrigenOcr(id, local ? "local+ia" : "ia", fusion);
 
     // Una discrepancia de monto se come el mensaje entero: es lo único que
     // hay que mirar antes de enviar, y mezclarlo con "la IA completó el
@@ -3042,6 +3049,37 @@ function estadoReintentoOcr(id, huecos) {
   return huecos.some((v) => !v) ? "pendiente" : null;
 }
 
+// De dónde salieron los datos de cada ítem ("local", "ia", "local+ia") y si
+// el monto quedó confirmado por la aritmética del documento. Se guardan con
+// el ítem al enviar la rendición, y sirven para dos cosas distintas:
+//  - Quien aprueba puede distinguir un total CONFIRMADO contra los
+//    subtotales de la factura de uno deducido por heurística.
+//  - Permite notar que el parser local se degradó. Si un proveedor cambia el
+//    formato de su factura, lo único que se vería sin esto es que la cuota
+//    de Gemini se acaba antes, sin ninguna explicación; con esto se puede
+//    consultar cuántos ítems vienen de cada origen y cuándo cambió.
+// Va acá, en un dato que ya se guarda igual, y no en una llamada de red
+// aparte: no cuesta ninguna solicitud extra.
+const ocrOrigen = new Map();
+// id -> { verificado: boolean, monto: number } con el monto que dejó el OCR.
+// Se guarda el monto además del flag porque si la persona lo corrige a mano
+// después, "verificado" dejaría de ser cierto: se compara al enviar.
+const ocrMonto = new Map();
+
+function registrarOrigenOcr(id, origen, datos) {
+  ocrOrigen.set(id, origen);
+  ocrMonto.set(id, { verificado: !!datos.monto_verificado, monto: datos.monto || null });
+}
+
+// "Verificado" describe el monto que leyó el OCR, no el que finalmente se
+// envía. Si la persona lo corrigió a mano, ese respaldo aritmético ya no
+// aplica al número que va a contabilidad, y marcarlo igual sería peor que no
+// marcar nada: quien aprueba confiaría en una confirmación que no existe.
+function montoSigueVerificado(id, montoEnviado) {
+  const reg = ocrMonto.get(id);
+  return !!(reg && reg.verificado && reg.monto === montoEnviado);
+}
+
 // El comprobante ya quedó adjunto en el <input type=file> antes de llamar a
 // esto (fotoInput/fotoInput2 lo retienen aunque el OCR falle -- ver
 // addItemRow / buildSinDocumentoFields), así que reintentar no requiere que
@@ -3252,6 +3290,7 @@ async function analizarComprobante(id, file, statusEl) {
       if (!esGeneracionVigenteOcr(id, gen)) return;
 
       const { datos } = fusionarLecturas(datosLocales, null, contable);
+      registrarOrigenOcr(id, "local", datos);
       await aplicarResultadoOcrCon(id, datos, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
       // Se dice explícitamente si el monto quedó CONFIRMADO por la
@@ -3293,6 +3332,7 @@ async function analizarComprobante(id, file, statusEl) {
     const contableIA = await resolverDatosContables(ia?.rut_proveedor);
     if (!esGeneracionVigenteOcr(id, gen)) return;
     const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
+    registrarOrigenOcr(id, "ia", datosIA);
     await aplicarResultadoOcrCon(id, datosIA, gen);
     if (!esGeneracionVigenteOcr(id, gen)) return;
 
@@ -3390,8 +3430,8 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     if (datosLocales) {
       const contable = await resolverDatosContables(datosLocales.rut_proveedor);
       if (!esGeneracionVigenteOcr(id, gen)) return;
-
       const { datos } = fusionarLecturas(datosLocales, null, contable);
+      registrarOrigenOcr(id, "local", datos);
       await aplicarResultadoOcrSin(id, datos, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
 
@@ -3421,6 +3461,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     const contableIA = await resolverDatosContables(ia?.rut_proveedor);
     if (!esGeneracionVigenteOcr(id, gen)) return;
     const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
+    registrarOrigenOcr(id, "ia", datosIA);
     await aplicarResultadoOcrSin(id, datosIA, gen);
     if (!esGeneracionVigenteOcr(id, gen)) return;
 
@@ -3785,6 +3826,8 @@ async function submitRendicion() {
           document.getElementById(`${id}-folio`).value.trim(),
           document.getElementById(`${id}-desc`).value.trim(),
         ]),
+        ocr_origen: ocrOrigen.get(id) || null,
+        monto_verificado: montoSigueVerificado(id, monto),
         _fotoInput: fotoInput,
       });
     } else {
@@ -3817,6 +3860,8 @@ async function submitRendicion() {
         ocr_reintento_estado: estadoReintentoOcr(id, [
           document.getElementById(`${id}-desc2`).value.trim(),
         ]),
+        ocr_origen: ocrOrigen.get(id) || null,
+        monto_verificado: montoSigueVerificado(id, monto),
         _fotoInput: fotoInput2,
       });
     }
