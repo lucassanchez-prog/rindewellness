@@ -706,17 +706,20 @@ async function loadDashboard() {
   dashboardData.solicitudesMias = solicitudesMias || [];
 
   if (esAprobadorEfectivo(currentProfile)) {
-    // El admin (usuario maestro) ve todas las rendiciones de todo el grupo;
-    // un aprobador normal (o un delegado temporal) solo ve las pendientes
-    // de aprobar.
-    let query = db.from("rendiciones").select("*");
-    query = currentProfile.rol === "admin"
-      ? query.order("created_at", { ascending: false })
-      : query.eq("estado", "Pendiente").order("created_at", { ascending: true });
-    const { data: pendientes } = await query;
-    dashboardData.aprobaciones = pendientes || [];
-    document.getElementById("tab-aprobaciones").textContent =
-      currentProfile.rol === "admin" ? "Todas las rendiciones" : "Aprobaciones pendientes";
+    // Aprobadores y admin ven TODAS las rendiciones del grupo, en cualquier
+    // estado. Antes un aprobador solo recibía las que estaban Pendiente, y
+    // eso le tapaba justamente el contexto con el que se aprueba bien: qué
+    // se le aprobó antes a esa persona, si un gasto parecido ya había
+    // pasado, qué se rechazó y por qué. Para volver a la cola de trabajo
+    // está el filtro por estado de la misma vista (ver
+    // applyDashboardFilters), que es una elección de quien mira y no algo
+    // impuesto por la consulta.
+    //
+    // La base ya lo permitía: la policy rendiciones_select habilita a
+    // 'aprobador' y 'admin' por igual. El límite era solo de la app.
+    const { data: todas } = await db.from("rendiciones").select("*").order("created_at", { ascending: false });
+    dashboardData.aprobaciones = todas || [];
+    document.getElementById("tab-aprobaciones").textContent = "Todas las rendiciones";
 
     let querySolicitudes = db.from("solicitudes_fondos").select("*");
     querySolicitudes = currentProfile.rol === "admin"
