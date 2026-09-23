@@ -60,7 +60,11 @@ const CENTROS_COSTO_POR_EMPRESA = {
 const TIPOS_DOCUMENTO = ["Factura Electrónica", "Factura Exenta Electrónica", "Boleta de Honorario"];
 
 function tipoItemLabel(tipoItem) {
-  return tipoItem === "ConDocumento" ? "Documento electrónico" : "Boleta";
+  // "Comprobante/Boleta" y no solo "Boleta": por acá entra cualquier
+  // respaldo de gasto que no sea un documento tributario electrónico
+  // (vouchers, comprobantes de transferencia, boletas de papel), y decir
+  // solo "Boleta" hacía dudar de dónde cargar el resto.
+  return tipoItem === "ConDocumento" ? "Documento electrónico" : "Comprobante/Boleta";
 }
 
 const CUENTA_POR_TIPO_DOC = {
@@ -2082,7 +2086,7 @@ function addItemRow() {
 
   const toggle = el("div", { class: "toggle-group", role: "tablist" }, [
     el("button", { type: "button", class: "active", "data-tipo": "ConDocumento", "aria-pressed": "true" }, "Documento electrónico"),
-    el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Boleta"),
+    el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Comprobante/Boleta"),
   ]);
 
   const bodyConDoc = buildConDocumentoFields(id);
@@ -2408,9 +2412,43 @@ function parsearTextoFactura(texto) {
     nro_documento: mFolio ? mFolio[1] : null,
     fecha,
     monto,
-    descripcion: null,
+    descripcion: descripcionDesdeDetalle(t),
     categoria_sugerida: null,
   };
+}
+
+// Etiquetas que forman la fila de encabezado de la tabla de detalle. Se usan
+// para dos cosas: saber dónde empieza el detalle y limpiar los restos que
+// queden mezclados con los productos.
+const CABECERA_DETALLE = String.raw`(?:SKU|ITEM|Item|Detalle|Descripci[oó]n|VALOR\s*UNITARIO|P\.?\s*unitario|Precio|CANTIDAD|Cant\.?|%?\s*Descuento|SUBTOTAL|Total\s*item)`;
+
+// Descripción sacada del detalle del propio documento (lo que se compró).
+// Ojo con el encabezado: hay que consumirlo ENTERO antes de capturar, porque
+// si no, el "SUBTOTAL" que forma parte del propio encabezado corta la
+// captura antes de llegar a los productos (probado: devolvía "% Descuento").
+function descripcionDesdeDetalle(texto) {
+  const re = new RegExp(
+    String.raw`\b(?:ITEM|Item|Detalle|Descripci[oó]n)\b(?:\s*${CABECERA_DETALLE})*(.{0,500}?)(?:Neto|NETO|Total\s*\$|TOTAL\s*\(|I\.V\.A|IVA\s*\(|Timbre|Son:|Referencias)`,
+    "is"
+  );
+  const m = re.exec(texto);
+  if (!m) return null;
+  let z = m[1]
+    .replace(/\$\s*[\d.,]+/g, " ")
+    .replace(/\b\d+[.,]\d+\s*%/g, " ")
+    .replace(/\b\d{1,3}(?:\.\d{3})+\b/g, " ")
+    .replace(new RegExp(CABECERA_DETALLE, "gi"), " ")
+    // Rachas de dos o más números sueltos son columnas de la tabla
+    // (cantidad, código del ítem siguiente). Un número solo se respeta:
+    // suele ser parte del producto ("1kg", "2 lbs").
+    .replace(/(?:(?<=\s)|^)\d+(?:\s+\d+)+(?=\s|$)/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s\-·,.|]+|[\s\-·,.|]+$/g, "")
+    .replace(/^\d+\s+/, "") // código/SKU suelto al principio
+    .trim();
+  if (z.length < 8) return null;
+  if (z.length > 110) z = z.slice(0, 110).replace(/\s+\S*$/, "") + "…"; // cortar en palabra entera, no a la mitad
+  return z;
 }
 
 // Sugerencias SIN IA sacadas del historial real de ESTE MISMO RUT: qué
@@ -2767,7 +2805,11 @@ async function analizarComprobante(id, file, statusEl) {
         buscarDatosPreviosPorRut(datosLocales.rut_proveedor),
       ]);
       datosLocales.categoria_sugerida = categoriaContable || previos.categoria;
-      datosLocales.descripcion = previos.descripcion;
+      // La descripción que escribió una persona para este mismo proveedor le
+      // gana al detalle crudo del PDF ("Creatina y proteína Foodtech" es más
+      // útil que "1577 Creatine 100% Pure Monohydrate 1kg - Foodtech…"), pero
+      // si no hay historial, el detalle del documento es mejor que nada.
+      datosLocales.descripcion = previos.descripcion || datosLocales.descripcion;
 
       await aplicarResultadoOcrCon(id, datosLocales, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
@@ -2871,9 +2913,41 @@ async function aplicarResultadoOcrSin(id, data, gen) {
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
   limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`]);
-  statusEl.textContent = "🪄 Analizando comprobante con IA...";
+  statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
+    // Igual que en "Documento electrónico": si es un PDF con texto, se lee
+    // local (gratis, al instante, sin gastar cuota de Gemini). Este
+    // formulario no tiene campos de RUT/folio/tipo, pero el RUT leído
+    // igual sirve para resolver proveedor, categoría y descripción.
+    const datosLocales = await leerPdfLocal(file);
+    if (datosLocales) {
+      const [nombreReal, categoriaContable, previos] = await Promise.all([
+        buscarNombreProveedorPorRut(datosLocales.rut_proveedor),
+        buscarCategoriaEnContabilidad(datosLocales.rut_proveedor),
+        buscarDatosPreviosPorRut(datosLocales.rut_proveedor),
+      ]);
+      datosLocales.nombre_proveedor = nombreReal;
+      datosLocales.categoria_sugerida = categoriaContable || previos.categoria;
+      // Ver el mismo criterio en analizarComprobante: historial primero,
+      // detalle del PDF como respaldo.
+      datosLocales.descripcion = previos.descripcion || datosLocales.descripcion;
+
+      await aplicarResultadoOcrSin(id, datosLocales, gen);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
+
+      // Si el PDF resultó ser una factura/boleta de honorarios, lo más
+      // probable es que corresponda la otra pestaña: esos documentos se
+      // contabilizan distinto (ver CUENTA_POR_TIPO_DOC y la exportación a
+      // Kame), así que conviene avisar antes de que se envíe mal.
+      const esDocumentoTributario = datosLocales.tipo_documento && /Factura|Honorario/i.test(datosLocales.tipo_documento);
+      statusEl.textContent = esDocumentoTributario
+        ? `✔ Datos leídos del PDF. Ojo: parece ser un(a) ${datosLocales.tipo_documento}, que normalmente va en la pestaña "Documento electrónico". Revísalo antes de enviar.`
+        : "✔ Datos leídos del PDF. Revísalos antes de enviar.";
+      statusEl.className = "ocr-status show ok";
+      return;
+    }
+
     const data = await llamarOcrRecibo(file);
     await aplicarResultadoOcrSin(id, data, gen);
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
@@ -4282,7 +4356,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   const toggle = puedeCambiarTipo
     ? el("div", { class: "toggle-group", role: "tablist" }, [
         el("button", { type: "button", "data-tipo": "ConDocumento", "aria-pressed": "false" }, "Documento electrónico"),
-        el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Boleta"),
+        el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Comprobante/Boleta"),
       ])
     : null;
   const camposTipo = el("div");
