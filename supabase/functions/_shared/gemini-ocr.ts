@@ -197,14 +197,18 @@ export const CATEGORIAS = [
   "Capacitaciones al Personal", "Honorarios Profesionales", "Honorarios Sin Retención",
 ];
 
-const PROMPT = `Eres un asistente que extrae datos de comprobantes de compra chilenos
-(facturas electrónicas, boletas electrónicas o boletas de honorarios).
+const PROMPT = `Eres un asistente que extrae datos de CUALQUIER comprobante de gasto chileno.
+No son solo facturas: también llegan boletas electrónicas y de papel, boletas
+de honorarios, boletas de ventas y servicios, vouchers de Transbank/Redcompra,
+comprobantes de transferencia electrónica, comprobantes de depósito, recibos y
+tickets. Todos son válidos y de todos hay que extraer lo que se pueda; no
+descartes un documento por no ser un DTE.
 Analiza la imagen adjunta y devuelve SOLO un JSON válido, sin texto adicional
 ni explicaciones, con exactamente esta forma:
 {
-  "nombre_proveedor": "razón social o nombre del proveedor/local" o null,
+  "nombre_proveedor": "razón social o nombre del proveedor/local; en una transferencia, el DESTINATARIO del dinero" o null,
   "rut_proveedor": "12.345.678-9" o null,
-  "tipo_documento": "Factura Electrónica" | "Factura Exenta Electrónica" | "Boleta de Honorario" | "Boleta Electrónica" | null,
+  "tipo_documento": "Factura Electrónica" | "Factura Exenta Electrónica" | "Boleta de Honorario" | "Boleta Electrónica" | "Boleta" | "Voucher" | "Comprobante de Transferencia" | "Comprobante de Depósito" | "Recibo" | "Nota de Crédito" | "Nota de Débito" | null,
   "nro_documento": "string" o null,
   "fecha": "YYYY-MM-DD" o null,
   "monto": number o null,
@@ -213,6 +217,11 @@ ni explicaciones, con exactamente esta forma:
 }
 Si no puedes leer un dato con certeza, usa null en ese campo. No inventes datos.
 El monto debe ser el total final del documento, sin puntos ni signos, solo el número.
+En documentos sin desglose de IVA (boletas, vouchers, transferencias) el monto es
+simplemente el total pagado o transferido.
+"nro_documento" es el número que identifica al documento: el folio en una boleta o
+factura, el número de operación en una transferencia, el código de autorización en
+un voucher. Si el documento no tiene ninguno, null.
 Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la lista (respetando tildes y mayúsculas), nunca inventes una categoría nueva.`;
 
 // El navegador ya leyó el PDF localmente con pdf.js antes de llegar acá, así

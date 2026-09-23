@@ -2434,22 +2434,38 @@ async function leerFotoLocal(file) {
     const texto = data?.text || "";
     if (texto.replace(/\s/g, "").length < 40) return null; // no salió texto legible
     const datos = parsearTextoFactura(texto);
-    // Umbral de utilidad: sin un RUT válido ni un monto confirmado por
-    // aritmética, lo que haya salido no es lo bastante confiable como para
-    // ponerlo en campos que van a contabilidad. Vale más dejarlos vacíos.
-    if (!datos.rut_proveedor && !datos.monto_verificado) return null;
+    // Umbral de utilidad: hace falta AL MENOS un dato con respaldo propio.
+    // Vale un RUT (lo valida su dígito verificador) o un monto con
+    // procedencia fuerte (aritmética del documento, o pegado a su etiqueta).
+    //
+    // La condición anterior exigía RUT o aritmética, y por eso descartaba
+    // entera la foto del comprobante de transferencia real: no trae RUT del
+    // destinatario ni desglose de IVA, pero SÍ decía "Monto $230.000" junto
+    // a su etiqueta, que es el dato correcto y el único que importaba. Con
+    // el filtro viejo, todo ese tipo de comprobante quedaba fuera por
+    // definición, sin importar lo bien que se hubiera leído.
+    const montoConRespaldo = datos.monto && (datos.monto_origen === "aritmetica" || datos.monto_origen === "etiqueta");
+    if (!datos.rut_proveedor && !montoConRespaldo) return null;
 
-    // EL MONTO NO SE RELLENA DESDE UNA FOTO salvo que la aritmética del
-    // documento lo confirme. Probado contra una factura real fotografiada
-    // por WhatsApp: el RUT, el folio y el tipo salieron perfectos, pero el
-    // total se leyó $273.008 cuando eran $350.874. Y tiene sentido que sea
-    // así: el RUT se valida con su dígito verificador y el folio tiene que
-    // venir pegado a su etiqueta, pero un monto son dígitos sueltos sin nada
-    // que los contradiga si el OCR se equivoca. Como el monto es obligatorio
-    // igual, la persona lo va a escribir de todos modos: dejarlo en blanco
-    // le cuesta diez segundos, y un número equivocado que se cuela le cuesta
-    // a contabilidad.
-    if (!datos.monto_verificado) datos.monto = null;
+    // Desde una foto, el monto solo se acepta si hay EVIDENCIA de que es el
+    // total: o la aritmética del documento lo confirma, o venía pegado a una
+    // etiqueta ("TOTAL $ 8.990", "Monto transferido: $230.000"). Lo que no
+    // se acepta nunca es el paso de último recurso, que elige el mayor
+    // importe con $: eso es una conjetura, y sobre una foto sale mal.
+    //
+    // Medido, no supuesto. En la factura de Supletech fotografiada por
+    // WhatsApp, el total real ($350.874) no llegó a leerse EN ABSOLUTO, así
+    // que esa conjetura agarró el subtotal de una línea ($273.008) y lo puso
+    // en el campo tan campante. Y no sirve filtrar por la confianza del OCR:
+    // ese número equivocado salió con confianza 83, mientras que el RUT, que
+    // estaba bien, salió con 40. La confianza mide nitidez del trazo, no
+    // acierto.
+    //
+    // La distinción importa sobre todo para boletas, comprobantes de
+    // transferencia y vouchers: esos no traen desglose de IVA, así que la
+    // verificación aritmética NUNCA les va a aplicar y la etiqueta es la
+    // única evidencia fuerte que pueden ofrecer.
+    if (datos.monto_origen !== "aritmetica" && datos.monto_origen !== "etiqueta") datos.monto = null;
 
     // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
     // 2026, un solo dígito mal que manda el gasto a otro período contable.
@@ -2514,6 +2530,22 @@ function parsearTextoFactura(texto) {
   else if (/FACTURA\s+ELECTR/i.test(t)) tipo_documento = "Factura Electrónica";
   else if (/BOLETA\s+DE\s+HONORARIO/i.test(t)) tipo_documento = "Boleta de Honorario";
   else if (/BOLETA\s+ELECTR/i.test(t)) tipo_documento = "Boleta Electrónica";
+  // A partir de acá ya no son documentos tributarios electrónicos, y por eso
+  // van al final: si el documento es un DTE, alguna de las reglas de arriba
+  // ya ganó. Estos son los que se rinden por la pestaña Comprobante/Boleta y
+  // que hasta ahora el lector no reconocía en absoluto, así que ni el tipo
+  // ni el folio ni la fecha se sacaban de ellos.
+  else if (/BOLETA\s+DE\s+VENTAS?(\s+Y\s+SERVICIOS?)?/i.test(t)) tipo_documento = "Boleta";
+  else if (/COMPROBANTE\s+DE\s+(TRANSFERENCIA|PAGO)|TRANSFERENCIA\s+(ELECTR[OÓ]NICA|EXITOSA|REALIZADA)|TRANSFERENCIA\s+A\s+TERCEROS/i.test(t)) tipo_documento = "Comprobante de Transferencia";
+  else if (/COMPROBANTE\s+DE\s+DEP[OÓ]SITO/i.test(t)) tipo_documento = "Comprobante de Depósito";
+  else if (/\bVOUCHER\b|COMPROBANTE\s+DE\s+VENTA|TRANSBANK|REDCOMPRA/i.test(t)) tipo_documento = "Voucher";
+  else if (/\bRECIBO\b/i.test(t)) tipo_documento = "Recibo";
+  else if (/\bBOLETA\b/i.test(t)) tipo_documento = "Boleta";
+  // Las apps de los bancos no escriben "comprobante de transferencia" en
+  // ninguna parte: la pantalla real de una transferencia hecha dice
+  // "Operación realizada", "Monto", "Destinatario", "Cuenta Corriente". Se
+  // reconoce por esa combinación, que ningún otro tipo de documento tiene.
+  else if (/Destinatario/i.test(t) && /Cuenta\s+Corriente|Cuenta\s+Vista|Cuenta\s+RUT/i.test(t)) tipo_documento = "Comprobante de Transferencia";
 
   // Folio solo si viene con su etiqueta pegada ("N° 136982"). Cuando la
   // etiqueta quedó separada del número en el flujo de texto, se prefiere
@@ -2534,12 +2566,25 @@ function parsearTextoFactura(texto) {
   // símbolo de grado muy seguido ("FACTURA ELECTRONICA N 136982"). Va en
   // mayúscula y sin flag "i" en esa alternativa: con "i" volvería a matchear
   // la palabra "no" y el folio sería cualquier número detrás de un "no".
-  const RE_FOLIO = /(N[°º]\.?|No\.?|N(?=\s+\d)|FOLIO|Folio)\s*:?\s*(\d{2,10})\b/g;
+  // Los documentos que no son DTE numeran con otras palabras: una
+  // transferencia trae "N° de operación", un voucher un "código de
+  // autorización". Sin estas etiquetas, el número identificador de esos
+  // comprobantes no se leía nunca.
+  // OJO: esta expresión NO lleva flag "i", y no es un descuido. Con "i", la
+  // alternativa "No" matchea la palabra española "no" y cualquier número
+  // detrás pasa por folio ("Pago no 30 dias" -> folio 30). Por eso las
+  // etiquetas de varias palabras traen sus variantes de mayúscula escritas a
+  // mano en vez de resolverse con el flag.
+  const RE_FOLIO = /(N[°º]\.?|No\.?|N(?=\s+\d)|FOLIO|Folio|[NnPp][°º]?\s*[Dd][Ee]\s*[OoTtCcDd][a-zíóé]+|N[UÚuú]MERO\s+[Dd][Ee]\s+[A-Za-zíóé]+|C[oó]digo\s+[Dd][Ee]\s+[A-Za-zíóé]+)\s*:?\s*(\d{2,12})\b/g;
   const ANTES_NO_ES_FOLIO = /(orden\s+de\s+compra|nota\s+de\s+venta|res(?:oluci[oó]n)?\.?\s*ex\.?|cotizaci[oó]n|gu[ií]a\s+de\s+despacho|contrato|pago)\s*$/i;
   const candidatosFolio = [];
   for (const m of t.matchAll(RE_FOLIO)) {
     const contextoPrevio = t.slice(Math.max(0, m.index - 40), m.index);
     if (ANTES_NO_ES_FOLIO.test(contextoPrevio.trim())) continue;
+    // Puros ceros no es un folio, es una casilla vacía del formulario o un
+    // relleno que el OCR leyó como número. Salió en la foto de la factura de
+    // Correos, que devolvía "00000000" como número de documento.
+    if (/^0+$/.test(m[2])) continue;
     candidatosFolio.push({ valor: m[2], pegadoAlTipo: /(factura|boleta|documento)[^.]{0,30}$/i.test(contextoPrevio) });
   }
   const mFolio = candidatosFolio.find((c) => c.pegadoAlTipo) || candidatosFolio[0];
@@ -2571,14 +2616,31 @@ function parsearTextoFactura(texto) {
     .filter((n) => n >= 1000);
   const verificado = totalPorNetoMasIva(todosLosImportes);
   let monto = verificado ? verificado.total : null;
+  // De DÓNDE salió el monto, que importa tanto como el monto mismo:
+  //   "aritmetica" -> neto + IVA cuadran con el total. Certeza.
+  //   "etiqueta"   -> venía pegado a un "TOTAL". Evidencia fuerte.
+  //   "maximo"     -> el mayor importe con $. Una CONJETURA, y sobre una
+  //                   foto es peligrosa: en la factura fotografiada de
+  //                   Supletech el total real ni siquiera se alcanzó a leer,
+  //                   así que este paso eligió el subtotal de una línea
+  //                   ($273.008 en vez de $350.874) con toda naturalidad.
+  // leerFotoLocal usa esto para aceptar solo las dos primeras. En un PDF,
+  // donde el texto es exacto, las tres siguen valiendo.
+  let monto_origen = verificado ? "aritmetica" : null;
 
   // 2) Si no cuadra (factura exenta, sin IVA, o subtotales ilegibles), el
   //    importe etiquetado "Total $". El \\$ es obligatorio y "total" va como
   //    palabra propia: sin eso matcheaba "SUBTOTAL 1577" (un SKU) y
   //    "Total 2.40 CLF" (texto de una glosa).
+  //    Las etiquetas van más allá de "total" a propósito: una boleta, un
+  //    comprobante de transferencia o un recibo no dicen "TOTAL" ni traen
+  //    desglose de IVA, y son justamente los documentos donde este paso es
+  //    la ÚNICA evidencia fuerte disponible (el paso 1 nunca va a aplicar).
   if (!monto) {
-    const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])total\\s*\\(?\\s*\\$\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
+    const ETIQUETAS_TOTAL = String.raw`total(?:\s*a\s*pagar|\s*boleta)?|monto(?:\s*(?:transferido|total|a\s*pagar|de\s*la\s*transferencia))?|valor\s*total|importe(?:\s*total)?|a\s*pagar|neto\s*a\s*pagar|te\s*transfiri[oó]`;
+    const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])(?:${ETIQUETAS_TOTAL})\\s*\\(?\\s*\\$?\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
     monto = mTotal ? aNumero(mTotal[1]) : null;
+    if (monto) monto_origen = "etiqueta";
   }
   // 3) Último recurso: si la etiqueta quedó lejos de su valor (pasa en el
   //    formato bsale), el mayor importe CON SIGNO $ del documento. El "$" es
@@ -2590,6 +2652,7 @@ function parsearTextoFactura(texto) {
       .map((m) => aNumero(m[1]))
       .filter((n) => n >= 1000);
     monto = candidatos.length ? Math.max(...candidatos) : null;
+    if (monto) monto_origen = "maximo";
   }
 
   // Todo lo anterior da por sentado que los importes están en pesos. Si el
@@ -2623,6 +2686,7 @@ function parsearTextoFactura(texto) {
     // para decirle a la persona qué revisar: un monto verificado no necesita
     // segunda mirada, uno deducido sí.
     monto_verificado: montoConfirmado,
+    monto_origen,
     descripcion: descripcionDesdeDetalle(t),
     categoria_sugerida: null,
   };
@@ -2675,7 +2739,7 @@ function totalPorNetoMasIva(importes) {
 // monto y categoría, así que pedirle a la IA lo que ese formulario ni
 // siquiera puede mostrar sería gastar cuota para nada.
 const CAMPOS_OCR_CON = ["nombre_proveedor", "rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto", "descripcion", "categoria_sugerida"];
-const CAMPOS_OCR_SIN = ["nombre_proveedor", "monto", "descripcion", "categoria_sugerida"];
+const CAMPOS_OCR_SIN = ["nombre_proveedor", "rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto", "descripcion", "categoria_sugerida"];
 
 // Solo para el mensaje que se le muestra a la persona: los nombres internos
 // ("nro_documento") no significan nada para quien está rindiendo.
@@ -3578,6 +3642,15 @@ async function aplicarResultadoOcrSin(id, data, gen) {
   if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
   const montoIA2 = montoValidoCLP(data.monto);
   if (montoIA2) document.getElementById(`${id}-monto2`).value = montoIA2.toLocaleString("es-CL");
+  // Datos del documento, informativos. A diferencia de "Documento
+  // electrónico", acá el tipo es texto libre: por esta pestaña entra
+  // cualquier cosa (boleta, voucher, comprobante de transferencia, recibo)
+  // y encajonarlo en una lista cerrada obligaría a descartar lo que no
+  // calce, que es justo lo que hacía que no se leyera nada de ellos.
+  if (data.tipo_documento) document.getElementById(`${id}-tipodoc2`).value = data.tipo_documento;
+  if (data.nro_documento) document.getElementById(`${id}-folio2`).value = data.nro_documento;
+  if (data.rut_proveedor) document.getElementById(`${id}-rut2`).value = formatearRut(data.rut_proveedor);
+  if (data.fecha) document.getElementById(`${id}-fecha2`).value = data.fecha;
   // La categoría sugerida solo se aplica si existe tal cual en el
   // desplegable (puede estar filtrado por las cuentas permitidas del
   // usuario) -- el campo queda igual visible y editable para que la
@@ -3594,7 +3667,7 @@ async function aplicarResultadoOcrSin(id, data, gen) {
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
-  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`]);
+  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -3685,6 +3758,26 @@ function buildSinDocumentoFields(id) {
   const row3 = el("div", { class: "field-row" }, [
     fieldInput(`${id}-desc2`, "Descripción", "text"),
   ]);
+  // Datos del documento, TODOS opcionales y puramente informativos: sirven
+  // para que quien aprueba pueda contrastar el ítem contra el comprobante
+  // adjunto sin abrirlo, y el RUT además destraba la sugerencia de categoría
+  // desde el historial contable, que hasta ahora solo funcionaba para
+  // facturas porque esta pestaña no capturaba ningún RUT.
+  //
+  // Lo que NO cambian es la contabilidad: una boleta, un comprobante de
+  // transferencia o un voucher siguen yendo DIRECTO A LA CUENTA DE GASTO
+  // (4.01.03.xx, el campo "Cuenta contable" de más arriba). No generan
+  // cuenta por pagar ni ficha de proveedor, que es lo que distingue a esta
+  // pestaña de "Documento electrónico" (ver CUENTA_POR_TIPO_DOC). Tener el
+  // RUT acá no convierte al comprobante en un documento tributario.
+  const row4 = el("div", { class: "field-row" }, [
+    fieldInput(`${id}-tipodoc2`, "Tipo de documento (opcional)", "text"),
+    fieldInput(`${id}-folio2`, "N° de documento (opcional)", "text"),
+  ]);
+  const row5 = el("div", { class: "field-row" }, [
+    fieldInput(`${id}-rut2`, "RUT del proveedor (opcional)", "text"),
+    fieldInput(`${id}-fecha2`, "Fecha del documento (opcional)", "date"),
+  ]);
   const foto = fieldFile(`${id}-foto2`, "Comprobante (foto o PDF)");
   const ocrStatus = el("p", { class: "ocr-status", id: `${id}-ocr-status2` });
   foto.appendChild(ocrStatus);
@@ -3694,6 +3787,8 @@ function buildSinDocumentoFields(id) {
   box.appendChild(historialHint);
   box.appendChild(row2);
   box.appendChild(row3);
+  box.appendChild(row4);
+  box.appendChild(row5);
   box.appendChild(foto);
 
   const fotoInput2 = foto.querySelector("input[type=file]");
@@ -4020,24 +4115,41 @@ async function submitRendicion() {
         toast(`Falta adjuntar el comprobante del Ítem ${idx + 1}.`);
         return;
       }
+      // El RUT es opcional acá, pero si se escribió (o lo leyó el OCR de una
+      // foto, que se puede equivocar) tiene que ser válido: guardar un RUT
+      // mal formado es peor que no guardarlo, porque después se cruza contra
+      // contabilidad y no calza con nada sin que se sepa por qué.
+      const rutSinDoc = document.getElementById(`${id}-rut2`).value.trim();
+      if (rutSinDoc && !validarRut(rutSinDoc)) {
+        toast(`El RUT del proveedor del Ítem ${idx + 1} no es válido.`);
+        return;
+      }
       items.push({
         tipo_item: "SinDocumento",
         nombre_proveedor: document.getElementById(`${id}-nombreprov2`).value.trim() || null,
-        rut_proveedor: null,
-        tipo_documento: null,
-        nro_documento: null,
-        fecha_vencimiento: null,
+        // Informativos: quien aprueba los contrasta contra el adjunto sin
+        // abrirlo. NO cambian el asiento -- cuenta_contable sigue siendo la
+        // cuenta de GASTO que eligió la persona, nunca la cuenta por pagar,
+        // aunque el comprobante traiga RUT. Es la diferencia de fondo entre
+        // esta pestaña y "Documento electrónico".
+        rut_proveedor: rutSinDoc || null,
+        tipo_documento: document.getElementById(`${id}-tipodoc2`).value.trim() || null,
+        nro_documento: document.getElementById(`${id}-folio2`).value.trim() || null,
+        fecha_vencimiento: document.getElementById(`${id}-fecha2`).value || null,
         cuenta_contable: document.getElementById(`${id}-cuenta`).value.trim(),
         empresa: empresaRendicion,
         centro_costo: document.getElementById(`${id}-cc`).value.trim() || centroCostoRendicion,
         categoria: document.getElementById(`${id}-categoria`).value,
         monto,
         descripcion: document.getElementById(`${id}-desc2`).value.trim(),
-        // Igual que en ConDocumento. Acá el único hueco que el agente puede
-        // llenar es la descripción: el gasto directo no tiene proveedor ni
-        // folio que leer.
+        // Igual que en ConDocumento. Ahora esta pestaña sí tiene folio, RUT
+        // y tipo, así que el agente tiene más huecos reales que llenar que
+        // solo la descripción.
         ocr_reintento_estado: estadoReintentoOcr(id, [
           document.getElementById(`${id}-desc2`).value.trim(),
+          document.getElementById(`${id}-nombreprov2`).value.trim(),
+          rutSinDoc,
+          document.getElementById(`${id}-folio2`).value.trim(),
         ]),
         ocr_origen: ocrOrigen.get(id) || null,
         monto_verificado: montoSigueVerificado(id, monto),
