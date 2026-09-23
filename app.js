@@ -2398,11 +2398,39 @@ function cargarTesseract() {
   return tesseractCargando;
 }
 
+// Una foto de celular moderna viene en 4000px o más, y pasársela así a
+// Tesseract es peor por los dos lados: tarda mucho más y no lee mejor (el
+// motor trabaja alrededor de un tamaño de texto, no con el máximo detalle
+// posible). Se reescala a un lado máximo razonable y en calidad alta -- alta
+// a propósito, distinto de comprimirImagenSiCorresponde, que apunta a que el
+// archivo pese poco para subirlo: acá los artefactos de compresión son
+// justamente lo que hace que un 8 se lea como 3.
+const LADO_MAXIMO_OCR = 2000;
+async function prepararImagenParaOcr(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const escala = Math.min(1, LADO_MAXIMO_OCR / Math.max(bitmap.width, bitmap.height));
+    if (escala === 1) return file;
+    const w = Math.round(bitmap.width * escala);
+    const h = Math.round(bitmap.height * escala);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.92));
+    return blob ? new File([blob], file.name, { type: "image/jpeg" }) : file;
+  } catch (err) {
+    console.error("No se pudo preparar la imagen para OCR, se usa la original:", err);
+    return file;
+  }
+}
+
 async function leerFotoLocal(file) {
   if (!(file.type || "").startsWith("image/")) return null;
   try {
     const tess = await cargarTesseract();
-    const { data } = await tess.recognize(file, "spa");
+    const { data } = await tess.recognize(await prepararImagenParaOcr(file), "spa");
     const texto = data?.text || "";
     if (texto.replace(/\s/g, "").length < 40) return null; // no salió texto legible
     const datos = parsearTextoFactura(texto);
@@ -2410,6 +2438,30 @@ async function leerFotoLocal(file) {
     // aritmética, lo que haya salido no es lo bastante confiable como para
     // ponerlo en campos que van a contabilidad. Vale más dejarlos vacíos.
     if (!datos.rut_proveedor && !datos.monto_verificado) return null;
+
+    // EL MONTO NO SE RELLENA DESDE UNA FOTO salvo que la aritmética del
+    // documento lo confirme. Probado contra una factura real fotografiada
+    // por WhatsApp: el RUT, el folio y el tipo salieron perfectos, pero el
+    // total se leyó $273.008 cuando eran $350.874. Y tiene sentido que sea
+    // así: el RUT se valida con su dígito verificador y el folio tiene que
+    // venir pegado a su etiqueta, pero un monto son dígitos sueltos sin nada
+    // que los contradiga si el OCR se equivoca. Como el monto es obligatorio
+    // igual, la persona lo va a escribir de todos modos: dejarlo en blanco
+    // le cuesta diez segundos, y un número equivocado que se cuela le cuesta
+    // a contabilidad.
+    if (!datos.monto_verificado) datos.monto = null;
+
+    // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
+    // 2026, un solo dígito mal que manda el gasto a otro período contable.
+    // No hay forma de validarla, así que se descarta la que no sea
+    // plausible para una rendición (nada de más de un año atrás ni futuro).
+    if (datos.fecha) {
+      const f = new Date(datos.fecha + "T00:00:00");
+      const hoy = new Date();
+      const haceUnAnio = new Date(hoy.getFullYear() - 1, hoy.getMonth(), hoy.getDate());
+      const enUnMes = new Date(hoy.getFullYear(), hoy.getMonth() + 1, hoy.getDate());
+      if (isNaN(f) || f < haceUnAnio || f > enUnMes) datos.fecha = null;
+    }
     return datos;
   } catch (err) {
     console.error("No se pudo leer la foto localmente:", err);
@@ -2835,7 +2887,11 @@ async function completarConIA({ id, file, gen, statusEl, local, contable, datos,
 // Etiquetas que forman la fila de encabezado de la tabla de detalle. Se usan
 // para dos cosas: saber dónde empieza el detalle y limpiar los restos que
 // queden mezclados con los productos.
-const CABECERA_DETALLE = String.raw`(?:SKU|ITEM|Item|Detalle|Descripci[oó]n|VALOR\s*UNITARIO|P\.?\s*unitario|Precio|CANTIDAD|Cant\.?|%?\s*Descuento|SUBTOTAL|Total\s*item)`;
+// "Impto Adic." y "Desc. Valor" se agregaron después de probar contra una
+// factura real guardada (importadora FA DA 9): el resto de la cabecera se
+// limpiaba bien, pero esas dos columnas sobrevivían y la descripción salía
+// "%Impto Adic.* %Desc. Valor - ARTICULOS VARIOS" en vez de los productos.
+const CABECERA_DETALLE = String.raw`(?:SKU|ITEM|Item|Detalle|Descripci[oó]n|VALOR\s*UNITARIO|P\.?\s*unitario|Precio|CANTIDAD|Cant\.?|%?\s*Desc(?:uento|\.)?(?:\s*Valor)?|%?\s*Impto\.?\s*Adic\.?\*?|SUBTOTAL|Total\s*item)`;
 
 // Descripción sacada del detalle del propio documento (lo que se compró).
 // Ojo con el encabezado: hay que consumirlo ENTERO antes de capturar, porque
@@ -2843,16 +2899,29 @@ const CABECERA_DETALLE = String.raw`(?:SKU|ITEM|Item|Detalle|Descripci[oó]n|VAL
 // captura antes de llegar a los productos (probado: devolvía "% Descuento").
 function descripcionDesdeDetalle(texto) {
   const re = new RegExp(
-    String.raw`\b(?:ITEM|Item|Detalle|Descripci[oó]n)\b(?:\s*${CABECERA_DETALLE})*(.{0,500}?)(?:Neto|NETO|Total\s*\$|TOTAL\s*\(|I\.V\.A|IVA\s*\(|Timbre|Son:|Referencias)`,
+    // "Forma de Pago" se sumó a los cortes tras probar contra una factura
+    // real (importadora FA DA 9): venía después del detalle y antes de los
+    // totales, así que la captura seguía de largo y la descripción terminaba
+    // en "...Forma de Pago:Crédito".
+    String.raw`\b(?:ITEM|Item|Detalle|Descripci[oó]n)\b(?:\s*${CABECERA_DETALLE})*(.{0,500}?)(?:Neto|NETO|Total\s*\$|TOTAL\s*\(|I\.V\.A|IVA\s*\(|Timbre|Son:|Referencias|Forma\s+de\s+Pago)`,
     "is"
   );
   const m = re.exec(texto);
   if (!m) return null;
   let z = m[1]
+    // Las etiquetas de cabecera se quitan PRIMERO, antes que los números.
+    // Al revés no alcanza: quitar "%Desc." deja pegados dos fragmentos que
+    // por separado ya habían pasado el filtro numérico ("20 %Desc. ,33" ->
+    // "20 ,33"), y esa cola aparecía en la descripción de una factura real.
+    .replace(new RegExp(CABECERA_DETALLE, "gi"), " ")
     .replace(/\$\s*[\d.,]+/g, " ")
     .replace(/\b\d+[.,]\d+\s*%/g, " ")
-    .replace(/\b\d{1,3}(?:\.\d{3})+\b/g, " ")
-    .replace(new RegExp(CABECERA_DETALLE, "gi"), " ")
+    // Un importe con miles Y decimales es UN solo token: "1.819,33". Antes
+    // se quitaban por separado los miles y los decimales, y sobre una
+    // factura real ("- ARTICULOS VARIOS 20 1.819,33 36.387") eso se comía
+    // "1.819" y dejaba ",33" suelto pegado a la descripción. La coma
+    // decimal tiene que estar en la MISMA alternativa que los puntos de mil.
+    .replace(/\b\d{1,3}(?:\.\d{3})+(?:,\d+)?\b|\b\d+,\d+\b/g, " ")
     // Rachas de dos o más números sueltos son columnas de la tabla
     // (cantidad, código del ítem siguiente). Un número solo se respeta:
     // suele ser parte del producto ("1kg", "2 lbs").
@@ -2866,6 +2935,10 @@ function descripcionDesdeDetalle(texto) {
     .replace(/\s{2,}/g, " ")
     .replace(/^[\s\-·,.|]+|[\s\-·,.|]+$/g, "")
     .replace(/^\d+\s+/, "") // código/SKU suelto al principio
+    // ...y la cantidad suelta al final, que es lo que queda de la fila una
+    // vez quitados los importes ("ARTICULOS VARIOS 20"). Un producto que
+    // termina de verdad en un número es raro; una columna sobrante, no.
+    .replace(/[\s,.]*\b\d+\s*$/, "")
     .trim();
   if (z.length < 8) return null;
   if (z.length > 110) z = z.slice(0, 110).replace(/\s+\S*$/, "") + "…"; // cortar en palabra entera, no a la mitad
