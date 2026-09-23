@@ -63,6 +63,23 @@ create table if not exists public.gemini_modelo_stats (
   ultimo_intento timestamptz,
   updated_at timestamptz not null default now()
 );
+
+-- Estas dos se agregaron después, en caliente y directo sobre producción
+-- mientras se diagnosticaba el incidente de cuota del 2026-09-22, y por eso
+-- faltaban acá: el esquema real y este archivo quedaron desincronizados, así
+-- que reconstruir el proyecto desde el repositorio daba una instalación rota
+-- (el código escribe estas columnas, PostgREST rechaza el insert entero si no
+-- existen, y el error se traga un try/catch). Van como ALTER idempotente para
+-- que sirva tanto en una base nueva como en la que ya las tiene.
+--   ultimo_error:     mensaje crudo del último fallo, POR MODELO. Sin esto
+--                     hubo que deducir qué fallaba mirando los tiempos entre
+--                     intentos (horas de diagnóstico a ciegas).
+--   disponible_desde: hasta cuándo no vale la pena volver a llamar a este
+--                     modelo por cuota agotada. Es lo que evita gastar
+--                     solicitudes para recibir el mismo rechazo.
+alter table public.gemini_modelo_stats add column if not exists ultimo_error text;
+alter table public.gemini_modelo_stats add column if not exists disponible_desde timestamptz;
+
 alter table public.gemini_modelo_stats enable row level security;
 
 -- ------------------------------------------------------------

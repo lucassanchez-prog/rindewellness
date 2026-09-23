@@ -303,8 +303,16 @@ async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknow
     (err as Error & { reintentable?: boolean }).reintentable = true;
     throw err;
   }
+  // Tope duro de candidatos por intento. El presupuesto de tiempo no alcanza
+  // como freno: un error de cuota vuelve en menos de un segundo, así que la
+  // comprobación de tiempo de abajo nunca corta y se terminaban llamando los
+  // cuatro modelos para juntar cuatro veces el mismo rechazo. Con una cuota
+  // diaria de ~20 por modelo, ese abanico es el mayor desperdicio del
+  // sistema: 2 candidatos dan margen real de recuperación sin cuadruplicar
+  // el gasto de cada fallo.
+  const MAX_CANDIDATOS = 2;
   let ultimoError: Error = new Error("No hay modelos de Gemini configurados (GEMINI_MODELS_ORDEN).");
-  for (let i = 0; i < modelosOrdenados.length; i++) {
+  for (let i = 0; i < Math.min(modelosOrdenados.length, MAX_CANDIDATOS); i++) {
     // Solo se empieza con otro candidato si queda tiempo para darle una
     // oportunidad REAL (no arrancar una llamada que vamos a cortar a los 2
     // segundos -- ese fue justamente el error del presupuesto anterior).
@@ -322,6 +330,34 @@ async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknow
     }
   }
   throw ultimoError;
+}
+
+// Devuelve el monto como número entero de pesos, o null si no se puede
+// afirmar con certeza cuál era. Rechazar es preferible a equivocarse: un
+// campo vacío lo completa una persona, un monto mal leído entra a
+// contabilidad sin que nadie lo note.
+export function normalizarMonto(valor: unknown): number | null {
+  if (valor === null || valor === undefined) return null;
+  if (typeof valor === "number") return Number.isFinite(valor) && valor > 0 ? Math.round(valor) : null;
+  if (typeof valor !== "string") return null;
+
+  const s = valor.trim().replace(/^\$\s*/, "");
+  // Formato chileno: puntos como separador de miles, coma decimal opcional
+  // ("350.874", "13.650,42"). Los grupos de 3 dígitos son lo que lo
+  // identifica sin ambigüedad.
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) {
+    return Math.round(Number(s.replace(/\./g, "").replace(",", ".")));
+  }
+  // Entero limpio, que es lo que pide el prompt ("350874").
+  if (/^\d+$/.test(s)) return Number(s);
+  // Decimal con coma, sin separador de miles ("1234,56").
+  if (/^\d+,\d+$/.test(s)) return Math.round(Number(s.replace(",", ".")));
+  // Cualquier otra cosa ("15.00", "1.234.5", texto suelto) es ambigua: no se
+  // adivina. Ojo con "15.000" versus "15.00" -- el primero son quince mil y
+  // el segundo probablemente quince, y sin más contexto no hay forma de
+  // distinguirlos con certeza, así que el patrón de arriba exige grupos
+  // exactos de 3 dígitos y esto descarta el resto.
+  return null;
 }
 
 export interface ResultadoOcr {
@@ -389,15 +425,15 @@ export async function leerComprobante(
     parsed.categoria_sugerida = null;
   }
 
-  // El prompt le pide a Gemini un número limpio (sin puntos de miles), pero
-  // nada lo obliga a respetarlo -- un monto chileno como "15.000" leído tal
-  // cual, sin este chequeo, se interpreta como Number("15.000") = 15 y
-  // autocompleta un monto mil veces más chico sin ningún error visible. Se
-  // descarta (no se adivina el formato) en vez de arriesgar un dato
-  // silenciosamente incorrecto.
-  if (parsed.monto !== null && parsed.monto !== undefined && !Number.isFinite(Number(parsed.monto))) {
-    parsed.monto = null;
-  }
+  // El prompt le pide a Gemini un número limpio, pero nada lo obliga a
+  // respetarlo y a veces devuelve el formato chileno ("15.000" = quince mil).
+  //
+  // OJO: la primera versión de este chequeo era `!Number.isFinite(Number(m))`
+  // y NO servía justamente para el caso que decía cubrir -- Number("15.000")
+  // da 15, que es perfectamente finito, así que el guard lo dejaba pasar y el
+  // monto entraba mil veces más chico sin ningún error visible. Hay que
+  // interpretar el formato, no solo preguntar si es un número.
+  parsed.monto = normalizarMonto(parsed.monto);
 
   return parsed as ResultadoOcr;
 }

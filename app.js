@@ -2036,6 +2036,18 @@ function openNuevaRendicion(pushHistory = true) {
   actualizarCentroCostoRendicion();
   document.getElementById("items-container").innerHTML = "";
   itemSeq = 0;
+  // itemSeq vuelve a 0, así que el primer ítem de esta rendición se vuelve a
+  // llamar "item-1" igual que el de la rendición anterior. Si estos dos mapas
+  // no se limpian, ese id reciclado arrastra el estado del formulario viejo:
+  //  - un OCR que quedó en vuelo de la rendición anterior encuentra su "gen"
+  //    todavía vigente y los elementos otra vez existentes, y escribe el RUT,
+  //    folio, fecha y monto del documento ANTERIOR en este formulario en
+  //    blanco -- la persona ve un ítem lleno y lo puede enviar así.
+  //  - ocrExitoso.get("item-1") sigue en true, así que estadoReintentoOcr
+  //    decide no encolar un ítem cuyo OCR en realidad falló, y el agente en
+  //    segundo plano nunca lo toma, sin ninguna señal visible.
+  ocrGeneracion.clear();
+  ocrExitoso.clear();
   addItemRow();
   if (pushHistory) pushView("view-nueva"); else show("view-nueva");
 }
@@ -2360,12 +2372,32 @@ function parsearTextoFactura(texto) {
   // El RUT del EMISOR va antes que el del receptor en los dos formatos
   // probados. Se valida el dígito verificador (validarRut) para descartar
   // números que solo parecen RUT.
+  //
+  // Antes de eso se descartan los RUT del propio grupo: en toda factura que
+  // recibimos aparece el nuestro como RECEPTOR, y en los formatos donde va
+  // primero, "el primer RUT del texto" nos ponía a nosotros mismos como
+  // proveedor. Eso no solo llena mal el campo: buscarCategoriaEnContabilidad
+  // y buscarDatosPreviosPorRut salen a buscar el historial de ese RUT y
+  // sugieren una categoría deducida de la entidad equivocada, y como la
+  // lectura local igual "funcionó" (hay un RUT válido y un monto), nunca se
+  // consulta a la IA para contrastar.
+  const rutsPropios = new Set(Object.values(RUT_POR_EMPRESA).map((r) => r.replace(/[.\-]/g, "").toUpperCase()));
   const ruts = [...t.matchAll(RE_RUT_EN_TEXTO)]
     .map((m) => m[1].replace(/\s/g, ""))
-    .filter((r) => validarRut(r));
+    .filter((r) => validarRut(r))
+    .filter((r) => !rutsPropios.has(r.replace(/[.\-]/g, "").toUpperCase()));
 
   let tipo_documento = null;
-  if (/FACTURA\s+EXENTA/i.test(t)) tipo_documento = "Factura Exenta Electrónica";
+  // Las notas van PRIMERO y no es un detalle de orden: una nota de crédito
+  // trae un bloque de referencias ("Referencia: Factura Electrónica N° ..."),
+  // así que /FACTURA\s+ELECTR/ matchea igual y la NC entraba como factura.
+  // Como "Nota de Crédito" no existe en TIPOS_DOCUMENTO, el select se quedaba
+  // en su valor por defecto (Factura Electrónica) y el monto se cargaba
+  // POSITIVO a la cuenta por pagar -- una nota que debía REBAJAR el pasivo
+  // terminaba aumentándolo, con el signo al revés y sin aviso.
+  if (/NOTA\s+DE\s+CR[EÉ]DITO/i.test(t)) tipo_documento = "Nota de Crédito";
+  else if (/NOTA\s+DE\s+D[EÉ]BITO/i.test(t)) tipo_documento = "Nota de Débito";
+  else if (/FACTURA\s+EXENTA/i.test(t)) tipo_documento = "Factura Exenta Electrónica";
   else if (/FACTURA\s+ELECTR/i.test(t)) tipo_documento = "Factura Electrónica";
   else if (/BOLETA\s+DE\s+HONORARIO/i.test(t)) tipo_documento = "Boleta de Honorario";
   else if (/BOLETA\s+ELECTR/i.test(t)) tipo_documento = "Boleta Electrónica";
@@ -2374,7 +2406,26 @@ function parsearTextoFactura(texto) {
   // etiqueta quedó separada del número en el flujo de texto, se prefiere
   // dejarlo en blanco antes que adivinar: un folio equivocado en
   // contabilidad es peor que un campo vacío.
-  const mFolio = /(?:N[°ºo]\.?|FOLIO)\s*:?\s*(\d{2,10})\b/i.exec(t);
+  //
+  // Dos trampas que costaron folios equivocados y que explican por qué esto
+  // no es un simple /N°\s*(\d+)/i:
+  //  - Con el flag "i", la clase N[°ºo] también matchea la palabra "no".
+  //    "Pago no 30 dias" devolvía folio 30. Por eso "No" va aparte y sin
+  //    ignorar mayúsculas, y se exige que la N sea mayúscula.
+  //  - Se tomaba el PRIMER match de todo el texto, y en el encabezado suelen
+  //    venir antes la orden de compra ("Orden de compra No 4500123456") y la
+  //    resolución del SII ("Res. Ex. N° 80 de 2014"). Ahora se descartan los
+  //    números precedidos por esas etiquetas y se prefiere el que viene
+  //    pegado al tipo de documento.
+  const RE_FOLIO = /(N[°º]\.?|No\.?|FOLIO|Folio)\s*:?\s*(\d{2,10})\b/g;
+  const ANTES_NO_ES_FOLIO = /(orden\s+de\s+compra|nota\s+de\s+venta|res(?:oluci[oó]n)?\.?\s*ex\.?|cotizaci[oó]n|gu[ií]a\s+de\s+despacho|contrato|pago)\s*$/i;
+  const candidatosFolio = [];
+  for (const m of t.matchAll(RE_FOLIO)) {
+    const contextoPrevio = t.slice(Math.max(0, m.index - 40), m.index);
+    if (ANTES_NO_ES_FOLIO.test(contextoPrevio.trim())) continue;
+    candidatosFolio.push({ valor: m[2], pegadoAlTipo: /(factura|boleta|documento)[^.]{0,30}$/i.test(contextoPrevio) });
+  }
+  const mFolio = candidatosFolio.find((c) => c.pegadoAlTipo) || candidatosFolio[0];
 
   // Los RUT se sacan del texto ANTES de buscar importes: si no, sus dígitos
   // se leen como pesos (77.574.911-3 daba un "monto" de $77.574.911).
@@ -2387,7 +2438,18 @@ function parsearTextoFactura(texto) {
   //    aparece, el monto deja de ser una heurística -- queda verificado
   //    contra los subtotales de la factura, que es justo lo que hace falta
   //    para un dato que termina en contabilidad.
-  const todosLosImportes = [...sinRuts.matchAll(new RegExp(`\\b${RE_MONTO}\\b`, "g"))]
+  //    OJO con el conjunto de candidatos: si se le pasan TODOS los números
+  //    del texto, la aritmética encuentra tríos por casualidad. Con los
+  //    números de referencia típicos de una factura real
+  //    ({136982, 115277, 21705, ...}) se cumple 136982 - 115277 = 21705 y
+  //    round(115277 * 0.19) = 21903, que cae dentro de la tolerancia: tres
+  //    folios pasan por neto+IVA=total y devuelven $136.982 como monto. Y es
+  //    peor que un mal número suelto, porque queda marcado como VERIFICADO:
+  //    se le muestra a la persona "monto confirmado" y encima se salta el
+  //    contraste con la IA, que era justo la red de seguridad. Por eso solo
+  //    entran importes con "$" delante o pegados a una etiqueta de subtotal.
+  const RE_IMPORTE_CREIBLE = new RegExp(`(?:\\$\\s*|(?:neto|iva|i\\.v\\.a\\.|afecto|exento|subtotal|total|monto)\\W{0,12})${RE_MONTO}\\b`, "gi");
+  const todosLosImportes = [...sinRuts.matchAll(RE_IMPORTE_CREIBLE)]
     .map((m) => aNumero(m[1]))
     .filter((n) => n >= 1000);
   const verificado = totalPorNetoMasIva(todosLosImportes);
@@ -2413,6 +2475,19 @@ function parsearTextoFactura(texto) {
     monto = candidatos.length ? Math.max(...candidatos) : null;
   }
 
+  // Todo lo anterior da por sentado que los importes están en pesos. Si el
+  // documento está en otra moneda, "US$ 1.500" se lee como $1.500 y la
+  // diferencia no la nota nadie: el campo queda con un número creíble. Ante
+  // una moneda extranjera cerca de un importe se abandona la lectura local
+  // (monto = null) y el comprobante cae al camino de la IA, que sí ve el
+  // símbolo en la imagen. El chequeo va acá y no antes porque solo importa
+  // cuando efectivamente se encontró un monto que reportar.
+  let montoConfirmado = !!verificado;
+  if (monto && /(US\$|USD|EUR|€|\bUF\b|\bCLF\b|\bUTM\b)\W{0,15}\d|\d\W{0,8}(USD|EUR|\bUF\b|\bCLF\b|\bUTM\b)/i.test(sinRuts)) {
+    monto = null;
+    montoConfirmado = false; // sin monto no hay nada que declarar verificado
+  }
+
   let fecha = null;
   const mNum = /\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/.exec(t);
   const mTxt = /\b(\d{1,2})\s+de\s+([a-záéíóú]+)\s+(?:del?\s+)?(\d{4})\b/i.exec(t);
@@ -2424,13 +2499,13 @@ function parsearTextoFactura(texto) {
     nombre_proveedor: null, // se resuelve por RUT contra contabilidad, que es más confiable que leerlo del PDF
     rut_proveedor: ruts[0] || null,
     tipo_documento,
-    nro_documento: mFolio ? mFolio[1] : null,
+    nro_documento: mFolio ? mFolio.valor : null,
     fecha,
     monto,
     // true solo cuando el monto se confirmó con neto + IVA = total. Se usa
     // para decirle a la persona qué revisar: un monto verificado no necesita
     // segunda mirada, uno deducido sí.
-    monto_verificado: !!verificado,
+    monto_verificado: montoConfirmado,
     descripcion: descripcionDesdeDetalle(t),
     categoria_sugerida: null,
   };
@@ -2459,6 +2534,41 @@ function totalPorNetoMasIva(importes) {
   return mejor;
 }
 
+// Segunda opinión de la IA, SOLO cuando la lectura local no pudo confirmar
+// el monto por aritmética (factura exenta, maquetado raro, subtotales
+// ilegibles). Dos lectores independientes que coinciden son mucha más
+// evidencia que uno solo; y si difieren, se avisa en vez de elegir en
+// silencio -- que es lo peor que puede pasar con un monto que va a
+// contabilidad.
+//
+// Se gasta cuota de Gemini únicamente en los casos dudosos, que son pocos:
+// cuando la aritmética cuadra no se llama a la IA en absoluto. Corre en
+// segundo plano, sin bloquear: los campos ya quedaron llenos con la lectura
+// local, esto solo confirma o advierte.
+async function contrastarMontoConIA(id, file, gen, montoLocal, statusEl) {
+  try {
+    const data = await llamarOcrRecibo(file);
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+    const montoIA = Number(data?.monto);
+    if (!Number.isFinite(montoIA) || !montoIA) return; // la IA no leyó monto: se deja lo local como está
+
+    if (montoIA === montoLocal) {
+      statusEl.textContent = `✔ Datos leídos del PDF. Monto confirmado: la IA leyó el mismo total (${fmtCLP(montoLocal)}). Revisa el resto antes de enviar.`;
+      statusEl.className = "ocr-status show ok";
+      return;
+    }
+    // Discrepancia: NO se cambia el campo solo. El valor local es
+    // determinista (sale del texto del documento) y la IA interpreta una
+    // imagen; cuál es el correcto lo decide la persona mirando la factura.
+    statusEl.textContent = `⚠ Ojo con el monto: del texto del PDF se leyó ${fmtCLP(montoLocal)}, pero la IA leyó ${fmtCLP(montoIA)}. Se dejó el primero. Confirma cuál corresponde mirando la factura antes de enviar.`;
+    statusEl.className = "ocr-status show err";
+  } catch (err) {
+    // Que falle la segunda opinión no es un problema: la lectura local ya
+    // llenó los campos. Se registra y se sigue, sin alarmar a nadie.
+    console.error("No se pudo contrastar el monto con la IA:", err);
+  }
+}
+
 // Etiquetas que forman la fila de encabezado de la tabla de detalle. Se usan
 // para dos cosas: saber dónde empieza el detalle y limpiar los restos que
 // queden mezclados con los productos.
@@ -2483,7 +2593,13 @@ function descripcionDesdeDetalle(texto) {
     // Rachas de dos o más números sueltos son columnas de la tabla
     // (cantidad, código del ítem siguiente). Un número solo se respeta:
     // suele ser parte del producto ("1kg", "2 lbs").
-    .replace(/(?:(?<=\s)|^)\d+(?:\s+\d+)+(?=\s|$)/g, " ")
+    // OJO: acá NO se puede usar lookbehind ((?<=\s)). Los literales de regex
+    // se validan al PARSEAR el archivo, así que un lookbehind en un
+    // navegador que no lo soporta no rompe esta función: rompe app.js
+    // entero, y la app queda muerta (pantalla en blanco) para esa persona.
+    // Safari recién lo soporta desde la 16.4 y acá hay gente rindiendo
+    // desde iPhones viejos. Se captura el separador y se devuelve.
+    .replace(/(^|\s)\d+(?:\s+\d+)+(?=\s|$)/g, "$1 ")
     .replace(/\s{2,}/g, " ")
     .replace(/^[\s\-·,.|]+|[\s\-·,.|]+$/g, "")
     .replace(/^\d+\s+/, "") // código/SKU suelto al principio
@@ -2602,8 +2718,18 @@ async function buscarCategoriaEnContabilidad(rut) {
 function folioDesdeNombreArchivo(nombre) {
   if (!nombre) return null;
   const sinExtension = nombre.replace(/\.[a-z0-9]+$/i, "");
-  const m = /(?:factura|boleta|dte|[NnFf])[ _\-°º]*(\d{3,10})\b/.exec(sinExtension);
-  return m ? m[1] : null;
+  // Sin el flag "i" esto no matcheaba justamente el caso para el que se
+  // escribió ("..._FACTURA_136982_..." en mayúsculas), y en cambio sí caía en
+  // los que debía ignorar: "boleta-2026-09-15.pdf" devolvía 2026 como folio y
+  // "factura_20260915.pdf" devolvía la fecha completa. Un año o una fecha
+  // metidos en nro_documento son peores que un campo vacío: alimentan el
+  // control de duplicados y el cruce con contabilidad del aprobador.
+  const m = /(?:factura|boleta|dte|n|f)[ _\-°º]*(\d{3,10})(?![\d])/i.exec(sinExtension);
+  if (!m) return null;
+  const candidato = m[1];
+  if (/^(19|20)\d{2}$/.test(candidato)) return null;            // un año suelto
+  if (/^(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$/.test(candidato)) return null; // AAAAMMDD
+  return candidato;
 }
 
 // Devuelve los datos si el PDF traía texto suficiente, o null para que siga
@@ -2701,6 +2827,18 @@ function esGeneracionVigenteOcr(id, gen) {
 // persona ya haya cerrado el navegador.
 const ocrExitoso = new Map();
 
+// Encolar tiene un costo real: cada reintento del agente gasta solicitudes de
+// la cuota gratuita de Gemini, que es de ~20 por modelo AL DÍA. Antes se
+// encolaba TODO ítem cuyo OCR en vivo no hubiera salido bien, incluso cuando
+// la persona ya había escrito los datos a mano -- el agente reintentaba
+// durante horas para "sugerir" exactamente lo que ya estaba en pantalla, y
+// esa cuota le faltaba después a un comprobante que sí la necesitaba. Solo
+// vale la pena encolar si queda algún hueco que el agente pueda llenar.
+function estadoReintentoOcr(id, huecos) {
+  if (ocrExitoso.get(id) === true) return null;
+  return huecos.some((v) => !v) ? "pendiente" : null;
+}
+
 // El comprobante ya quedó adjunto en el <input type=file> antes de llamar a
 // esto (fotoInput/fotoInput2 lo retienen aunque el OCR falle -- ver
 // addItemRow / buildSinDocumentoFields), así que reintentar no requiere que
@@ -2730,6 +2868,36 @@ function mostrarErrorOcr(statusEl, err, reintentar) {
   ]));
 }
 
+// Último filtro antes de que un monto venga de afuera (IA o cola
+// ocr_previos) y aterrice en el campo. El servidor ya normaliza
+// (normalizarMonto en _shared/gemini-ocr.ts), pero el cliente es el último
+// salto antes de contabilidad y repetía exactamente el bug que se acababa
+// de sacar allá: "Number.isFinite(Number(x))" deja pasar "15.000" como 15
+// (formato chileno leído como decimal, error de 1000x hacia abajo), y un
+// decimal como 13650.42 se renderizaba "13.650,42", que parseMoneyValue
+// -- que borra todo lo que no sea dígito -- convierte en 1.365.042 al
+// enviar, un error de 100x hacia arriba. Además, las filas de ocr_previos
+// guardadas ANTES del arreglo del servidor se aplican por acá.
+//
+// OJO con la tentación de resolverlo con Number.isInteger: Number("15.000")
+// es 15, que ES un entero positivo, así que el chequeo pasa y el error de
+// 1000x sigue vivo. Hay que mirar el FORMATO del string, no solo el número
+// que resulta. Es el mismo criterio que normalizarMonto del servidor: si el
+// formato es ambiguo (ej. "15.00": ¿centavos o miles mal escritos?) se
+// devuelve null y el campo queda vacío, que es preferible a un monto
+// equivocado que nadie revisa.
+function montoValidoCLP(valor) {
+  if (valor === null || valor === undefined) return null;
+  if (typeof valor === "number") return Number.isFinite(valor) && valor > 0 ? Math.round(valor) : null;
+  if (typeof valor !== "string") return null;
+  const s = valor.trim().replace(/^\$\s*/, "");
+  // "1.234.567" o "1.234.567,89": puntos de miles al estilo chileno.
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) return Math.round(Number(s.replace(/\./g, "").replace(",", "."))) || null;
+  if (/^\d+$/.test(s)) return Number(s) || null;
+  if (/^\d+,\d+$/.test(s)) return Math.round(Number(s.replace(",", "."))) || null;
+  return null;
+}
+
 // Aplica el resultado de la IA a los campos de un ítem "Documento
 // electrónico" -- lo usa tanto el éxito en vivo (más abajo) como la cola
 // PRE-envío (ocr_previos) cuando el agente en segundo plano lo resuelve
@@ -2746,20 +2914,33 @@ async function aplicarResultadoOcrCon(id, data, gen) {
     // Si ese RUT ya está en la contabilidad, su razón social real le gana
     // a lo que la IA haya alcanzado a leer de la imagen.
     const nombreReal = await buscarNombreProveedorPorRut(rutFormateado);
-    if (nombreReal && esGeneracionVigenteOcr(id, gen)) document.getElementById(`${id}-nombreprov`).value = nombreReal;
+    // Re-chequeo OBLIGATORIO después del await, y con "return", no con un
+    // "&&" que solo cubra esta línea: mientras la consulta a contabilidad
+    // estaba en vuelo, la persona pudo adjuntar OTRO comprobante. Esa
+    // segunda corrida ya limpió y llenó los campos; si esta sigue de largo,
+    // pisa folio, fecha, descripción y MONTO con los del documento anterior
+    // y deja un ítem con datos de dos comprobantes distintos -- justo lo
+    // que la limpieza de campos venía a evitar.
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+    if (nombreReal) document.getElementById(`${id}-nombreprov`).value = nombreReal;
   }
-  if (data.tipo_documento && TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
-    document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
+  if (data.tipo_documento) {
+    if (TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
+      document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
+    } else {
+      // El desplegable no tiene esta opción (típico: una nota de crédito o
+      // de débito). Antes esto se descartaba en silencio y el select se
+      // quedaba con "Factura Electrónica", así que una NC entraba como
+      // factura, con monto positivo y a la cuenta por pagar -- con el signo
+      // al revés y sin que nadie se enterara. Avisar es lo mínimo.
+      toast(`El comprobante parece ser "${data.tipo_documento}", que no se puede rendir por acá. Revísalo antes de enviar.`);
+    }
   }
   if (data.nro_documento) document.getElementById(`${id}-folio`).value = data.nro_documento;
   if (data.fecha) document.getElementById(`${id}-venc`).value = data.fecha;
   if (data.descripcion) document.getElementById(`${id}-desc`).value = data.descripcion;
-  // Number.isFinite: aunque ocr-recibo ya descarta un monto que no sea un
-  // número válido, un segundo chequeo acá es gratis y evita mostrar
-  // literalmente "NaN" en el campo si algo cambiara del lado del servidor.
-  if (data.monto && Number.isFinite(Number(data.monto))) {
-    document.getElementById(`${id}-monto`).value = Number(data.monto).toLocaleString("es-CL");
-  }
+  const montoIA = montoValidoCLP(data.monto);
+  if (montoIA) document.getElementById(`${id}-monto`).value = montoIA.toLocaleString("es-CL");
   // Igual que en "Gasto directo": solo se aplica si existe tal cual en
   // el desplegable, el campo queda visible y editable para confirmarla.
   if (data.categoria_sugerida) {
@@ -2816,16 +2997,23 @@ function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
 // mezclando el folio/RUT/descripción de una factura con el monto de otra.
 // Son campos que describen al documento adjunto: conservar el valor de otro
 // documento nunca es lo correcto.
+// Los <select> necesitan trato aparte: ponerles value="" cuando no existe
+// una opción con ese valor los deja en selectedIndex = -1 (sin nada
+// seleccionado), y submitRendicion leería "" -- que para tipodoc significa
+// CUENTA_POR_TIPO_DOC[""] = undefined, es decir un ítem sin cuenta contable.
+// Volver al índice 0 los deja en su estado inicial de verdad.
 function limpiarCamposDeComprobante(ids) {
   ids.forEach((campoId) => {
-    const el = document.getElementById(campoId);
-    if (el) el.value = "";
+    const campo = document.getElementById(campoId);
+    if (!campo) return;
+    if (campo.tagName === "SELECT") campo.selectedIndex = 0;
+    else campo.value = "";
   });
 }
 
 async function analizarComprobante(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
-  limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`]);
+  limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`, `${id}-tipodoc`, `${id}-categoriacon`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -2833,6 +3021,18 @@ async function analizarComprobante(id, file, statusEl) {
     // electrónica con texto, sale al instante, gratis y sin gastar cuota de
     // Gemini. Solo si eso no alcanza (foto, PDF escaneado) se llama a la IA.
     const datosLocales = await leerPdfLocal(file);
+    // Freno duro para notas de crédito/débito, ANTES de tocar ningún campo.
+    // Una NC rebaja el pasivo con el proveedor; rendirla como si fuera una
+    // factura lo AUMENTA por el mismo monto, y el error viaja hasta el
+    // asiento contable. El desplegable de tipo de documento no tiene esa
+    // opción, así que no hay forma de cargarla bien por acá. El aviso va en
+    // statusEl y no en un toast a propósito: el toast se desvanece y esto
+    // tiene que quedar a la vista mientras la persona decide qué hacer.
+    if (datosLocales && /^Nota de (Cr[eé]dito|D[eé]bito)$/i.test(datosLocales.tipo_documento || "")) {
+      statusEl.textContent = `⛔ Este documento es una ${datosLocales.tipo_documento}, no una factura o boleta: no se puede rendir por acá porque rebaja lo que se le debe al proveedor en vez de sumarlo. Envíalo a contabilidad directamente y quita este ítem.`;
+      statusEl.className = "ocr-status show err";
+      return;
+    }
     if (datosLocales) {
       // El folio, cuando no se pudo leer del texto, suele venir en el nombre
       // del archivo.
@@ -2870,6 +3070,13 @@ async function analizarComprobante(id, file, statusEl) {
         statusEl.textContent = `✔ Datos leídos del PDF de la factura.${montoOk} Revísalos antes de enviar.`;
       }
       statusEl.className = "ocr-status show ok";
+
+      // Si la aritmética NO confirmó el monto, se le pide una segunda
+      // lectura a la IA para contrastar (ver contrastarMontoConIA). Cuando sí
+      // lo confirmó, no se gasta ni una llamada: ya hay certeza.
+      if (!datosLocales.monto_verificado && datosLocales.monto) {
+        contrastarMontoConIA(id, file, gen, datosLocales.monto, statusEl);
+      }
       return;
     }
 
@@ -2939,9 +3146,8 @@ async function aplicarResultadoOcrSin(id, data, gen) {
     mostrarHistorialProveedor(id, data.nombre_proveedor);
   }
   if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
-  if (data.monto && Number.isFinite(Number(data.monto))) {
-    document.getElementById(`${id}-monto2`).value = Number(data.monto).toLocaleString("es-CL");
-  }
+  const montoIA2 = montoValidoCLP(data.monto);
+  if (montoIA2) document.getElementById(`${id}-monto2`).value = montoIA2.toLocaleString("es-CL");
   // La categoría sugerida solo se aplica si existe tal cual en el
   // desplegable (puede estar filtrado por las cuentas permitidas del
   // usuario) -- el campo queda igual visible y editable para que la
@@ -2958,7 +3164,7 @@ async function aplicarResultadoOcrSin(id, data, gen) {
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
-  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`]);
+  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -3177,7 +3383,16 @@ function fieldSelectCategoria(id) {
     ? CATEGORIAS_GASTO.filter((c) => cuentasPermitidas.has(c.cuenta))
     : CATEGORIAS_GASTO;
   const opciones = filtradas.length ? filtradas : CATEGORIAS_GASTO;
-  const select = el("select", { id }, opciones.map((c) => el("option", { value: c.nombre }, c.nombre)));
+  // Primera opción en blanco, a propósito. Sin ella el desplegable arranca
+  // preseleccionado en la primera categoría de la lista y submitRendicion la
+  // guarda tal cual, así que todo ítem que nadie tocó se iba con esa
+  // categoría. Peor: buscarDatosPreviosPorRut cuenta esas filas para sugerir
+  // "la categoría más usada" del proveedor, con lo cual la sugerencia
+  // terminaba convergiendo al valor por defecto y confirmándose sola.
+  const select = el("select", { id }, [
+    el("option", { value: "" }, "— elegir —"),
+    ...opciones.map((c) => el("option", { value: c.nombre }, c.nombre)),
+  ]);
   return el("div", { class: "field" }, [el("label", { for: id }, "Categoría del gasto"), select]);
 }
 
@@ -3340,10 +3555,16 @@ async function submitRendicion() {
         categoria: document.getElementById(`${id}-categoriacon`)?.value || null,
         monto,
         descripcion: document.getElementById(`${id}-desc`).value.trim(),
-        // Si el OCR en vivo nunca completó este ítem con éxito, queda en
-        // cola para que ocr-reintento-pendientes lo siga intentando en
-        // segundo plano (ver el comentario de ocrExitoso más arriba).
-        ocr_reintento_estado: ocrExitoso.get(id) === true ? null : "pendiente",
+        // Si el OCR en vivo nunca completó este ítem con éxito Y todavía
+        // falta algún dato que el agente pueda aportar, queda en cola para
+        // que ocr-reintento-pendientes lo siga intentando en segundo plano
+        // (ver estadoReintentoOcr más arriba).
+        ocr_reintento_estado: estadoReintentoOcr(id, [
+          document.getElementById(`${id}-nombreprov`).value.trim(),
+          rutProveedor,
+          document.getElementById(`${id}-folio`).value.trim(),
+          document.getElementById(`${id}-desc`).value.trim(),
+        ]),
         _fotoInput: fotoInput,
       });
     } else {
@@ -3370,9 +3591,12 @@ async function submitRendicion() {
         categoria: document.getElementById(`${id}-categoria`).value,
         monto,
         descripcion: document.getElementById(`${id}-desc2`).value.trim(),
-        // Igual que en ConDocumento: si el OCR en vivo nunca completó este
-        // ítem con éxito, queda en cola para el reintento en segundo plano.
-        ocr_reintento_estado: ocrExitoso.get(id) === true ? null : "pendiente",
+        // Igual que en ConDocumento. Acá el único hueco que el agente puede
+        // llenar es la descripción: el gasto directo no tiene proveedor ni
+        // folio que leer.
+        ocr_reintento_estado: estadoReintentoOcr(id, [
+          document.getElementById(`${id}-desc2`).value.trim(),
+        ]),
         _fotoInput: fotoInput2,
       });
     }
@@ -3986,9 +4210,11 @@ async function openDetalle(id, pushHistory = true) {
     // Resultado del "agente" que reintenta el OCR en segundo plano (ver
     // migracion_ocr_reintento.sql): nunca pisa lo ya guardado, es solo una
     // sugerencia para que quien revisa el ítem decida si vale la pena
-    // aplicarla a mano (vía "Editar"). "agotado" no se muestra -- ya se
-    // avisó del fallo al momento de crear el ítem, no hace falta insistir
-    // para siempre con algo que se determinó ilegible.
+    // aplicarla a mano (vía "Editar"). Los tres estados se muestran, incluido
+    // "agotado": antes ese caso no renderizaba nada, así que el aviso
+    // "🔄 la IA sigue intentando" simplemente desaparecía de la pantalla y
+    // quien revisaba quedaba sin desenlace -- sin saber si había terminado
+    // bien, si seguía corriendo o si el ítem se había caído de la cola.
     // OJO: el display:block de .ocr-status va en un <div> ADENTRO del <td>,
     // no en el <td> mismo -- mismo motivo que acciones-cell más arriba:
     // ponerle un display distinto de table-cell directo a una celda con
@@ -4014,6 +4240,13 @@ async function openDetalle(id, pushHistory = true) {
         el("td", { colspan: String(columnas.length) }, [
           el("div", { class: "ocr-status show ok" },
             `💡 La IA logró leer este comprobante en un reintento en segundo plano: ${partes || "sin datos nuevos"}. Revísalo y aplícalo a mano con "Editar" si corresponde.`),
+        ]),
+      ]));
+    } else if (it.ocr_reintento_estado === "agotado") {
+      tbody.appendChild(el("tr", {}, [
+        el("td", { colspan: String(columnas.length) }, [
+          el("div", { class: "ocr-status show" },
+            "La IA no pudo leer este comprobante ni siquiera reintentando en segundo plano. Los datos del ítem son los que cargó la persona a mano: revísalos contra el comprobante adjunto."),
         ]),
       ]));
     }

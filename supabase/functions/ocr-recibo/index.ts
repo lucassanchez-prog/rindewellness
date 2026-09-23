@@ -71,8 +71,14 @@ Deno.serve(async (req: Request) => {
     // reintentar unas cuantas veces durante un incidente sin llegar a
     // trabarse, sin dejar de ser un tope muy por encima de lo que alguien
     // carga a mano en una rendición real.
+    // OJO con este número: cada "ocr_call" puede gastar hasta MAX_CANDIDATOS
+    // solicitudes de Gemini (ver gemini-ocr.ts), y la cuota gratuita es de
+    // ~20 por modelo AL DÍA. Con el 60 que había acá, un solo usuario podía
+    // consumir 120 solicitudes en una hora -- más que la cuota diaria
+    // completa. El tope está denominado en llamadas, no en solicitudes, así
+    // que hay que dividirlo por el abanico de candidatos.
     const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
-    if (llamadasRecientes >= 60) {
+    if (llamadasRecientes >= 25) {
       throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
     }
     await logEvent(admin, "ocr_call", { usuarioId: userId });
