@@ -56,11 +56,15 @@ Deno.serve(async (req: Request) => {
   // comprobante en ocr_previos si la lectura en vivo falla -- ver más abajo.
   let imageBase64: string | undefined;
   let mimeType: string | undefined;
+  // datosParciales también vive acá afuera: el catch lo necesita para
+  // guardarlo junto al comprobante encolado en ocr_previos.
+  let camposFaltantes: string[] | null = null;
+  let datosParciales: Record<string, unknown> | null = null;
   try {
     const user = await requireUser(req);
     userId = user.id;
 
-    ({ imageBase64, mimeType } = await req.json());
+    ({ imageBase64, mimeType, camposFaltantes, datosParciales } = await req.json());
 
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
@@ -92,7 +96,29 @@ Deno.serve(async (req: Request) => {
       throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
     }
 
-    const resultado = await leerComprobante(admin, imageBase64, mimeType);
+    // ACÁ está el ahorro de cuota. El navegador lee el PDF localmente con
+    // pdf.js antes de llamar acá, y cuando esa lectura sale completa manda
+    // "camposFaltantes" vacío. Gastar una solicitud de Gemini para volver a
+    // leer un documento que ya se leyó entero es exactamente lo que dejó la
+    // app sin OCR un día completo: la cuota gratuita es de ~20 solicitudes
+    // POR MODELO AL DÍA. Si no falta nada, se devuelve lo que ya se sabía y
+    // no se llama a Gemini en absoluto.
+    //
+    // La lista vacía y la ausencia del campo NO son lo mismo: un cliente
+    // viejo (o el agente en segundo plano) no manda "camposFaltantes", y ahí
+    // hay que leer todo como siempre. Solo un array presente Y vacío
+    // significa "no falta nada".
+    if (Array.isArray(camposFaltantes) && camposFaltantes.length === 0) {
+      await logEvent(admin, "ocr_sin_llamada", { usuarioId: userId });
+      return new Response(JSON.stringify(datosParciales || {}), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const resultado = await leerComprobante(admin, imageBase64, mimeType, undefined, {
+      camposFaltantes,
+      datosParciales,
+    });
 
     // No es un fallo (la función igual responde 200), pero si Gemini no
     // sacó ningún dato útil del comprobante, se loguea para tener
@@ -135,6 +161,10 @@ Deno.serve(async (req: Request) => {
         const { data: previa, error: errInsert } = await admin.from("ocr_previos").insert({
           usuario_id: userId,
           storage_path: path,
+          // Lo que la lectura local ya había sacado del texto del PDF. El
+          // agente en segundo plano arranca de acá en vez de releer el
+          // documento entero (ver procesarPendiente).
+          datos_parciales: datosParciales && Object.keys(datosParciales).length ? datosParciales : null,
         }).select("id").single();
         if (errInsert) throw errInsert;
         previaId = previa.id as string;

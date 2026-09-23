@@ -160,6 +160,38 @@ function mimeTypeDesdeNombre(path: string): string {
 // Misma lógica de descarga+lectura+actualización para las dos colas
 // (ocr_previos y rendicion_items) -- solo cambian la tabla y los nombres de
 // columna. Devuelve true si tuvo éxito.
+// Los campos que la lectura local no alcanzó a resolver. Mismo criterio que
+// en el navegador (ver CAMPOS_OCR_CON en app.js): si se cambia allá, hay que
+// cambiarlo acá.
+const CAMPOS_OCR = [
+  "nombre_proveedor", "rut_proveedor", "tipo_documento", "nro_documento",
+  "fecha", "monto", "descripcion", "categoria_sugerida",
+];
+function camposFaltantesDe(parciales: Record<string, unknown> | null): string[] {
+  if (!parciales) return CAMPOS_OCR;
+  return CAMPOS_OCR.filter((c) => parciales[c] === null || parciales[c] === undefined || parciales[c] === "");
+}
+
+// El RUT, el tipo, el folio, la fecha y el monto de la lectura local le ganan
+// a los de Gemini, y no por desconfianza en el modelo: salen del TEXTO del
+// documento, mientras que los del modelo salen de interpretar una imagen. Que
+// el reintento de segundo plano "corrija" un folio que ya estaba bien leído
+// sería un retroceso silencioso, y nadie lo estaría mirando cuando pasa.
+function fusionarConParciales(
+  parciales: Record<string, unknown> | null,
+  resultado: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!parciales) return resultado;
+  const DETERMINISTAS = ["rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto"];
+  const fusionado: Record<string, unknown> = { ...resultado };
+  for (const campo of DETERMINISTAS) {
+    if (parciales[campo] !== null && parciales[campo] !== undefined && parciales[campo] !== "") {
+      fusionado[campo] = parciales[campo];
+    }
+  }
+  return fusionado;
+}
+
 async function procesarPendiente(
   admin: ReturnType<typeof createClient>,
   tabla: string,
@@ -167,6 +199,7 @@ async function procesarPendiente(
   storagePath: string,
   intentosPrevios: number,
   col: { estado: string; resultado: string; intentos: string; ultimo: string },
+  datosParciales: Record<string, unknown> | null = null,
 ): Promise<boolean> {
   try {
     const { data: archivo, error: errDescarga } = await admin.storage.from("comprobantes").download(storagePath);
@@ -188,11 +221,20 @@ async function procesarPendiente(
     // Presupuesto largo: acá no hay nadie mirando un spinner, así que se le
     // da a Gemini el tiempo que de verdad necesita para leer un documento
     // (ver PresupuestoTiempo en _shared/gemini-ocr.ts).
-    const resultado = await leerComprobante(admin, base64, mimeType, PRESUPUESTO_SEGUNDO_PLANO);
+    // La lectura local del navegador (pdf.js) ya pudo haber sacado el RUT,
+    // el folio, la fecha y el monto del TEXTO del documento antes de que
+    // fallara la llamada en vivo. Se le dice a Gemini qué falta y qué ya se
+    // sabe: la solicitud cuesta lo mismo, pero rinde más y no se gasta en
+    // releer lo ya leído.
+    const faltantes = camposFaltantesDe(datosParciales);
+    const resultado = await leerComprobante(admin, base64, mimeType, PRESUPUESTO_SEGUNDO_PLANO, {
+      camposFaltantes: faltantes,
+      datosParciales,
+    });
 
     await admin.from(tabla).update({
       [col.estado]: "listo",
-      [col.resultado]: resultado,
+      [col.resultado]: fusionarConParciales(datosParciales, resultado),
       [col.intentos]: intentosPrevios + 1,
       [col.ultimo]: new Date().toISOString(),
     }).eq("id", id);
@@ -238,7 +280,7 @@ Deno.serve(async (req: Request) => {
     // ---- Cola 1: ocr_previos (comprobantes de antes de enviar la rendición) ----
     let consultaPrevios = admin
       .from("ocr_previos")
-      .select("id, storage_path, intentos")
+      .select("id, storage_path, intentos, datos_parciales")
       .eq("estado", "pendiente")
       .order("ultimo_intento", { ascending: true, nullsFirst: true })
       .limit(LOTE_PREVIOS);
@@ -248,7 +290,7 @@ Deno.serve(async (req: Request) => {
     for (const p of previos || []) {
       if (!quedaTiempo()) break;
       procesados++;
-      if (await procesarPendiente(admin, "ocr_previos", p.id as string, p.storage_path as string, (p.intentos as number) || 0, COL_PREVIOS)) exitosos++;
+      if (await procesarPendiente(admin, "ocr_previos", p.id as string, p.storage_path as string, (p.intentos as number) || 0, COL_PREVIOS, (p.datos_parciales as Record<string, unknown> | null) || null)) exitosos++;
     }
 
     // ---- Cola 2: rendicion_items (ítems ya guardados sin OCR exitoso) ----

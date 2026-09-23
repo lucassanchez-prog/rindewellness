@@ -58,3 +58,17 @@ create index if not exists idx_ocr_previos_pendiente
 --   supabase functions deploy ocr-reintento-pendientes
 -- (ocr-recibo ahora sube el archivo a Storage y crea esta fila cuando falla
 -- en vivo; ocr-reintento-pendientes ahora también procesa esta cola.)
+
+-- ------------------------------------------------------------
+-- datos_parciales: lo que la lectura LOCAL (pdf.js en el navegador) alcanzó
+-- a sacar del documento antes de que fallara la llamada a la IA.
+--
+-- Sin esto, el agente en segundo plano reprocesaba el comprobante entero
+-- desde cero aunque el RUT, el folio y el monto ya se supieran con certeza
+-- -- gastaba una solicitud completa de Gemini (de las ~20 por modelo al día
+-- que hay) para volver a averiguar lo ya averiguado, y encima su resultado,
+-- que sale de interpretar una imagen, podía contradecir un dato que se había
+-- leído del TEXTO del documento. Ahora arranca desde acá: le pide a Gemini
+-- solo los campos que faltan y fusiona sin pisar lo determinista.
+-- ------------------------------------------------------------
+alter table public.ocr_previos add column if not exists datos_parciales jsonb;

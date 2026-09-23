@@ -205,6 +205,38 @@ Si no puedes leer un dato con certeza, usa null en ese campo. No inventes datos.
 El monto debe ser el total final del documento, sin puntos ni signos, solo el número.
 Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la lista (respetando tildes y mayúsculas), nunca inventes una categoría nueva.`;
 
+// El navegador ya leyó el PDF localmente con pdf.js antes de llegar acá, así
+// que muchas veces sabe el RUT, el folio y el monto con certeza -- salen del
+// TEXTO del documento, no de interpretar una imagen. Mandarle eso a Gemini
+// como contexto, y pedirle solo lo que falta, sirve para dos cosas: lo ubica
+// en el documento (un folio y un RUT conocidos son anclas muy fuertes) y
+// acota la respuesta a lo que de verdad hace falta.
+//
+// OJO: esto NO ahorra solicitudes por sí solo -- una llamada enfocada cuesta
+// exactamente lo mismo que una completa. El ahorro real está en no llamar
+// cuando no falta nada (ver ocr-recibo), que es el caso más común desde que
+// la lectura local funciona. Esto solo hace que la solicitud que sí se gasta
+// rinda más.
+function armarPrompt(camposFaltantes?: string[] | null, datosParciales?: Record<string, unknown> | null): string {
+  const faltan = (camposFaltantes || []).filter((c) => typeof c === "string" && c.length);
+  const conocidos = Object.entries(datosParciales || {}).filter(([, v]) => v !== null && v !== undefined && v !== "");
+  if (!faltan.length && !conocidos.length) return PROMPT;
+
+  let extra = "\n\nCONTEXTO ADICIONAL:";
+  if (conocidos.length) {
+    extra += `\nEstos datos YA se extrajeron del texto del documento y son correctos; úsalos para ubicarte y NO los contradigas:\n`
+      + conocidos.map(([k, v]) => `  - ${k}: ${JSON.stringify(v)}`).join("\n");
+  }
+  if (faltan.length) {
+    // Se le sigue pidiendo el JSON COMPLETO aunque solo interesen algunos
+    // campos: pedirle un JSON de forma variable a un LLM es pedirle que se
+    // equivoque en la forma, y el costo de que devuelva los demás campos es
+    // cero. El consumidor ya sabe cuáles mirar.
+    extra += `\nDe todo el JSON, los campos que de verdad hacen falta son: ${faltan.join(", ")}. Pon especial cuidado en esos. Devuelve igual el JSON completo con la forma indicada.`;
+  }
+  return PROMPT + extra;
+}
+
 // Gemini a veces devuelve "high demand" de forma transitoria (picos de uso),
 // la capa gratuita tiene un límite de solicitudes POR MINUTO ("quota
 // exceeded") que se libera solo unos segundos después, y a veces un modelo
@@ -383,6 +415,7 @@ export async function leerComprobante(
   imageBase64: string,
   mimeType: string,
   presupuesto: PresupuestoTiempo = PRESUPUESTO_EN_VIVO,
+  enfoque?: { camposFaltantes?: string[] | null; datosParciales?: Record<string, unknown> | null },
 ): Promise<ResultadoOcr> {
   if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
 
@@ -390,7 +423,7 @@ export async function leerComprobante(
     contents: [
       {
         parts: [
-          { text: PROMPT },
+          { text: armarPrompt(enfoque?.camposFaltantes, enfoque?.datosParciales) },
           { inline_data: { mime_type: mimeType || "image/jpeg", data: imageBase64 } },
         ],
       },

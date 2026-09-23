@@ -2534,38 +2534,231 @@ function totalPorNetoMasIva(importes) {
   return mejor;
 }
 
-// Segunda opinión de la IA, SOLO cuando la lectura local no pudo confirmar
-// el monto por aritmética (factura exenta, maquetado raro, subtotales
-// ilegibles). Dos lectores independientes que coinciden son mucha más
-// evidencia que uno solo; y si difieren, se avisa en vez de elegir en
-// silencio -- que es lo peor que puede pasar con un monto que va a
-// contabilidad.
+// ============================================================
+// UN LECTOR, DOS FUENTES
+// ------------------------------------------------------------
+// Antes había DOS caminos paralelos y excluyentes: si la lectura local
+// devolvía algo se aplicaba y la IA no se llamaba nunca (salvo para
+// contrastar el monto), y si devolvía null todo venía de la IA. El
+// resultado era que un PDF que sí se leía local pero al que le faltaba el
+// folio, o cuya descripción quedaba en null, dejaba esos campos VACÍOS
+// aunque la IA los habría podido leer.
 //
-// Se gasta cuota de Gemini únicamente en los casos dudosos, que son pocos:
-// cuando la aritmética cuadra no se llama a la IA en absoluto. Corre en
-// segundo plano, sin bloquear: los campos ya quedaron llenos con la lectura
-// local, esto solo confirma o advierte.
-async function contrastarMontoConIA(id, file, gen, montoLocal, statusEl) {
-  try {
-    const data = await llamarOcrRecibo(file);
-    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
-    const montoIA = Number(data?.monto);
-    if (!Number.isFinite(montoIA) || !montoIA) return; // la IA no leyó monto: se deja lo local como está
+// Ahora los dos caminos terminan en la misma función de fusión
+// (fusionarLecturas) y la IA es una segunda fuente que solo rellena huecos.
+// El tope de UNA llamada por comprobante no es negociable: la cuota gratuita
+// de Gemini es de ~20 solicitudes POR MODELO AL DÍA, el usuario decidió no
+// pagar, y ya hubo un día entero sin OCR porque la propia maquinaria de
+// reintentos se la comió sola. Cuando la lectura local dejó todo lleno y la
+// aritmética confirmó el monto, se gastan CERO llamadas.
+// ============================================================
 
-    if (montoIA === montoLocal) {
-      statusEl.textContent = `✔ Datos leídos del PDF. Monto confirmado: la IA leyó el mismo total (${fmtCLP(montoLocal)}). Revisa el resto antes de enviar.`;
-      statusEl.className = "ocr-status show ok";
+// Los campos que conoce la fusión, por formulario. "Documento electrónico"
+// los tiene todos; "Gasto directo" solo muestra proveedor, descripción,
+// monto y categoría, así que pedirle a la IA lo que ese formulario ni
+// siquiera puede mostrar sería gastar cuota para nada.
+const CAMPOS_OCR_CON = ["nombre_proveedor", "rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto", "descripcion", "categoria_sugerida"];
+const CAMPOS_OCR_SIN = ["nombre_proveedor", "monto", "descripcion", "categoria_sugerida"];
+
+// Solo para el mensaje que se le muestra a la persona: los nombres internos
+// ("nro_documento") no significan nada para quien está rindiendo.
+const ETIQUETA_CAMPO_OCR = {
+  nombre_proveedor: "proveedor",
+  rut_proveedor: "RUT",
+  tipo_documento: "tipo de documento",
+  nro_documento: "folio",
+  fecha: "fecha",
+  monto: "monto",
+  descripcion: "descripción",
+  categoria_sugerida: "categoría",
+};
+
+// Todo lo que se puede saber de un RUT sin gastar una sola solicitud de
+// Gemini: razón social real, categoría con la que contabilidad registró
+// antes a este proveedor, y qué se cargó la última vez en la propia app.
+// Van juntas y en paralelo porque son independientes entre sí y el
+// formulario está esperando.
+async function resolverDatosContables(rut) {
+  const vacio = { rut: null, nombre_proveedor: null, categoria: null, descripcion: null, desdeContabilidad: false };
+  if (!rut) return vacio;
+  // El RUT se normaliza ANTES de consultar: la lectura local lo saca con
+  // puntos ("77.574.911-3") y la IA suele devolverlo pelado ("77574911-3"),
+  // pero las dos bases lo guardan en la forma con puntos (es la que escribe
+  // aplicarResultadoOcrCon). Sin esto, el mismo proveedor encontraba
+  // historial cuando venía del PDF y no cuando venía de una foto.
+  const rutFormateado = formatearRut(rut);
+  const [nombre, categoriaContable, previos] = await Promise.all([
+    buscarNombreProveedorPorRut(rutFormateado),
+    buscarCategoriaEnContabilidad(rutFormateado),
+    buscarDatosPreviosPorRut(rutFormateado),
+  ]);
+  return {
+    rut: rutFormateado,
+    nombre_proveedor: nombre,
+    categoria: categoriaContable || previos.categoria,
+    descripcion: previos.descripcion,
+    // Se distingue la categoría que sale de la CONTABILIDAD REAL (años de
+    // asientos) de la que sale del historial de la app, porque el mensaje
+    // que ve la persona dice de dónde viene y eso cambia cuánto confiar.
+    desdeContabilidad: !!categoriaContable,
+  };
+}
+
+// Campos que quedaron sin valor después de la lectura local + contabilidad.
+function camposFaltantesOcr(datos, campos) {
+  return campos.filter((c) => !datos || !datos[c]);
+}
+
+// Lo que se le pide a la IA: los campos faltantes, MÁS el monto cuando la
+// aritmética del documento no lo pudo confirmar. El monto ahí no está
+// técnicamente "faltando" (hay un número), pero es el dato que más caro sale
+// equivocado, así que vale la pena que la única llamada que tenemos también
+// traiga una segunda lectura suya para contrastar -- que es exactamente lo
+// que hacía contrastarMontoConIA antes de integrarse a la fusión. Si la
+// aritmética ya lo confirmó no se pide: no hay nada que contrastar.
+function camposAPedirOcr(datos, campos) {
+  const faltan = camposFaltantesOcr(datos, campos);
+  if (campos.includes("monto") && datos && datos.monto && !datos.monto_verificado && !faltan.includes("monto")) faltan.push("monto");
+  return faltan;
+}
+
+// Qué campos JUSTIFICAN gastar una solicitud de Gemini, que es distinto de
+// qué campos se le piden. Los que están acá salen del documento y son caros
+// de equivocar o latosos de tipear a mano; los que NO están (nombre del
+// proveedor, descripción, categoría) son comodidades que la persona
+// completa en segundos y que casi siempre resuelve contabilidad gratis.
+//
+// La distinción no es un refinamiento: sin ella este cambio AUMENTABA el
+// consumo en vez de mantenerlo. Antes se llamaba a la IA solo cuando la
+// aritmética no confirmaba el monto; con la fusión, un proveedor nuevo sin
+// historial deja vacíos nombre, categoría y descripción, y eso habría
+// disparado una llamada en un caso donde antes había cero. Con un techo de
+// ~20 solicitudes por modelo al día, esa diferencia se nota el mismo día.
+const CAMPOS_QUE_JUSTIFICAN_IA = new Set(["rut_proveedor", "monto", "nro_documento", "fecha", "tipo_documento"]);
+
+// Se le pide TODO lo que falta (los campos extra salen gratis en la misma
+// solicitud), pero solo se gasta la solicitud si falta algo sustantivo.
+function valeLaPenaLlamarIA(pedidos) {
+  return pedidos.some((c) => CAMPOS_QUE_JUSTIFICAN_IA.has(c));
+}
+
+// Lo que la lectura local SÍ obtuvo, para mandárselo a ocr-recibo y que no
+// tenga que adivinar de nuevo lo que ya sabemos (contrato acordado con el
+// lado servidor).
+function datosParcialesOcr(datos) {
+  const out = {};
+  if (!datos) return out;
+  CAMPOS_OCR_CON.forEach((c) => { if (datos[c]) out[c] = datos[c]; });
+  return out;
+}
+
+// LA función de fusión: todo lo que termina en los campos del formulario
+// pasa por acá, venga de la lectura local, de contabilidad o de la IA.
+//
+// La precedencia no es un gusto, sale de cuán determinista es cada fuente:
+//  - RUT, tipo, folio y fecha salen del TEXTO del documento, así que lo
+//    local gana siempre que exista; la IA (que interpreta una imagen) solo
+//    rellena huecos.
+//  - Nombre, categoría y descripción no están en el texto, o están peor que
+//    en el historial: contabilidad primero, IA después, local al final.
+//  - El monto NUNCA se cambia solo. Si las dos fuentes coinciden queda
+//    confirmado; si difieren se avisa y se deja el local, porque cuál es el
+//    correcto lo decide la persona mirando la factura.
+//
+// Devuelve tres cosas:
+//  - datos: la fusión completa, para aplicar cuando no se aplicó nada aún.
+//  - aporteIA: SOLO los campos que puso la IA. Es lo que se aplica en la
+//    segunda pasada -- repisar los campos locales 20 segundos después
+//    borraría lo que la persona haya corregido a mano mientras esperaba.
+//  - avisos: lo que hay que decirle a la persona sobre el monto.
+function fusionarLecturas(local, ia, contable) {
+  const L = local || {};
+  const I = ia || {};
+  const C = contable || {};
+  const datos = {};
+  const aporteIA = {};
+  const avisos = [];
+
+  // Determinista primero: lo local manda, la IA solo rellena.
+  ["rut_proveedor", "tipo_documento", "nro_documento", "fecha"].forEach((campo) => {
+    datos[campo] = L[campo] || I[campo] || null;
+    if (!L[campo] && I[campo]) aporteIA[campo] = I[campo];
+  });
+
+  // Contabilidad manda: son datos de personas y de asientos reales, no de
+  // un modelo mirando una imagen.
+  [["nombre_proveedor", C.nombre_proveedor], ["descripcion", C.descripcion], ["categoria_sugerida", C.categoria]].forEach(([campo, valorContable]) => {
+    datos[campo] = valorContable || I[campo] || L[campo] || null;
+    if (!valorContable && I[campo] && I[campo] !== L[campo]) aporteIA[campo] = I[campo];
+  });
+
+  // El monto pasa por montoValidoCLP a propósito: es el último filtro antes
+  // de que un número de afuera aterrice en un campo que va a contabilidad.
+  const montoLocal = montoValidoCLP(L.monto);
+  const montoIA = montoValidoCLP(I.monto);
+  datos.monto = montoLocal || montoIA || null;
+  datos.monto_verificado = !!L.monto_verificado;
+  if (montoLocal && montoIA) {
+    if (montoLocal === montoIA) {
+      // Dos lectores independientes que coinciden son mucha más evidencia
+      // que uno solo: el monto queda tan confirmado como por aritmética.
+      datos.monto_verificado = true;
+      avisos.push({ ok: true, texto: `Monto confirmado: la IA leyó el mismo total (${fmtCLP(montoLocal)}).` });
+    } else {
+      avisos.push({ ok: false, texto: `⚠ Ojo con el monto: del texto del PDF se leyó ${fmtCLP(montoLocal)}, pero la IA leyó ${fmtCLP(montoIA)}. Se dejó el primero. Confirma cuál corresponde mirando la factura antes de enviar.` });
+    }
+  } else if (!montoLocal && montoIA) {
+    aporteIA.monto = montoIA;
+  }
+
+  return { datos, aporteIA, avisos };
+}
+
+// La ÚNICA llamada a la IA del camino con lectura local, y solo cuando
+// quedaron huecos. Corre en segundo plano a propósito: los campos locales ya
+// están en pantalla, nadie tiene que mirar un spinner 15-25s para recién ver
+// algo. Si falla (cuota agotada, timeout) no se alarma a nadie ni se muestra
+// el botón de reintento -- lo local ya sirve para enviar la rendición.
+async function completarConIA({ id, file, gen, statusEl, local, contable, datos, campos, aplicar, textoBase }) {
+  try {
+    const ia = await llamarOcrRecibo(file, camposAPedirOcr(datos, campos), datosParcialesOcr(datos));
+    // Re-chequeo OBLIGATORIO después de CADA await, y con "return": mientras
+    // la IA respondía, la persona pudo adjuntar otro comprobante. Si esto
+    // sigue de largo, deja el ítem con datos de dos documentos distintos.
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+
+    // Si el RUT lo aportó la IA (el PDF tenía texto pero no un RUT legible),
+    // recién ahora se le puede preguntar a contabilidad por ese proveedor.
+    let contableFinal = contable;
+    if (!contableFinal || !contableFinal.rut) {
+      if (ia && ia.rut_proveedor) {
+        contableFinal = await resolverDatosContables(ia.rut_proveedor);
+        if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+      }
+    }
+
+    const { aporteIA, avisos } = fusionarLecturas(local, ia, contableFinal);
+    await aplicar(id, aporteIA, gen);
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+
+    // Una discrepancia de monto se come el mensaje entero: es lo único que
+    // hay que mirar antes de enviar, y mezclarlo con "la IA completó el
+    // folio" lo esconde.
+    const problema = avisos.find((a) => !a.ok);
+    if (problema) {
+      statusEl.textContent = problema.texto;
+      statusEl.className = "ocr-status show err";
       return;
     }
-    // Discrepancia: NO se cambia el campo solo. El valor local es
-    // determinista (sale del texto del documento) y la IA interpreta una
-    // imagen; cuál es el correcto lo decide la persona mirando la factura.
-    statusEl.textContent = `⚠ Ojo con el monto: del texto del PDF se leyó ${fmtCLP(montoLocal)}, pero la IA leyó ${fmtCLP(montoIA)}. Se dejó el primero. Confirma cuál corresponde mirando la factura antes de enviar.`;
-    statusEl.className = "ocr-status show err";
+    const llenados = Object.keys(aporteIA).filter((c) => campos.includes(c)).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
+    const extra = (llenados.length ? ` La IA completó lo que faltaba: ${llenados.join(", ")}.` : "")
+      + avisos.map((a) => ` ${a.texto}`).join("");
+    statusEl.textContent = `${textoBase}${extra}`;
+    statusEl.className = "ocr-status show ok";
   } catch (err) {
-    // Que falle la segunda opinión no es un problema: la lectura local ya
+    // Que falle la segunda fuente no es un problema: la lectura local ya
     // llenó los campos. Se registra y se sigue, sin alarmar a nadie.
-    console.error("No se pudo contrastar el monto con la IA:", err);
+    console.error("No se pudieron completar los campos faltantes con la IA:", err);
   }
 }
 
@@ -2757,7 +2950,13 @@ async function leerPdfLocal(file) {
   }
 }
 
-async function llamarOcrRecibo(file) {
+// "camposFaltantes" y "datosParciales" son opcionales y van en el body para
+// que ocr-recibo lea SOLO lo que la lectura local no pudo sacar, en vez de
+// releer el documento entero. No cambian el costo de la llamada (sigue
+// siendo una sola solicitud a Gemini), pero sí lo que se le pide. Si el
+// servidor todavía no los soporta simplemente los ignora y responde como
+// siempre, así que mandarlos es inofensivo.
+async function llamarOcrRecibo(file, camposFaltantes, datosParciales) {
   const imageBase64 = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
@@ -2765,8 +2964,12 @@ async function llamarOcrRecibo(file) {
     reader.readAsDataURL(file);
   });
 
+  const body = { imageBase64, mimeType: file.type || "image/jpeg" };
+  if (camposFaltantes && camposFaltantes.length) body.camposFaltantes = camposFaltantes;
+  if (datosParciales && Object.keys(datosParciales).length) body.datosParciales = datosParciales;
+
   const { data, error } = await conTimeout(
-    db.functions.invoke("ocr-recibo", { body: { imageBase64, mimeType: file.type || "image/jpeg" } }),
+    db.functions.invoke("ocr-recibo", { body }),
     // Tiene que ser MAYOR que el presupuesto del servidor (PRESUPUESTO_EN_VIVO
     // en _shared/gemini-ocr.ts, 30s) más el viaje de red -- si no, cortamos
     // acá justo antes de que la respuesta buena llegue. Sí, 45s de spinner es
@@ -2912,8 +3115,12 @@ async function aplicarResultadoOcrCon(id, data, gen) {
     const rutFormateado = formatearRut(data.rut_proveedor);
     document.getElementById(`${id}-rut`).value = rutFormateado;
     // Si ese RUT ya está en la contabilidad, su razón social real le gana
-    // a lo que la IA haya alcanzado a leer de la imagen.
-    const nombreReal = await buscarNombreProveedorPorRut(rutFormateado);
+    // a lo que la IA haya alcanzado a leer de la imagen. Se salta cuando el
+    // nombre ya vino resuelto: los caminos que pasan por fusionarLecturas ya
+    // consultaron contabilidad (resolverDatosContables), y repetir la
+    // consulta acá no solo es una query de más, es un await de más en el que
+    // la persona puede adjuntar otro comprobante.
+    const nombreReal = data.nombre_proveedor ? null : await buscarNombreProveedorPorRut(rutFormateado);
     // Re-chequeo OBLIGATORIO después del await, y con "return", no con un
     // "&&" que solo cubra esta línea: mientras la consulta a contabilidad
     // estaba en vuelo, la persona pudo adjuntar OTRO comprobante. Esa
@@ -3037,54 +3244,61 @@ async function analizarComprobante(id, file, statusEl) {
       // El folio, cuando no se pudo leer del texto, suele venir en el nombre
       // del archivo.
       if (!datosLocales.nro_documento) datosLocales.nro_documento = folioDesdeNombreArchivo(file.name);
-      // Categoría y descripción no salen del PDF. La categoría se busca
-      // primero en la CONTABILIDAD (con qué cuenta de gasto se registró
-      // antes a este proveedor: años de asientos reales) y, si ahí no hay
-      // nada, en el historial de la propia app. La descripción sale del
-      // último ítem cargado para este proveedor.
-      const [categoriaContable, previos] = await Promise.all([
-        buscarCategoriaEnContabilidad(datosLocales.rut_proveedor),
-        buscarDatosPreviosPorRut(datosLocales.rut_proveedor),
-      ]);
-      datosLocales.categoria_sugerida = categoriaContable || previos.categoria;
-      // La descripción que escribió una persona para este mismo proveedor le
-      // gana al detalle crudo del PDF ("Creatina y proteína Foodtech" es más
-      // útil que "1577 Creatine 100% Pure Monohydrate 1kg - Foodtech…"), pero
-      // si no hay historial, el detalle del documento es mejor que nada.
-      datosLocales.descripcion = previos.descripcion || datosLocales.descripcion;
+      // Categoría, descripción y razón social no salen del PDF: salen de la
+      // CONTABILIDAD (con qué cuenta de gasto se registró antes a este
+      // proveedor: años de asientos reales) y del historial de la propia
+      // app. Es información que no cuesta ni una solicitud de Gemini.
+      const contable = await resolverDatosContables(datosLocales.rut_proveedor);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
 
-      await aplicarResultadoOcrCon(id, datosLocales, gen);
+      const { datos } = fusionarLecturas(datosLocales, null, contable);
+      await aplicarResultadoOcrCon(id, datos, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
       // Se dice explícitamente si el monto quedó CONFIRMADO por la
       // aritmética del documento: sirve para dirigir la revisión al dato que
       // de verdad la necesita, en vez de pedir que se revise todo por igual.
-      const montoOk = datosLocales.monto_verificado ? " Monto confirmado (neto + IVA cuadran con el total)." : "";
+      const montoOk = datos.monto_verificado ? " Monto confirmado (neto + IVA cuadran con el total)." : "";
       // También de dónde salió la categoría: si viene de contabilidad,
       // conviene decirlo -- es un dato más fuerte que el historial de la app
       // y ayuda a que la persona decida si confiar en él o cambiarlo.
-      if (categoriaContable) {
-        statusEl.textContent = `✔ Datos leídos del PDF.${montoOk} Categoría sugerida: "${categoriaContable}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalo antes de enviar.`;
-      } else if (previos.categoria || previos.descripcion) {
-        statusEl.textContent = `✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor.${montoOk} Revísalos antes de enviar.`;
+      let textoBase;
+      if (contable.desdeContabilidad) {
+        textoBase = `✔ Datos leídos del PDF.${montoOk} Categoría sugerida: "${contable.categoria}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalo antes de enviar.`;
+      } else if (contable.categoria || contable.descripcion) {
+        textoBase = `✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor.${montoOk} Revísalos antes de enviar.`;
       } else {
-        statusEl.textContent = `✔ Datos leídos del PDF de la factura.${montoOk} Revísalos antes de enviar.`;
+        textoBase = `✔ Datos leídos del PDF de la factura.${montoOk} Revísalos antes de enviar.`;
       }
+      statusEl.textContent = textoBase;
       statusEl.className = "ocr-status show ok";
 
-      // Si la aritmética NO confirmó el monto, se le pide una segunda
-      // lectura a la IA para contrastar (ver contrastarMontoConIA). Cuando sí
-      // lo confirmó, no se gasta ni una llamada: ya hay certeza.
-      if (!datosLocales.monto_verificado && datosLocales.monto) {
-        contrastarMontoConIA(id, file, gen, datosLocales.monto, statusEl);
+      // Acá está el ahorro: la IA se llama SOLO si después de lo local y de
+      // contabilidad todavía quedaron huecos (o el monto no lo confirmó la
+      // aritmética). Cuando la factura se leyó completa, son cero llamadas.
+      // No se espera el resultado a propósito: los campos ya están en
+      // pantalla y la IA completa después, sin que nadie mire un spinner.
+      if (valeLaPenaLlamarIA(camposAPedirOcr(datos, CAMPOS_OCR_CON))) {
+        completarConIA({ id, file, gen, statusEl, local: datosLocales, contable, datos,
+          campos: CAMPOS_OCR_CON, aplicar: aplicarResultadoOcrCon, textoBase });
       }
       return;
     }
 
-    const data = await llamarOcrRecibo(file);
-    await aplicarResultadoOcrCon(id, data, gen);
+    // Sin lectura local (foto, PDF escaneado o protegido): la IA es la única
+    // fuente. Igual pasa por la MISMA fusión, para que exista un solo camino
+    // por el que los datos llegan a los campos -- antes eran dos, y lo que se
+    // arreglaba en uno seguía roto en el otro.
+    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_CON, {});
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
+    const contableIA = await resolverDatosContables(ia?.rut_proveedor);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+    const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
+    await aplicarResultadoOcrCon(id, datosIA, gen);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
 
-    statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
+    statusEl.textContent = contableIA.desdeContabilidad
+      ? `✔ Datos completados con IA. Categoría sugerida: "${contableIA.categoria}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalos antes de enviar.`
+      : "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
   } catch (err) {
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
@@ -3174,35 +3388,41 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     // igual sirve para resolver proveedor, categoría y descripción.
     const datosLocales = await leerPdfLocal(file);
     if (datosLocales) {
-      const [nombreReal, categoriaContable, previos] = await Promise.all([
-        buscarNombreProveedorPorRut(datosLocales.rut_proveedor),
-        buscarCategoriaEnContabilidad(datosLocales.rut_proveedor),
-        buscarDatosPreviosPorRut(datosLocales.rut_proveedor),
-      ]);
-      datosLocales.nombre_proveedor = nombreReal;
-      datosLocales.categoria_sugerida = categoriaContable || previos.categoria;
-      // Ver el mismo criterio en analizarComprobante: historial primero,
-      // detalle del PDF como respaldo.
-      datosLocales.descripcion = previos.descripcion || datosLocales.descripcion;
+      const contable = await resolverDatosContables(datosLocales.rut_proveedor);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
 
-      await aplicarResultadoOcrSin(id, datosLocales, gen);
+      const { datos } = fusionarLecturas(datosLocales, null, contable);
+      await aplicarResultadoOcrSin(id, datos, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
 
       // Si el PDF resultó ser una factura/boleta de honorarios, lo más
       // probable es que corresponda la otra pestaña: esos documentos se
       // contabilizan distinto (ver CUENTA_POR_TIPO_DOC y la exportación a
       // Kame), así que conviene avisar antes de que se envíe mal.
-      const esDocumentoTributario = datosLocales.tipo_documento && /Factura|Honorario/i.test(datosLocales.tipo_documento);
-      statusEl.textContent = esDocumentoTributario
-        ? `✔ Datos leídos del PDF. Ojo: parece ser un(a) ${datosLocales.tipo_documento}, que normalmente va en la pestaña "Documento electrónico". Revísalo antes de enviar.`
+      const esDocumentoTributario = datos.tipo_documento && /Factura|Honorario/i.test(datos.tipo_documento);
+      const textoBase = esDocumentoTributario
+        ? `✔ Datos leídos del PDF. Ojo: parece ser un(a) ${datos.tipo_documento}, que normalmente va en la pestaña "Documento electrónico". Revísalo antes de enviar.`
         : "✔ Datos leídos del PDF. Revísalos antes de enviar.";
+      statusEl.textContent = textoBase;
       statusEl.className = "ocr-status show ok";
+
+      // Se pide a la IA solo lo que ESTE formulario puede mostrar: pedirle
+      // folio o tipo de documento acá sería gastar cuota en campos que no
+      // existen en pantalla.
+      if (valeLaPenaLlamarIA(camposAPedirOcr(datos, CAMPOS_OCR_SIN))) {
+        completarConIA({ id, file, gen, statusEl, local: datosLocales, contable, datos,
+          campos: CAMPOS_OCR_SIN, aplicar: aplicarResultadoOcrSin, textoBase });
+      }
       return;
     }
 
-    const data = await llamarOcrRecibo(file);
-    await aplicarResultadoOcrSin(id, data, gen);
+    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_SIN, {});
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
+    const contableIA = await resolverDatosContables(ia?.rut_proveedor);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+    const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
+    await aplicarResultadoOcrSin(id, datosIA, gen);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
 
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
