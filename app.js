@@ -2468,7 +2468,8 @@ async function leerFotoLocal(file) {
     // transferencia y vouchers: esos no traen desglose de IVA, así que la
     // verificación aritmética NUNCA les va a aplicar y la etiqueta es la
     // única evidencia fuerte que pueden ofrecer.
-    if (datos.monto_origen !== "aritmetica" && datos.monto_origen !== "etiqueta") datos.monto = null;
+    const ORIGENES_ACEPTABLES_EN_FOTO = ["palabras+digitos", "aritmetica", "etiqueta"];
+    if (!ORIGENES_ACEPTABLES_EN_FOTO.includes(datos.monto_origen)) datos.monto = null;
 
     // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
     // 2026, un solo dígito mal que manda el gasto a otro período contable.
@@ -2520,6 +2521,58 @@ function nombreDesdeEtiqueta(t) {
   // en puros números o símbolos es ruido de OCR, no un nombre.
   if (nombre.length < 3 || !/^[A-Za-zÁÉÍÓÚÑÜáéíóúñü]/.test(nombre) || !/[A-Za-zÁÉÍÓÚÑáéíóúñ]{3}/.test(nombre)) return null;
   return nombre;
+}
+
+// Las boletas y facturas chilenas casi siempre imprimen el total EN LETRAS
+// ("SON: CIENTO ONCE MIL CIENTO SETENTA"). Eso es oro para una lectura por
+// foto, porque es el mismo número codificado de otra forma, y los errores de
+// OCR en los dígitos no se correlacionan con los de las palabras: en una
+// boleta real el total salió "TOTAL $ 11.179" -- un dígito menos que los
+// $111.170 verdaderos -- y estaba pegado a su etiqueta, así que ninguna de
+// las defensas que había lo detectó. Las letras decían el número correcto.
+//
+// Y se autoverifica: una secuencia de palabras o forma un número válido en
+// español o no forma nada. Un error de OCR en una palabra rompe el parseo en
+// vez de producir un número equivocado, que es exactamente el modo de falla
+// que se busca.
+const NUM_PALABRAS = {
+  cero:0, un:1, uno:1, una:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9,
+  diez:10, once:11, doce:12, trece:13, catorce:14, quince:15, dieciseis:16, diecisiete:17,
+  dieciocho:18, diecinueve:19, veinte:20, veintiuno:21, veintidos:22, veintitres:23,
+  veinticuatro:24, veinticinco:25, veintiseis:26, veintisiete:27, veintiocho:28, veintinueve:29,
+  treinta:30, cuarenta:40, cincuenta:50, sesenta:60, setenta:70, ochenta:80, noventa:90,
+  cien:100, ciento:100, doscientos:200, trescientos:300, cuatrocientos:400, quinientos:500,
+  seiscientos:600, setecientos:700, ochocientos:800, novecientos:900,
+};
+const SIN_TILDES = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+function montoDesdePalabras(texto) {
+  // El bloque arranca en "SON" y termina donde deja de haber palabras de
+  // número (típicamente "PESOS", o basura del OCR).
+  const m = /\bSON\s*:?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ\s]{6,120})/i.exec(texto);
+  if (!m) return null;
+  const tokens = SIN_TILDES(m[1]).split(/\s+/).filter(Boolean);
+  let total = 0, grupo = 0, hubo = false, consumidos = 0;
+  for (const tk of tokens) {
+    if (tk === "y") continue;                 // "treinta y cinco"
+    if (tk === "mil") { grupo = (grupo || 1) * 1000; total += grupo; grupo = 0; hubo = true; consumidos++; continue; }
+    if (tk === "millon" || tk === "millones") { total = (total + (grupo || 1)) * 1000000; grupo = 0; hubo = true; consumidos++; continue; }
+    const v = NUM_PALABRAS[tk];
+    if (v === undefined) break;               // se acabó el número: "PESOS", ruido, etc.
+    grupo += v;
+    consumidos++;
+    hubo = true;
+  }
+  const valor = total + grupo;
+  if (!hubo || valor <= 0) return null;
+  // Dos guardas contra un parseo que se cortó a la mitad. "OCHO MXL
+  // NOVECIENTOS" (con la palabra "MIL" rota por el OCR) devolvía 8: se
+  // consumía un solo token, se frenaba en la palabra ilegible y entregaba
+  // ese 8 como si fuera el total -- pisando el monto correcto que los
+  // dígitos sí habían leído bien. Un total escrito en letras de verdad usa
+  // varias palabras y no baja de mil en una rendición.
+  if (consumidos < 2 || valor < 1000) return null;
+  return valor;
 }
 
 function parsearTextoFactura(texto) {
@@ -2698,7 +2751,30 @@ function parsearTextoFactura(texto) {
   // (monto = null) y el comprobante cae al camino de la IA, que sí ve el
   // símbolo en la imagen. El chequeo va acá y no antes porque solo importa
   // cuando efectivamente se encontró un monto que reportar.
-  let montoConfirmado = !!verificado;
+  // El total en letras le GANA a los dígitos, y no es arbitrario: las letras
+  // tienen que formar un número válido en español para parsearse, así que un
+  // error de OCR ahí se detecta solo; un dígito mal leído no se detecta de
+  // ninguna forma. Si además coinciden, el monto queda confirmado con la
+  // misma fuerza que neto + IVA: son dos codificaciones independientes del
+  // mismo número dentro del propio documento.
+  const enPalabras = montoDesdePalabras(sinRuts);
+  if (enPalabras) {
+    if (monto === enPalabras) {
+      monto_origen = "palabras+digitos";
+    } else {
+      // Desacuerdo. Las letras SON más confiables (se autoverifican), pero
+      // preferirlas en silencio igual significaría elegir por la persona con
+      // un documento que se contradice a sí mismo -- y un parseo de letras
+      // con una palabra mal leída en el medio puede dar un número plausible
+      // y equivocado. Se marca la discrepancia y el filtro de fotos lo
+      // rechaza: en una foto el monto queda en blanco y lo escribe la
+      // persona. En un PDF el texto es exacto, así que se conserva el valor
+      // de los dígitos.
+      monto_origen = "discrepancia";
+    }
+  }
+
+  let montoConfirmado = !!verificado || monto_origen === "palabras+digitos";
   if (monto && /(US\$|USD|EUR|€|\bUF\b|\bCLF\b|\bUTM\b)\W{0,15}\d|\d\W{0,8}(USD|EUR|\bUF\b|\bCLF\b|\bUTM\b)/i.test(sinRuts)) {
     monto = null;
     montoConfirmado = false; // sin monto no hay nada que declarar verificado
