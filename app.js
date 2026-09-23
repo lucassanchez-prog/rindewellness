@@ -2468,8 +2468,30 @@ async function leerFotoLocal(file) {
     // transferencia y vouchers: esos no traen desglose de IVA, así que la
     // verificación aritmética NUNCA les va a aplicar y la etiqueta es la
     // única evidencia fuerte que pueden ofrecer.
-    const ORIGENES_ACEPTABLES_EN_FOTO = ["palabras+digitos", "aritmetica", "etiqueta"];
+    // "etiqueta" NO está en esta lista, y eso salió de medir. Sobre 188
+    // comprobantes reales del archivo de Rindegastos, el monto se llenó 35
+    // veces y 5 estuvieron mal: las CINCO venían de "etiqueta". Ninguno de
+    // los 9 confirmados por aritmética ni de los 2 confirmados por letras
+    // falló. Los errores no son sutiles -- $10.130 leído como $310.130 y
+    // $221.390 como $4.221.390, con un dígito de más pegado por el OCR --
+    // y no hay forma de distinguirlos de los buenos: un número pegado a la
+    // palabra TOTAL se ve igual esté bien o mal leído.
+    //
+    // El costo de esto es real: se llena el monto en muchos menos casos.
+    // Pero el monto es obligatorio y la persona lo escribe igual, así que
+    // el campo en blanco le cuesta segundos y uno equivocado le cuesta a
+    // contabilidad. En un PDF "etiqueta" sigue valiendo: ahí el texto es
+    // exacto y no hay OCR que pueda equivocarse.
+    const ORIGENES_ACEPTABLES_EN_FOTO = ["palabras+digitos", "aritmetica"];
     if (!ORIGENES_ACEPTABLES_EN_FOTO.includes(datos.monto_origen)) datos.monto = null;
+
+    // El folio leído de una foto salió mal 28 de 40 veces en esa misma
+    // medición. Un folio equivocado no es inocuo: alimenta el control de
+    // duplicados y el cruce contra contabilidad del aprobador. Solo se
+    // conserva el que venía pegado al tipo de documento ("FACTURA
+    // ELECTRONICA N° 7960"), que es la única variante con contexto que lo
+    // respalde; el resto son números sueltos de cualquier parte del papel.
+    if (datos.folio_origen !== "tipo") datos.nro_documento = null;
 
     // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
     // 2026, un solo dígito mal que manda el gasto a otro período contable.
@@ -2591,7 +2613,16 @@ function parsearTextoFactura(texto) {
   // lectura local igual "funcionó" (hay un RUT válido y un monto), nunca se
   // consulta a la IA para contrastar.
   const rutsPropios = new Set(Object.values(RUT_POR_EMPRESA).map((r) => r.replace(/[.\-]/g, "").toUpperCase()));
+  // También se descarta el RUT rotulado como del COMPRADOR. En las boletas
+  // de caja es habitual que el cliente dicte su RUT y quede impreso como
+  // "RUT SOLICITANTE: 10.247.521-6"; ese RUT es válido (pasa el dígito
+  // verificador) y venía antes que el del emisor, así que se tomaba como
+  // proveedor. Medido sobre el archivo de Rindegastos: era la causa de
+  // varios de los RUT equivocados, y arrastra consigo la categoría sugerida,
+  // porque se le busca el historial contable a la entidad equivocada.
+  const ETIQUETA_COMPRADOR = /(solicitante|cliente|comprador|receptor|se[nñ]or\(?e?s?\)?|adquirente)\s*:?\s*$/i;
   const ruts = [...t.matchAll(RE_RUT_EN_TEXTO)]
+    .filter((m) => !ETIQUETA_COMPRADOR.test(t.slice(Math.max(0, m.index - 30), m.index).replace(/R\.?U\.?T\.?\s*:?\s*$/i, "").trim()))
     .map((m) => m[1].replace(/\s/g, ""))
     .filter((r) => validarRut(r))
     .filter((r) => !rutsPropios.has(r.replace(/[.\-]/g, "").toUpperCase()));
@@ -2799,6 +2830,9 @@ function parsearTextoFactura(texto) {
     rut_proveedor: ruts[0] || null,
     tipo_documento,
     nro_documento: mFolio ? mFolio.valor : null,
+    // "tipo" = venía pegado al tipo de documento (evidencia fuerte);
+    // "suelto" = un número con etiqueta N° en cualquier parte del papel.
+    folio_origen: mFolio ? (mFolio.pegadoAlTipo ? "tipo" : "suelto") : null,
     fecha,
     monto,
     // true solo cuando el monto se confirmó con neto + IVA = total. Se usa
@@ -3735,9 +3769,16 @@ async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
   // vacío de verdad. Con el otro, el aviso del comprobante de transferencia
   // decía "completa a mano: ... monto" con el monto correcto ya en el campo.
   const faltan = camposFaltantesOcr(datos, campos).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
+  // El folio y el RUT se nombran aparte, y no por cortesía: medidos contra
+  // 188 comprobantes reales, leyendo de una foto el folio sale mal 1 de
+  // cada 3 veces y el RUT 1 de cada 10, casi siempre por un solo dígito.
+  // Son errores que no se notan de reojo justamente porque el número se ve
+  // bien formado, así que hay que pedir que se contrasten contra el papel.
+  const aVerificar = [datos.nro_documento && "el N° de documento", datos.rut_proveedor && "el RUT"].filter(Boolean);
   statusEl.textContent = `⚠ La IA no está disponible, así que la foto se leyó acá mismo, que es menos preciso.`
-    + (datos.monto_verificado ? " El monto igual quedó confirmado (neto + IVA cuadran con el total)." : "")
-    + (faltan.length ? ` Revisa todo y completa a mano: ${faltan.join(", ")}.` : " Revisa todos los campos antes de enviar.");
+    + (datos.monto_verificado ? " El monto sí quedó confirmado contra el propio documento." : "")
+    + (faltan.length ? ` Completa a mano: ${faltan.join(", ")}.` : "")
+    + (aVerificar.length ? ` Y compara ${aVerificar.join(" y ")} con el comprobante: de una foto suelen salir con un dígito cambiado.` : " Revisa todos los campos antes de enviar.");
   statusEl.className = "ocr-status show";
   return true;
 }
