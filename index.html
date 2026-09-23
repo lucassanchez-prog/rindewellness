@@ -386,7 +386,12 @@
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="config.js"></script>
-  <script src="pure.js"></script>
-  <script src="app.js?v=39"></script>
+  <!-- OJO: subir estos ?v= en CADA cambio de pure.js/app.js. Existen solo
+       para invalidar el caché del navegador; si no se tocan, alguien con la
+       app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
+       2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
+       el navegador seguía sirviendo la versión anterior. -->
+  <script src="pure.js?v=40"></script>
+  <script src="app.js?v=40"></script>
 </body>
 </html>

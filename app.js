@@ -2729,8 +2729,23 @@ function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
   setTimeout(sondear, INTERVALO_MS);
 }
 
+// Al adjuntar un comprobante NUEVO hay que borrar lo que había cargado el
+// anterior: si la lectura nueva no logra sacar algún dato, ese campo se
+// quedaba con el valor del archivo viejo. Pasa de verdad cuando alguien
+// adjunta el PDF equivocado, se da cuenta y elige el correcto -- y quedaba
+// mezclando el folio/RUT/descripción de una factura con el monto de otra.
+// Son campos que describen al documento adjunto: conservar el valor de otro
+// documento nunca es lo correcto.
+function limpiarCamposDeComprobante(ids) {
+  ids.forEach((campoId) => {
+    const el = document.getElementById(campoId);
+    if (el) el.value = "";
+  });
+}
+
 async function analizarComprobante(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
+  limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -2855,6 +2870,7 @@ async function aplicarResultadoOcrSin(id, data, gen) {
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const gen = nuevaGeneracionOcr(id);
+  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`]);
   statusEl.textContent = "🪄 Analizando comprobante con IA...";
   statusEl.className = "ocr-status show";
   try {
