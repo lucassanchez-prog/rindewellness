@@ -2553,7 +2553,11 @@ function parsearTextoFactura(texto) {
   // terminaba aumentándolo, con el signo al revés y sin aviso.
   if (/NOTA\s+DE\s+CR[EÉ]DITO/i.test(t)) tipo_documento = "Nota de Crédito";
   else if (/NOTA\s+DE\s+D[EÉ]BITO/i.test(t)) tipo_documento = "Nota de Débito";
-  else if (/FACTURA\s+EXENTA/i.test(t)) tipo_documento = "Factura Exenta Electrónica";
+  // "FACTURA NO AFECTA O EXENTA ELECTRÓNICA" es como el SII rotula las
+  // exentas, y en la foto de una factura real de Correos el OCR dejó solo
+  // "CURA EXENTA ELECTRÓNICA": se perdió la palabra FACTURA entera. Por eso
+  // alcanza con que aparezca "EXENTA ELECTR", sin exigir lo de antes.
+  else if (/FACTURA\s+EXENTA|EXENTA\s+ELECTR|NO\s+AFECTA\s+O\s+EXENTA|FACTURA\s+NO\s+AFECTA/i.test(t)) tipo_documento = "Factura Exenta Electrónica";
   else if (/FACTURA\s+ELECTR/i.test(t)) tipo_documento = "Factura Electrónica";
   else if (/BOLETA\s+DE\s+HONORARIO/i.test(t)) tipo_documento = "Boleta de Honorario";
   else if (/BOLETA\s+ELECTR/i.test(t)) tipo_documento = "Boleta Electrónica";
@@ -2602,7 +2606,12 @@ function parsearTextoFactura(texto) {
   // detrás pasa por folio ("Pago no 30 dias" -> folio 30). Por eso las
   // etiquetas de varias palabras traen sus variantes de mayúscula escritas a
   // mano en vez de resolverse con el flag.
-  const RE_FOLIO = /(N[°º]\.?|No\.?|N(?=\s+\d)|FOLIO|Folio|[NnPp][°º]?\s*[Dd][Ee]\s*[OoTtCcDd][a-zíóé]+|N[UÚuú]MERO\s+[Dd][Ee]\s+[A-Za-zíóé]+|C[oó]digo\s+[Dd][Ee]\s+[A-Za-zíóé]+)\s*:?\s*(\d{2,12})\b/g;
+  // El "°" de "N°" es de lo que peor le sale al OCR de una foto: en dos
+  // facturas reales salió como "N* 7960" y como "Ne 003191702". Por eso la
+  // clase incluye esas confusiones además del símbolo correcto. Siguen
+  // dependiendo de una N MAYÚSCULA, que es lo que impide que esto degenere
+  // en "cualquier número precedido por la palabra no".
+  const RE_FOLIO = /(N[°º*e]\.?|No\.?|N(?=\s+\d)|FOLIO|Folio|[NnPp][°º]?\s*[Dd][Ee]\s*[OoTtCcDd][a-zíóé]+|N[UÚuú]MERO\s+[Dd][Ee]\s+[A-Za-zíóé]+|C[oó]digo\s+[Dd][Ee]\s+[A-Za-zíóé]+)\s*:?\s*(\d{2,12})\b/g;
   const ANTES_NO_ES_FOLIO = /(orden\s+de\s+compra|nota\s+de\s+venta|res(?:oluci[oó]n)?\.?\s*ex\.?|cotizaci[oó]n|gu[ií]a\s+de\s+despacho|contrato|pago)\s*$/i;
   const candidatosFolio = [];
   for (const m of t.matchAll(RE_FOLIO)) {
