@@ -213,6 +213,7 @@ ni explicaciones, con exactamente esta forma:
   "fecha": "YYYY-MM-DD" o null,
   "monto": number o null,
   "descripcion": "breve descripción del gasto, ej: Almuerzo equipo ventas" o null,
+  "monto_en_palabras": "el total escrito EN LETRAS tal como aparece impreso en el documento, ej: 'CIENTO ONCE MIL CIENTO SETENTA'" o null si el documento no lo trae,
   "categoria_sugerida": una de estas opciones EXACTAS: ${CATEGORIAS.map((c) => `"${c}"`).join(", ")} -- la que mejor calce con el gasto, o null si ninguna calza bien
 }
 Si no puedes leer un dato con certeza, usa null en ese campo. No inventes datos.
@@ -222,6 +223,10 @@ simplemente el total pagado o transferido.
 "nro_documento" es el número que identifica al documento: el folio en una boleta o
 factura, el número de operación en una transferencia, el código de autorización en
 un voucher. Si el documento no tiene ninguno, null.
+"monto_en_palabras" se transcribe LITERAL de lo que dice el papel (suele ir después
+de "SON:"), sin convertirlo a números y sin deducirlo del total: si no está impreso,
+null. Sirve para contrastar el total contra el propio documento, así que inventarlo
+a partir de los dígitos lo vuelve inútil.
 Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la lista (respetando tildes y mayúsculas), nunca inventes una categoría nueva.`;
 
 // El navegador ya leyó el PDF localmente con pdf.js antes de llegar acá, así
@@ -387,6 +392,43 @@ async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknow
 // afirmar con certeza cuál era. Rechazar es preferible a equivocarse: un
 // campo vacío lo completa una persona, un monto mal leído entra a
 // contabilidad sin que nadie lo note.
+// Interpreta un total escrito en letras. Es la MISMA lógica que
+// montoDesdePalabras en app.js; si se cambia una, hay que cambiar la otra.
+//
+// Las dos guardas del final no son cosmética: sin ellas, "OCHO MXL
+// NOVECIENTOS" (con MIL rota por la lectura) devolvía 8 -- se frenaba en la
+// palabra ilegible y entregaba lo acumulado, pisando un total correcto. Un
+// total en letras de verdad usa varias palabras y no baja de mil.
+const NUM_PALABRAS: Record<string, number> = {
+  cero: 0, un: 1, uno: 1, una: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6, siete: 7, ocho: 8, nueve: 9,
+  diez: 10, once: 11, doce: 12, trece: 13, catorce: 14, quince: 15, dieciseis: 16, diecisiete: 17,
+  dieciocho: 18, diecinueve: 19, veinte: 20, veintiuno: 21, veintidos: 22, veintitres: 23,
+  veinticuatro: 24, veinticinco: 25, veintiseis: 26, veintisiete: 27, veintiocho: 28, veintinueve: 29,
+  treinta: 30, cuarenta: 40, cincuenta: 50, sesenta: 60, setenta: 70, ochenta: 80, noventa: 90,
+  cien: 100, ciento: 100, doscientos: 200, trescientos: 300, cuatrocientos: 400, quinientos: 500,
+  seiscientos: 600, setecientos: 700, ochocientos: 800, novecientos: 900,
+};
+
+export function montoDesdePalabras(texto: unknown): number | null {
+  if (typeof texto !== "string" || texto.trim().length < 6) return null;
+  const limpio = texto.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/^\s*son\s*:?\s*/, "");
+  const tokens = limpio.split(/[^a-z]+/).filter(Boolean);
+  let total = 0, grupo = 0, hubo = false, consumidos = 0;
+  for (const tk of tokens) {
+    if (tk === "y") continue;
+    if (tk === "mil") { grupo = (grupo || 1) * 1000; total += grupo; grupo = 0; hubo = true; consumidos++; continue; }
+    if (tk === "millon" || tk === "millones") { total = (total + (grupo || 1)) * 1000000; grupo = 0; hubo = true; consumidos++; continue; }
+    const v = NUM_PALABRAS[tk];
+    if (v === undefined) break; // "PESOS", ruido, o una palabra mal leída
+    grupo += v;
+    consumidos++;
+    hubo = true;
+  }
+  const valor = total + grupo;
+  if (!hubo || valor < 1000 || consumidos < 2) return null;
+  return valor;
+}
+
 export function normalizarMonto(valor: unknown): number | null {
   if (valor === null || valor === undefined) return null;
   if (typeof valor === "number") return Number.isFinite(valor) && valor > 0 ? Math.round(valor) : null;
@@ -420,6 +462,13 @@ export interface ResultadoOcr {
   monto: number | null;
   descripcion: string | null;
   categoria_sugerida: string | null;
+  // El total en letras tal como lo imprime el documento, y el resultado de
+  // contrastarlo contra los dígitos. monto_origen: "palabras+digitos" (los
+  // dos coinciden, certeza), "palabras" (difieren y ganó el que se
+  // autoverifica), "ia" (el documento no traía el total en letras).
+  monto_en_palabras: string | null;
+  monto_verificado: boolean;
+  monto_origen: "palabras+digitos" | "palabras" | "ia" | null;
 }
 
 // Punto de entrada único: imagen/PDF en base64 adentro, JSON ya validado
@@ -486,6 +535,37 @@ export async function leerComprobante(
   // monto entraba mil veces más chico sin ningún error visible. Hay que
   // interpretar el formato, no solo preguntar si es un número.
   parsed.monto = normalizarMonto(parsed.monto);
+
+  // Contraste del total contra el MISMO documento: casi todo comprobante
+  // chileno imprime el total en letras ("SON: CIENTO ONCE MIL CIENTO
+  // SETENTA"), y eso es el mismo número en otra codificación. Los errores
+  // de lectura en los dígitos no se correlacionan con los de las palabras,
+  // y las palabras se autoverifican: una secuencia o forma un número válido
+  // en español o no forma nada, así que una mal leída rompe el parseo en
+  // vez de producir otro número.
+  //
+  // Esta verificación ya existía del lado del navegador, sobre el texto del
+  // PDF, y ahí atrapó un $111.170 que se había leído $11.179. El camino de
+  // la IA no pasaba por ninguna de esas defensas -- consume el JSON del
+  // modelo directo -- así que hasta ahora era el único sin red. No cuesta
+  // una solicitud extra: viaja en la misma respuesta.
+  const enPalabras = montoDesdePalabras(parsed.monto_en_palabras);
+  parsed.monto_verificado = false;
+  parsed.monto_origen = parsed.monto ? "ia" : null;
+  if (enPalabras && parsed.monto) {
+    if (enPalabras === parsed.monto) {
+      parsed.monto_verificado = true;
+      parsed.monto_origen = "palabras+digitos";
+    } else {
+      // Discrepancia dentro del propio documento. Gana lo escrito en
+      // letras, que es lo único de los dos que se comprueba a sí mismo.
+      parsed.monto = enPalabras;
+      parsed.monto_origen = "palabras";
+    }
+  } else if (enPalabras && !parsed.monto) {
+    parsed.monto = enPalabras;
+    parsed.monto_origen = "palabras";
+  }
 
   return parsed as ResultadoOcr;
 }

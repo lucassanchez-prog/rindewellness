@@ -3073,7 +3073,12 @@ function fusionarLecturas(local, ia, contable) {
   const montoLocal = montoValidoCLP(L.monto);
   const montoIA = montoValidoCLP(I.monto);
   datos.monto = montoLocal || montoIA || null;
-  datos.monto_verificado = !!L.monto_verificado;
+  // La IA también puede traer el monto confirmado: ocr-recibo le pide el
+  // total EN LETRAS tal como está impreso y lo contrasta contra los dígitos
+  // del lado del servidor (ver montoDesdePalabras en _shared/gemini-ocr.ts).
+  // Antes ese camino no pasaba por ninguna verificación -- se consumía el
+  // JSON del modelo tal cual -- así que era el único sin red.
+  datos.monto_verificado = !!L.monto_verificado || (!montoLocal && !!I.monto_verificado);
   if (montoLocal && montoIA) {
     if (montoLocal === montoIA) {
       // Dos lectores independientes que coinciden son mucha más evidencia
