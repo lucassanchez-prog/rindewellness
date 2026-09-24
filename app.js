@@ -2469,30 +2469,30 @@ async function leerFotoLocal(file) {
     // transferencia y vouchers: esos no traen desglose de IVA, así que la
     // verificación aritmética NUNCA les va a aplicar y la etiqueta es la
     // única evidencia fuerte que pueden ofrecer.
-    // "etiqueta" NO está en esta lista, y eso salió de medir. Sobre 188
-    // comprobantes reales del archivo de Rindegastos, el monto se llenó 35
-    // veces y 5 estuvieron mal: las CINCO venían de "etiqueta". Ninguno de
-    // los 9 confirmados por aritmética ni de los 2 confirmados por letras
-    // falló. Los errores no son sutiles -- $10.130 leído como $310.130 y
-    // $221.390 como $4.221.390, con un dígito de más pegado por el OCR --
-    // y no hay forma de distinguirlos de los buenos: un número pegado a la
-    // palabra TOTAL se ve igual esté bien o mal leído.
+    // DECISIÓN DEL USUARIO (2026-09-23): desde una foto se completan TODOS
+    // los campos, incluidos el monto y el folio, aunque la lectura sea
+    // débil. Antes se dejaban en blanco cuando no había evidencia fuerte.
     //
-    // El costo de esto es real: se llena el monto en muchos menos casos.
-    // Pero el monto es obligatorio y la persona lo escribe igual, así que
-    // el campo en blanco le cuesta segundos y uno equivocado le cuesta a
-    // contabilidad. En un PDF "etiqueta" sigue valiendo: ahí el texto es
-    // exacto y no hay OCR que pueda equivocarse.
-    const ORIGENES_ACEPTABLES_EN_FOTO = ["palabras+digitos", "aritmetica"];
-    if (!ORIGENES_ACEPTABLES_EN_FOTO.includes(datos.monto_origen)) datos.monto = null;
-
-    // El folio leído de una foto salió mal 28 de 40 veces en esa misma
-    // medición. Un folio equivocado no es inocuo: alimenta el control de
-    // duplicados y el cruce contra contabilidad del aprobador. Solo se
-    // conserva el que venía pegado al tipo de documento ("FACTURA
-    // ELECTRONICA N° 7960"), que es la única variante con contexto que lo
-    // respalde; el resto son números sueltos de cualquier parte del papel.
-    if (datos.folio_origen !== "tipo") datos.nro_documento = null;
+    // El costo está medido y no es chico. Sobre 188 comprobantes reales del
+    // archivo de Rindegastos: aceptando el monto "pegado a una etiqueta
+    // TOTAL", 5 de 27 salieron mal -- $10.130 leído $310.130, $221.390
+    // leído $4.221.390, un dígito de más que el OCR pega de la nada. El
+    // folio sale mal cerca de la mitad de las veces. El error típico es de
+    // UN dígito, que es justo el que no se nota de reojo, porque el número
+    // queda bien formado.
+    //
+    // Por eso lo que se llena flojo se marca: cada campo con lectura débil
+    // queda listado en "confianza_baja" y aplicarRespaldoFoto se lo nombra
+    // a la persona pidiéndole que lo compare con el papel. Rellenar sin
+    // avisar sería lo único peor que dejar en blanco.
+    datos.confianza_baja = [];
+    const MONTO_FUERTE = ["palabras+digitos", "aritmetica"];
+    if (datos.monto && !MONTO_FUERTE.includes(datos.monto_origen)) datos.confianza_baja.push("monto");
+    // En una discrepancia entre dígitos y letras gana el número escrito en
+    // letras: es el único de los dos que se autoverifica (una palabra mal
+    // leída rompe el parseo en vez de producir otro número).
+    if (datos.monto_origen === "discrepancia" && datos.monto_en_palabras) datos.monto = datos.monto_en_palabras;
+    if (datos.nro_documento && datos.folio_origen !== "tipo") datos.confianza_baja.push("nro_documento");
 
     // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
     // 2026, un solo dígito mal que manda el gasto a otro período contable.
@@ -2841,6 +2841,9 @@ function parsearTextoFactura(texto) {
     // segunda mirada, uno deducido sí.
     monto_verificado: montoConfirmado,
     monto_origen,
+    // El total leído EN LETRAS, cuando existe. leerFotoLocal lo prefiere
+    // ante una discrepancia con los dígitos: es el único que se autoverifica.
+    monto_en_palabras: enPalabras || null,
     descripcion: descripcionDesdeDetalle(t),
     categoria_sugerida: null,
   };
@@ -3786,11 +3789,21 @@ async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
   // cada 3 veces y el RUT 1 de cada 10, casi siempre por un solo dígito.
   // Son errores que no se notan de reojo justamente porque el número se ve
   // bien formado, así que hay que pedir que se contrasten contra el papel.
-  const aVerificar = [datos.nro_documento && "el N° de documento", datos.rut_proveedor && "el RUT"].filter(Boolean);
+  // Los campos que se llenaron con lectura débil se nombran uno por uno.
+  // Todos vienen completos, así que lo único que separa a la persona de un
+  // dato equivocado es que sepa CUÁL mirar: "revisa todo" no funciona, se
+  // lee como una fórmula. El RUT va siempre en la lista porque, aunque lo
+  // valide su dígito verificador, medido sale mal 1 de cada 10 veces.
+  const dudosos = [
+    ...(datos.confianza_baja || []).map((c) => ETIQUETA_CAMPO_OCR[c] || c),
+    datos.rut_proveedor && "RUT",
+  ].filter(Boolean);
   statusEl.textContent = `⚠ La IA no está disponible, así que la foto se leyó acá mismo, que es menos preciso.`
     + (datos.monto_verificado ? " El monto sí quedó confirmado contra el propio documento." : "")
     + (faltan.length ? ` Completa a mano: ${faltan.join(", ")}.` : "")
-    + (aVerificar.length ? ` Y compara ${aVerificar.join(" y ")} con el comprobante: de una foto suelen salir con un dígito cambiado.` : " Revisa todos los campos antes de enviar.");
+    + (dudosos.length
+      ? ` COMPARA CON EL COMPROBANTE antes de enviar: ${dudosos.join(", ")}. De una foto suelen salir con un dígito cambiado, y el número igual se ve bien formado.`
+      : " Revisa los campos antes de enviar.");
   statusEl.className = "ocr-status show";
   return true;
 }
