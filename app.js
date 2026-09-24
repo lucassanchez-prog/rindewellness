@@ -2669,7 +2669,13 @@ function parsearTextoFactura(texto) {
   // que hasta ahora el lector no reconocía en absoluto, así que ni el tipo
   // ni el folio ni la fecha se sacaban de ellos.
   else if (/BOLETA\s+DE\s+VENTAS?(\s+Y\s+SERVICIOS?)?/i.test(t)) tipo_documento = "Boleta";
-  else if (/COMPROBANTE\s+DE\s+(TRANSFERENCIA|PAGO)|TRANSFERENCIA\s+(ELECTR[OÓ]NICA|EXITOSA|REALIZADA)|TRANSFERENCIA\s+A\s+TERCEROS/i.test(t)) tipo_documento = "Comprobante de Transferencia";
+  // "Comprobante de Pago" va aparte de la transferencia: son cosas distintas.
+  // Un comprobante de pago municipal (una multa, una patente) no tiene
+  // proveedor ni RUT emisor impreso -- el único RUT del papel es el NUESTRO,
+  // porque somos quienes pagamos. Meterlo en el mismo saco que una
+  // transferencia bancaria confundía el tipo en pantalla.
+  else if (/COMPROBANTE\s+DE\s+PAGO|TESORER[IÍ]A\s+MUNICIPAL/i.test(t)) tipo_documento = "Comprobante de Pago";
+  else if (/COMPROBANTE\s+DE\s+TRANSFERENCIA|TRANSFERENCIA\s+(ELECTR[OÓ]NICA|EXITOSA|REALIZADA)|TRANSFERENCIA\s+A\s+TERCEROS/i.test(t)) tipo_documento = "Comprobante de Transferencia";
   else if (/COMPROBANTE\s+DE\s+DEP[OÓ]SITO/i.test(t)) tipo_documento = "Comprobante de Depósito";
   else if (/\bVOUCHER\b|COMPROBANTE\s+DE\s+VENTA|TRANSBANK|REDCOMPRA/i.test(t)) tipo_documento = "Voucher";
   else if (/\bRECIBO\b/i.test(t)) tipo_documento = "Recibo";
@@ -2730,8 +2736,18 @@ function parsearTextoFactura(texto) {
   // Los RUT se sacan del texto ANTES de buscar importes: si no, sus dígitos
   // se leen como pesos (77.574.911-3 daba un "monto" de $77.574.911).
   const sinRuts = t.replace(RE_RUT_EN_TEXTO, " ");
-  const aNumero = (s) => Number(String(s).replace(/\./g, ""));
-  const RE_MONTO = "(\\d{1,3}(?:\\.\\d{3})+|\\d{4,})";
+  const aNumero = (s) => Number(String(s).replace(/[.,]/g, ""));
+  // Tres formas de escribir un importe. La del medio -- coma como separador
+  // de MILES -- se agregó tras un comprobante de pago municipal real que
+  // escribía el total "107,582": no matcheaba ninguna de las otras dos
+  // ("107" son 3 dígitos, no 4+; y no hay punto), así que el documento
+  // entero se descartaba por quedarse sin monto.
+  //
+  // Es segura en pesos chilenos porque el grupo tiene que ser de EXACTAMENTE
+  // tres dígitos: un decimal de verdad ("8,50") no matchea, y el peso no usa
+  // centavos en la práctica. El orden también importa: la alternativa con
+  // puntos va primera para que "13.650,42" se lea 13650 y no 1365042.
+  const RE_MONTO = "(\\d{1,3}(?:\\.\\d{3})+|\\d{1,3}(?:,\\d{3})+|\\d{4,})";
 
   // 1) La mejor fuente: el total CONFIRMADO por la propia aritmética del
   //    documento (neto + IVA = total, con el IVA al 19%). Cuando ese trío
@@ -2775,7 +2791,7 @@ function parsearTextoFactura(texto) {
   //    desglose de IVA, y son justamente los documentos donde este paso es
   //    la ÚNICA evidencia fuerte disponible (el paso 1 nunca va a aplicar).
   if (!monto) {
-    const ETIQUETAS_TOTAL = String.raw`total(?:\s*a\s*pagar|\s*boleta)?|monto(?:\s*(?:transferido|total|a\s*pagar|de\s*la\s*transferencia))?|valor\s*total|importe(?:\s*total)?|a\s*pagar|neto\s*a\s*pagar|te\s*transfiri[oó]`;
+    const ETIQUETAS_TOTAL = String.raw`total(?:\s*a\s*pagar|\s*boleta)?|monto(?:\s*(?:transferido|total|a\s*pagar|de\s*la\s*transferencia))?|valor\s*total|importe(?:\s*total)?|a\s*pagar|neto\s*a\s*pagar|te\s*transfiri[oó]|valores?`;
     const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])(?:${ETIQUETAS_TOTAL})\\s*\\(?\\s*\\$?\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
     monto = mTotal ? aNumero(mTotal[1]) : null;
     if (monto) monto_origen = "etiqueta";

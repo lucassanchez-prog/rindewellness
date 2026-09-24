@@ -73,6 +73,24 @@ const CASOS_LECTOR = [
     espera: { monto: 47600 },
   },
   {
+    nombre: "coma como separador de MILES, no de decimales",
+    // Real: comprobante de pago de la Municipalidad de Independencia, que
+    // escribe el total "107,582". No matcheaba ninguna forma conocida
+    // ("107" son 3 dígitos, no 4+; y no hay punto), así que el documento
+    // entero se descartaba por quedarse sin monto -- y como el único RUT del
+    // papel es el NUESTRO (somos quienes pagamos la multa), tampoco había
+    // RUT que lo salvara.
+    texto: "COMPROBANTE DE PAGO TESORERIA MUNICIPAL N 1501346 Valores 107,582",
+    espera: { monto: 107582, tipo_documento: "Comprobante de Pago" },
+  },
+  {
+    nombre: "una coma decimal de verdad NO es separador de miles",
+    // El grupo tiene que ser de exactamente tres dígitos: si se aceptara
+    // cualquier coma, "8,50" pasaría a valer 850.
+    texto: "R.U.T. 96.505.760-9 TOTAL $ 8,50",
+    espera: { monto: null },
+  },
+  {
     nombre: "moneda extranjera: no se lee como pesos",
     texto: "FACTURA ELECTRONICA N° 900 R.U.T. 96.505.760-9 TOTAL US$ 1.500",
     espera: { monto: null },
