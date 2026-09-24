@@ -2469,30 +2469,47 @@ async function leerFotoLocal(file) {
     // transferencia y vouchers: esos no traen desglose de IVA, así que la
     // verificación aritmética NUNCA les va a aplicar y la etiqueta es la
     // única evidencia fuerte que pueden ofrecer.
-    // DECISIÓN DEL USUARIO (2026-09-23): desde una foto se completan TODOS
-    // los campos, incluidos el monto y el folio, aunque la lectura sea
-    // débil. Antes se dejaban en blanco cuando no había evidencia fuerte.
+    // QUÉ SE COMPLETA DESDE UNA FOTO Y QUÉ NO. El criterio es uno solo: se
+    // llena la fuente que MIDE mejor que el azar, y se deja en blanco la que
+    // no. Sobre 409 comprobantes reales del archivo de Rindegastos:
     //
-    // El costo está medido y no es chico. Sobre 188 comprobantes reales del
-    // archivo de Rindegastos: aceptando el monto "pegado a una etiqueta
-    // TOTAL", 5 de 27 salieron mal -- $10.130 leído $310.130, $221.390
-    // leído $4.221.390, un dígito de más que el OCR pega de la nada. El
-    // folio sale mal cerca de la mitad de las veces. El error típico es de
-    // UN dígito, que es justo el que no se nota de reojo, porque el número
-    // queda bien formado.
+    //   monto con evidencia fuerte .... 46 llenados,   0 equivocados
+    //   monto rellenando siempre ...... 135 llenados, 58 equivocados (43%)
+    //   RUT ........................... 159 leídos,   15 equivocados (9%)
+    //   folio pegado al tipo de doc ... acierta ~6 de cada 10
+    //   folio suelto en la hoja ....... 109 leídos,   67 equivocados (61%)
     //
-    // Por eso lo que se llena flojo se marca: cada campo con lectura débil
-    // queda listado en "confianza_baja" y aplicarRespaldoFoto se lo nombra
-    // a la persona pidiéndole que lo compare con el papel. Rellenar sin
-    // avisar sería lo único peor que dejar en blanco.
+    // De ahí sale todo lo de abajo. El MONTO solo se llena con evidencia
+    // fuerte: entre los llenados sin ella, era más probable que estuviera
+    // mal que bien, y no es un campo donde valga arriesgar -- va a
+    // contabilidad, es obligatorio, y la persona lo escribe igual, así que
+    // el blanco le cuesta segundos y el error equivocado le cuesta a
+    // contabilidad. Los errores tampoco son sutiles: $10.130 leído
+    // $310.130, $221.390 leído $4.221.390.
+    //
+    // El FOLIO se conserva solo cuando venía pegado al tipo de documento
+    // ("FACTURA ELECTRONICA N° 7960"); el suelto se descarta porque acierta
+    // menos de la mitad de las veces, y un campo que miente más de lo que
+    // acierta es peor que vacío: la persona aprende a no mirarlo.
+    //
+    // El RUT se conserva: 9 de cada 10 salen bien, y además es la llave que
+    // destraba proveedor y categoría desde contabilidad.
+    //
+    // Lo que se conserva pero puede fallar queda listado en confianza_baja,
+    // y aplicarRespaldoFoto se lo nombra a la persona uno por uno. Rellenar
+    // sin avisar sería lo único peor que dejar en blanco.
     datos.confianza_baja = [];
-    const MONTO_FUERTE = ["palabras+digitos", "aritmetica"];
-    if (datos.monto && !MONTO_FUERTE.includes(datos.monto_origen)) datos.confianza_baja.push("monto");
     // En una discrepancia entre dígitos y letras gana el número escrito en
     // letras: es el único de los dos que se autoverifica (una palabra mal
     // leída rompe el parseo en vez de producir otro número).
-    if (datos.monto_origen === "discrepancia" && datos.monto_en_palabras) datos.monto = datos.monto_en_palabras;
-    if (datos.nro_documento && datos.folio_origen !== "tipo") datos.confianza_baja.push("nro_documento");
+    if (datos.monto_origen === "discrepancia" && datos.monto_en_palabras) {
+      datos.monto = datos.monto_en_palabras;
+      datos.monto_origen = "palabras";
+    }
+    const MONTO_FUERTE = ["palabras+digitos", "aritmetica", "palabras"];
+    if (!MONTO_FUERTE.includes(datos.monto_origen)) datos.monto = null;
+    if (datos.nro_documento && datos.folio_origen !== "tipo") datos.nro_documento = null;
+    if (datos.nro_documento) datos.confianza_baja.push("nro_documento");
 
     // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
     // 2026, un solo dígito mal que manda el gasto a otro período contable.
@@ -3803,12 +3820,19 @@ async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
     ...(datos.confianza_baja || []).map((c) => ETIQUETA_CAMPO_OCR[c] || c),
     datos.rut_proveedor && "RUT",
   ].filter(Boolean);
+  // El monto se nombra aparte del resto de los faltantes: es obligatorio, y
+  // cuando queda vacío no es que "no se pudo leer" sino que se leyó algo
+  // que no era lo bastante confiable como para ponerlo. Decirlo así evita
+  // que la persona crea que el lector no vio nada y busque el problema.
+  const faltaMonto = !datos.monto;
+  const otrosFaltantes = faltan.filter((f) => f !== ETIQUETA_CAMPO_OCR.monto);
   statusEl.textContent = `⚠ La IA no está disponible, así que la foto se leyó acá mismo, que es menos preciso.`
     + (datos.monto_verificado ? " El monto sí quedó confirmado contra el propio documento." : "")
-    + (faltan.length ? ` Completa a mano: ${faltan.join(", ")}.` : "")
+    + (faltaMonto ? " El monto quedó en blanco a propósito: de una foto no se puede confirmar, y un monto equivocado es peor que uno en blanco. Escríbelo mirando el comprobante." : "")
+    + (otrosFaltantes.length ? ` Completa a mano: ${otrosFaltantes.join(", ")}.` : "")
     + (dudosos.length
-      ? ` COMPARA CON EL COMPROBANTE antes de enviar: ${dudosos.join(", ")}. De una foto suelen salir con un dígito cambiado, y el número igual se ve bien formado.`
-      : " Revisa los campos antes de enviar.");
+      ? ` Y compara con el comprobante: ${dudosos.join(", ")}. De una foto suelen salir con un dígito cambiado, y el número igual se ve bien formado.`
+      : "");
   statusEl.className = "ocr-status show";
   return true;
 }
