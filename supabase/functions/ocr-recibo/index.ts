@@ -38,7 +38,7 @@ async function requireUser(req: Request) {
   // cualquier motivo, "profile" quedaba undefined y el chequeo de abajo
   // dejaba pasar a una cuenta desactivada sin loguear nada. Falla cerrado.
   if (profileErr) throw profileErr;
-  if (profile?.activo === false) throw new Error("Tu cuenta fue desactivada.");
+  if (!profile || profile.activo === false) throw new Error("Tu cuenta fue desactivada.");
   return data.user;
 }
 
@@ -81,12 +81,7 @@ Deno.serve(async (req: Request) => {
     // consumir 120 solicitudes en una hora -- más que la cuota diaria
     // completa. El tope está denominado en llamadas, no en solicitudes, así
     // que hay que dividirlo por el abanico de candidatos.
-    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
-    if (llamadasRecientes >= 25) {
-      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
-    }
-    await logEvent(admin, "ocr_call", { usuarioId: userId });
-
+    if (typeof imageBase64 !== "string") throw new Error("Falta la imagen (imageBase64).");
     if (!imageBase64) throw new Error("Falta la imagen (imageBase64).");
     // ~15MB de archivo original equivalen a ~20M caracteres en base64
     // (overhead ~33%). Sin este tope, un PDF/foto gigante se manda entero a
@@ -95,6 +90,20 @@ Deno.serve(async (req: Request) => {
     if (imageBase64.length > 20_000_000) {
       throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
     }
+
+    const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
+    const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
+    const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
+    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",1).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
+    if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
+    if (anterior?.resultado) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
+
+    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
+    if (llamadasRecientes >= 25) {
+      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
+    }
+    await logEvent(admin, "ocr_call", { usuarioId: userId });
+
 
     // ACÁ está el ahorro de cuota. El navegador lee el PDF localmente con
     // pdf.js antes de llamar acá, y cuando esa lectura sale completa manda
@@ -128,6 +137,10 @@ Deno.serve(async (req: Request) => {
       await logEvent(admin, "ocr_vacio", { usuarioId: userId });
     }
 
+    if (tieneDatosUtiles(resultado)) {
+      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:1,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
+      if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);
+    }
     return new Response(JSON.stringify(resultado), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
@@ -150,7 +163,7 @@ Deno.serve(async (req: Request) => {
     // no debe tapar el mensaje de error original de Gemini con uno de
     // Storage -- se loguea aparte y se responde igual sin previaId.
     let previaId: string | null = null;
-    if (!esRechazoEsperable && userId && imageBase64) {
+    if (!esRechazoEsperable && userId && typeof imageBase64 === "string" && imageBase64.length <= 20_000_000) {
       try {
         const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
         const parciales = datosParciales && Object.keys(datosParciales).length ? datosParciales : null;

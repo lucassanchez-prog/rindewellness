@@ -6,7 +6,7 @@
 // viven en pure.js (cargado antes que este archivo, ver index.html) -- son
 // funciones puras sin DOM ni red, separadas para poder testearlas con Node
 // (ver tests/pure.test.js) sin arrastrar el resto de la app.
-const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo } = window.RindeCore;
+const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, documentosDuplicados, campoCSV, resumenRendicion } = window.RindeCore;
 
 const CFG = window.RINDE_WELLNESS_CONFIG || {};
 let db = null; // proyecto propio de la app (lectura/escritura)
@@ -809,12 +809,12 @@ function renderList(container, rows, showEmpleado) {
 
   const columnas = ["Folio"];
   if (showEmpleado) columnas.push("Empleado");
-  columnas.push("Empresa", "Comentario", "Fecha", "Tipo", "Monto", "Estado");
+  columnas.push("Empresa", "Comentario", "Fecha", "Tipo", "Monto rendido", "Monto aprobado", "Estado");
 
   const columnasCentradas = new Set(["Folio", "Fecha", "Tipo", "Estado"]);
   const tabla = el("table", { class: "items-table" });
   tabla.appendChild(el("thead", {}, [
-    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c === "Monto" ? "right" : "") }, c))),
+    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c.startsWith("Monto") ? "right" : "") }, c))),
   ]));
   const tbody = el("tbody");
   tabla.appendChild(tbody);
@@ -827,7 +827,8 @@ function renderList(container, rows, showEmpleado) {
       el("td", { class: "wrap" }, r.comentario || "-"),
       el("td", { class: "center" }, fmtDate(r.created_at)),
       el("td", { class: "center" }, r.tipo_rendicion),
-      el("td", { class: "monto" }, fmtCLP(r.monto_total)),
+      el("td", { class: "monto" }, fmtCLP(r.monto_rendido ?? r.monto_total)),
+      el("td", { class: "monto" }, fmtCLP(r.monto_aprobado ?? (r.estado === "Aprobado" ? r.monto_total : 0))),
       el("td", { class: "center" }, el("span", { class: "pill " + r.estado }, r.estado)),
     );
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
@@ -2109,6 +2110,7 @@ function addItemRow() {
           const tieneArchivo = [...wrap.querySelectorAll('input[type=file]')].some((i) => i.files.length);
           if ((tieneMonto || tieneArchivo) && !confirm("¿Quitar este ítem? Se pierde el comprobante y los datos cargados, no se puede deshacer.")) return;
           wrap.remove();
+          actualizarAlertasDuplicados();
           renumerarItems();
           recalcTotal();
         },
@@ -2133,6 +2135,7 @@ function addItemRow() {
       const isCon = b.dataset.tipo === "ConDocumento";
       bodyConDoc.style.display = isCon ? "block" : "none";
       bodySinDoc.style.display = isCon ? "none" : "block";
+      actualizarAlertasDuplicados();
     });
   });
 
@@ -2140,6 +2143,17 @@ function addItemRow() {
   wrap.appendChild(toggle);
   wrap.appendChild(bodyConDoc);
   wrap.appendChild(bodySinDoc);
+  wrap.appendChild(bodyConDoc.querySelector(`#${id}-dup-status`));
+  wrap.appendChild(el("p", { class: "ocr-status", id: id + "-dup-local" }));
+  const identidadCampos = /-(rut2?|folio2?|tipodoc2?)$/;
+  wrap.addEventListener("input", (event) => {
+    if (event.isTrusted) camposEditadosOcr.add(event.target.id);
+    if (identidadCampos.test(event.target.id)) actualizarAlertasDuplicados();
+  });
+  wrap.addEventListener("change", (event) => { if (event.isTrusted) camposEditadosOcr.add(event.target.id); actualizarAlertasDuplicados(); });
+  wrap.addEventListener("focusout", (event) => {
+    if (identidadCampos.test(event.target.id)) chequearDuplicadoHistorico(id);
+  });
   document.getElementById("items-container").appendChild(wrap);
   // itemSeq solo sigue subiendo (nunca vuelve atrás, para que los ids del
   // DOM no se repitan) -- si antes se quitó un ítem, el título inicial de
@@ -2164,7 +2178,7 @@ function dividirItem(wrap, id) {
         nombreprov: v("-nombreprov"), rut: v("-rut"), tipodoc: v("-tipodoc"),
         folio: v("-folio"), venc: v("-venc"), categoria: v("-categoriacon"), monto: v("-monto"),
       }
-    : { nombreprov2: v("-nombreprov2"), categoria: v("-categoria"), monto2: v("-monto2") };
+    : { nombreprov2: v("-nombreprov2"), rut2: v("-rut2"), tipodoc2: v("-tipodoc2"), folio2: v("-folio2"), fecha2: v("-fecha2"), categoria: v("-categoria"), monto2: v("-monto2") };
 
   addItemRow();
   const nuevoId = "item-" + itemSeq;
@@ -2182,6 +2196,7 @@ function dividirItem(wrap, id) {
     document.getElementById(`${nuevoId}-monto`).value = datos.monto;
   } else {
     document.getElementById(`${nuevoId}-nombreprov2`).value = datos.nombreprov2;
+    for (const campo of ["rut2", "tipodoc2", "folio2", "fecha2"]) document.getElementById(`${nuevoId}-${campo}`).value = datos[campo];
     const catSel = document.getElementById(`${nuevoId}-categoria`);
     if (catSel && datos.categoria) { catSel.value = datos.categoria; catSel.dispatchEvent(new Event("change")); }
     document.getElementById(`${nuevoId}-monto2`).value = datos.monto2;
@@ -2195,6 +2210,7 @@ function dividirItem(wrap, id) {
   }
 
   recalcTotal();
+  actualizarAlertasDuplicados();
   toast("Ítem dividido. Ajusta el monto y el Centro de Costo de cada uno para que sumen el total real del documento.");
   document.getElementById(esCon ? `${nuevoId}-cccon` : `${nuevoId}-cc`)?.focus();
 }
@@ -2294,30 +2310,60 @@ function buildConDocumentoFields(id) {
     } else {
       rutHint.className = "ocr-status";
     }
-    const nombre = await buscarNombreProveedorPorRut(rutInput.value);
-    if (nombre) nombreProvInput.value = nombre;
-    chequearDuplicado();
+    const rutConsultado = rutInput.value;
+    const nombre = await buscarNombreProveedorPorRut(rutConsultado);
+    if (nombre && rutInput.value === rutConsultado && !camposEditadosOcr.has(nombreProvInput.id)) nombreProvInput.value = nombre;
   });
-  folioInput.addEventListener("blur", chequearDuplicado);
-
-  // Detector de comprobantes duplicados: mismo RUT + N° de documento ya
-  // cargado antes en OTRA rendición (propia o ajena) que no esté Rechazada.
-  // Es solo un aviso, no bloquea -- puede haber compras legítimas repetidas
-  // al mismo proveedor con folios que coinciden por error de tipeo, así que
-  // la decisión final la sigue tomando la persona (o quien aprueba).
-  async function chequearDuplicado() {
-    const rut = rutInput.value.trim();
-    const folio = folioInput.value.trim();
-    dupStatus.className = "ocr-status";
-    if (!rut || !folio || !validarRut(rut)) return;
-    const { data, error } = await db.rpc("buscar_documento_duplicado", { p_rut: rut, p_nro: folio });
-    if (error || !data || !data.length) return;
-    const match = data[0];
-    dupStatus.textContent = `⚠ Este documento ya está registrado en la rendición N° ${match.folio} de ${match.empleado_nombre} (${match.estado}). Revisa que no sea un duplicado.`;
-    dupStatus.className = "ocr-status show err";
-  }
 
   return box;
+}
+
+function documentoDeTarjeta(card) {
+  const con = card.querySelector('[data-tipo="ConDocumento"]').classList.contains("active");
+  const v = (campo) => document.getElementById(card.id + campo)?.value || "";
+  return { rut_proveedor: v(con ? "-rut" : "-rut2"), tipo_documento: v(con ? "-tipodoc" : "-tipodoc2"), nro_documento: v(con ? "-folio" : "-folio2") };
+}
+
+function actualizarAlertasDuplicados() {
+  const cards = [...document.querySelectorAll(".item-card")];
+  const grupos = documentosDuplicados(cards.map(documentoDeTarjeta));
+  cards.forEach((card) => {
+    const aviso = document.getElementById(card.id + "-dup-local");
+    if (aviso) { aviso.textContent = ""; aviso.className = "ocr-status"; }
+  });
+  grupos.forEach((indices) => {
+    const texto = "⚠ El mismo documento aparece en los ítems " + indices.map((i) => i + 1).join(", ") + ". Si lo repartiste entre centros de costo, verifica que los montos sumen el total de la factura.";
+    indices.forEach((indice) => {
+      const aviso = document.getElementById(cards[indice].id + "-dup-local");
+      if (aviso) { aviso.textContent = texto; aviso.className = "ocr-status show err"; }
+    });
+  });
+  return grupos;
+}
+
+async function chequearDuplicadoHistorico(id) {
+  const card = document.getElementById(id);
+  if (!card) return;
+  actualizarAlertasDuplicados();
+  const documento = documentoDeTarjeta(card);
+  const aviso = document.getElementById(id + "-dup-status");
+  const identidad = JSON.stringify(documento);
+  aviso.dataset.consulta = identidad;
+  aviso.className = "ocr-status";
+  if (!documento.rut_proveedor || !documento.nro_documento || !validarRut(documento.rut_proveedor)) return;
+  const { data, error } = await db.rpc("buscar_documento_duplicado", {
+    p_rut: documento.rut_proveedor, p_nro: documento.nro_documento, p_tipo: documento.tipo_documento,
+  });
+  if (!document.body.contains(card) || aviso.dataset.consulta !== identidad) return;
+  if (error) {
+    aviso.textContent = "No se pudo comprobar si el documento ya fue rendido. Revisa antes de enviar.";
+    aviso.className = "ocr-status show err";
+    return;
+  }
+  if (data?.length) {
+    aviso.textContent = "⚠ Este documento ya está registrado en la rendición N° " + data[0].folio + " de " + data[0].empleado_nombre + ". Revisa que no sea un duplicado.";
+    aviso.className = "ocr-status show err";
+  }
 }
 
 // Lee la foto del comprobante, se la manda a la Edge Function "ocr-recibo"
@@ -2428,7 +2474,7 @@ async function prepararImagenParaOcr(file) {
   try {
     const bitmap = await createImageBitmap(file);
     const escala = Math.min(1, LADO_MAXIMO_OCR / Math.max(bitmap.width, bitmap.height));
-    if (escala === 1) return file;
+    if (escala === 1) { bitmap.close(); return file; }
     const w = Math.round(bitmap.width * escala);
     const h = Math.round(bitmap.height * escala);
     const canvas = document.createElement("canvas");
@@ -2436,6 +2482,7 @@ async function prepararImagenParaOcr(file) {
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
     ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
     const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.92));
     return blob ? new File([blob], file.name, { type: "image/jpeg" }) : file;
   } catch (err) {
@@ -3181,6 +3228,7 @@ async function completarConIA({ id, file, gen, statusEl, local, contable, datos,
     }
 
     const { datos: fusion, aporteIA, avisos } = fusionarLecturas(local, ia, contableFinal);
+    mostrarVerificacionOcr(id, ia);
     await aplicar(id, aporteIA, gen);
     if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
     // La IA aportó algo: queda registrado como origen mixto. Y el monto pudo
@@ -3481,8 +3529,39 @@ async function llamarOcrRecibo(file, camposFaltantes, datosParciales) {
 // (o pulsa "reintenta con IA") mientras la llamada anterior todavía está en
 // vuelo: antes, cualquiera de las dos que respondiera último ganaba, sin
 // importar si correspondía al archivo que en realidad quedó adjunto.
+const camposEditadosOcr = new Set();
+const SUFIJOS_OCR = {nombre_proveedor:["nombreprov","nombreprov2"],rut_proveedor:["rut","rut2"],tipo_documento:["tipodoc","tipodoc2"],nro_documento:["folio","folio2"],fecha:["venc","fecha2"],monto:["monto","monto2"],descripcion:["desc","desc2"],categoria_sugerida:["categoriacon","categoria"]};
+function protegerEdicionOcr(id, data) {
+  const copia = {...data};
+  for (const [campo,sufijos] of Object.entries(SUFIJOS_OCR)) {
+    if (sufijos.some(s => camposEditadosOcr.has(id+"-"+s))) delete copia[campo];
+  }
+  return copia;
+}
+function mostrarVerificacionOcr(id, data) {
+  const card = document.getElementById(id);
+  if (!card || !data.verificacion_campos) return;
+  card.querySelector(".ocr-verificacion")?.remove();
+  const panel = document.createElement("details"); panel.className = "ocr-verificacion";
+  const titulo = document.createElement("summary"); titulo.textContent = "Revisión del agente: datos y evidencia"; panel.appendChild(titulo);
+  const etiquetas = {nombre_proveedor:"Proveedor",rut_proveedor:"RUT",tipo_documento:"Documento",nro_documento:"Folio",fecha:"Fecha",monto:"Monto"};
+  for (const [campo,revision] of Object.entries(data.verificacion_campos)) {
+    if (!etiquetas[campo] || !revision || typeof revision !== "object") continue;
+    const fila = document.createElement("p");
+    const manual = SUFIJOS_OCR[campo]?.some(s => camposEditadosOcr.has(id+"-"+s));
+    const estado = manual ? "Corregido por ti" : ({coincidente_lecturas:"Coincide en dos lecturas",consistente:"Coincide en cifras y palabras",por_confirmar:"Por confirmar",ilegible:"Ilegible"}[revision.estado] || "Por confirmar");
+    fila.textContent = etiquetas[campo]+": "+estado+". "+(manual ? "Se conservó tu edición." : String(revision.motivo || ""));
+    if (revision.texto) fila.textContent += ' Lectura: «'+String(revision.texto).slice(0,300)+'».';
+    if (revision.ubicacion) fila.textContent += " Ubicación: "+String(revision.ubicacion).slice(0,120)+".";
+    panel.appendChild(fila);
+  }
+  card.appendChild(panel);
+}
+
 const ocrGeneracion = new Map();
 function nuevaGeneracionOcr(id) {
+  for (const campo of camposEditadosOcr) if (campo.startsWith(id+"-")) camposEditadosOcr.delete(campo);
+  document.getElementById(id)?.querySelector(".ocr-verificacion")?.remove();
   const gen = (ocrGeneracion.get(id) || 0) + 1;
   ocrGeneracion.set(id, gen);
   return gen;
@@ -3609,6 +3688,8 @@ function montoValidoCLP(valor) {
 // mientras tanto.
 async function aplicarResultadoOcrCon(id, data, gen) {
   if (!esGeneracionVigenteOcr(id, gen)) return;
+  mostrarVerificacionOcr(id, data);
+  data = protegerEdicionOcr(id, data);
   ocrExitoso.set(id, true);
   if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
   if (data.rut_proveedor) {
@@ -3629,7 +3710,7 @@ async function aplicarResultadoOcrCon(id, data, gen) {
     // y deja un ítem con datos de dos comprobantes distintos -- justo lo
     // que la limpieza de campos venía a evitar.
     if (!esGeneracionVigenteOcr(id, gen)) return;
-    if (nombreReal) document.getElementById(`${id}-nombreprov`).value = nombreReal;
+    if (nombreReal && !camposEditadosOcr.has(`${id}-nombreprov`)) document.getElementById(`${id}-nombreprov`).value = nombreReal;
   }
   if (data.tipo_documento) {
     if (TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
@@ -3656,7 +3737,7 @@ async function aplicarResultadoOcrCon(id, data, gen) {
       catSelect.value = data.categoria_sugerida;
     }
   }
-  if (esGeneracionVigenteOcr(id, gen)) recalcTotal();
+  if (esGeneracionVigenteOcr(id, gen)) { recalcTotal(); chequearDuplicadoHistorico(id); }
 }
 
 // Dispara el agente de reintento en segundo plano AHORA MISMO (en vez de
@@ -3686,7 +3767,7 @@ function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
     if (data.estado === "listo" && data.resultado) {
       await aplicar(data.resultado, gen);
       if (esGeneracionVigenteOcr(id, gen)) {
-        statusEl.textContent = "✔ La IA logró leer el comprobante en un reintento automático. Revísalo antes de enviar.";
+        statusEl.textContent = "El agente completó la lectura. Revisa los campos y su evidencia; se conservaron tus correcciones.";
         statusEl.className = "ocr-status show ok";
       }
       return;
@@ -3812,7 +3893,10 @@ async function analizarComprobante(id, file, statusEl) {
     // nada, gana algo. Solo se aplica si pasó los controles de
     // leerFotoLocal (RUT con dígito verificador válido, o monto que cuadra
     // con neto + IVA).
-    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrCon, CAMPOS_OCR_CON)) return;
+    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrCon, CAMPOS_OCR_CON)) {
+      dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrCon(id, data, g), statusEl);
+      return;
+    }
 
     // Antes se mostraba siempre el mismo mensaje genérico, así que un PDF
     // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
@@ -3925,6 +4009,8 @@ async function mostrarHistorialProveedor(id, nombreProveedor) {
 // comentario de aquella.
 async function aplicarResultadoOcrSin(id, data, gen) {
   if (!esGeneracionVigenteOcr(id, gen)) return;
+  mostrarVerificacionOcr(id, data);
+  data = protegerEdicionOcr(id, data);
   ocrExitoso.set(id, true);
   if (data.nombre_proveedor) {
     document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
@@ -3953,7 +4039,7 @@ async function aplicarResultadoOcrSin(id, data, gen) {
       catSelect.dispatchEvent(new Event("change"));
     }
   }
-  if (esGeneracionVigenteOcr(id, gen)) recalcTotal();
+  if (esGeneracionVigenteOcr(id, gen)) { recalcTotal(); chequearDuplicadoHistorico(id); }
 }
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
@@ -4012,7 +4098,10 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     console.error("Error en OCR:", err);
     // Mismo respaldo que en "Documento electrónico": una foto sin IA
     // disponible se lee acá antes de darse por vencido.
-    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrSin, CAMPOS_OCR_SIN)) return;
+    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrSin, CAMPOS_OCR_SIN)) {
+      dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrSin(id, data, g), statusEl);
+      return;
+    }
     mostrarErrorOcr(statusEl, err, () => analizarComprobanteGastoDirecto(id, file, statusEl));
     dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrSin(id, data, g), statusEl);
   }
@@ -4473,6 +4562,12 @@ async function submitRendicion() {
   }
 
   if (!items.length) { toast("Ingresa el monto de al menos un ítem."); return; }
+  const duplicados = documentosDuplicados(items);
+  if (duplicados.length) {
+    actualizarAlertasDuplicados();
+    const resumen = duplicados.map((grupo) => grupo.map((i) => i + 1).join(", ")).join("; ");
+    if (!confirm("El mismo documento aparece más de una vez (ítems " + resumen + "). ¿Confirmas que es una distribución entre centros de costo y que los montos suman el total real de cada documento?")) return;
+  }
   const hayItemsPendientesOcr = items.some((it) => it.ocr_reintento_estado === "pendiente");
 
   let solicitudFondoId = null;
@@ -4486,6 +4581,15 @@ async function submitRendicion() {
   btn.innerHTML = '<span class="spinner"></span> Guardando...';
 
   try {
+    const vistos = new Set();
+    for (const item of items) {
+      const clave = window.RindeCore.claveDocumento(item);
+      if (!clave || vistos.has(clave)) continue;
+      vistos.add(clave);
+      const { data, error } = await db.rpc("buscar_documento_duplicado", { p_rut: item.rut_proveedor, p_nro: item.nro_documento, p_tipo: item.tipo_documento });
+      if (error) throw new Error("No se pudo comprobar documentos duplicados. Vuelve a intentar antes de enviar.");
+      if (data?.length && !confirm("El documento " + item.nro_documento + " ya aparece en la rendición N° " + data[0].folio + ". ¿Confirmas que corresponde enviarlo nuevamente?")) return;
+    }
     // Subimos los comprobantes ANTES de crear la rendición -- así, si todos
     // fallan (red, un nombre de archivo raro, etc.), nunca se llega a
     // insertar la cabecera y no se quema un folio en el intento. Antes se
@@ -4882,6 +4986,19 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
 // ------------------------------------------------------------
 // Detalle / aprobación
 // ------------------------------------------------------------
+function crearResumenRendicion(items) {
+  const resumen = resumenRendicion(items);
+  const tarjeta = (titulo, cantidad, monto, clase) => el("div", {class:"resumen-gastos-tarjeta "+clase}, [
+    el("h3", {}, titulo), el("p", {}, cantidad+" de "+resumen.total+" gastos"), el("strong", {class:"resumen-gastos-monto"}, fmtCLP(monto)+" CLP"),
+  ]);
+  const panel = el("section", {class:"resumen-gastos","aria-label":"Resumen de montos de la rendición"}, [
+    el("div", {class:"resumen-gastos-total"}, [el("span", {}, "Monto rendido"), el("strong", {}, fmtCLP(resumen.rendido)+" CLP")]),
+    el("div", {class:"resumen-gastos-grid"}, [tarjeta("Gastos aprobados",resumen.aprobados,resumen.aprobado,"aprobados"),tarjeta("Gastos rechazados",resumen.rechazados,resumen.rechazado,"rechazados")]),
+  ]);
+  if (resumen.pendientes) panel.appendChild(el("p", {class:"resumen-gastos-pendientes"}, resumen.pendientes+" gastos pendientes de revisión · "+fmtCLP(resumen.pendiente)+" CLP"));
+  return panel;
+}
+
 async function openDetalle(id, pushHistory = true) {
   const box0 = document.getElementById("detalle-card");
   box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
@@ -4896,8 +5013,8 @@ async function openDetalle(id, pushHistory = true) {
   // en paralelo en vez de esperar la primera para recién pedir la segunda.
   // historialCount es solo para saber si hay algo que mostrar -- el botón de
   // historial ni aparece si la rendición nunca tuvo un cambio registrado.
-  const [{ data: items }, { count: historialCount }, { data: montosEditados }] = await Promise.all([
-    db.from("rendicion_items").select("*").eq("rendicion_id", id),
+  const [{ data: items, error: errorItems, count: cantidadItems }, { count: historialCount }, { data: montosEditados }] = await Promise.all([
+    db.from("rendicion_items").select("*", {count:"exact"}).eq("rendicion_id", id),
     db.from("rendicion_items_historial").select("id", { count: "exact", head: true }).eq("rendicion_id", id),
     // Qué ítems tuvieron su monto editado a mano después de cargarse (por
     // OCR o a mano) -- una señal de confianza simple para quien aprueba,
@@ -4905,6 +5022,9 @@ async function openDetalle(id, pushHistory = true) {
     // resumían en ningún lado de la vista de detalle.
     db.from("rendicion_items_historial").select("item_id").eq("rendicion_id", id).eq("campo", "monto"),
   ]);
+  if (errorItems || !items || cantidadItems !== items.length) {
+    box0.textContent = "No se pudo cargar el detalle completo. Vuelve a abrir la rendición."; return;
+  }
   const itemsConMontoEditado = new Set((montosEditados || []).map((h) => h.item_id));
 
   const esAprobadorViewer = esAprobadorEfectivo(currentProfile);
@@ -4921,6 +5041,10 @@ async function openDetalle(id, pushHistory = true) {
     ]),
     el("span", { class: "pill " + r.estado, style: "font-size:0.8rem" }, r.estado),
   ]));
+
+  box.appendChild(crearResumenRendicion(items));
+  const gruposDuplicados = documentosDuplicados(items.filter((it) => it.estado !== "Rechazado"));
+  if (gruposDuplicados.length) box.appendChild(el("p", { class: "ocr-status show err" }, "⚠ Hay documentos repetidos en esta rendición. Comprueba que correspondan a una distribución del gasto y que no se esté rindiendo dos veces la factura."));
 
   // Si esta rendición justifica un fondo entregado por adelantado, se
   // muestra el vínculo con su solicitud (folio real, no el uuid) para
@@ -5124,10 +5248,7 @@ async function openDetalle(id, pushHistory = true) {
 
   box.appendChild(el("div", { class: "table-scroll" }, [tabla]));
 
-  box.appendChild(el("div", { class: "totals-bar" }, [
-    el("span", {}, "Total"),
-    el("span", { class: "amount" }, fmtCLP(r.monto_total)),
-  ]));
+
 
   if (r.estado === "Aprobado") {
     box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:10px" },
@@ -5309,37 +5430,14 @@ async function aprobarTodosPendientes(rendicion, items) {
 // a Aprobado (con el monto recalculado); si todos fueron rechazados, pasa
 // a Rechazado.
 async function finalizarAprobacionRendicion(rendicion, items) {
-  const aprobados = items.filter((it) => it.estado === "Aprobado");
-  const rechazados = items.filter((it) => it.estado === "Rechazado");
-  const estado = aprobados.length > 0 ? "Aprobado" : "Rechazado";
-  const montoTotal = aprobados.reduce((s, it) => s + Number(it.monto || 0), 0);
-
-  const cambios = {
-    estado,
-    monto_total: montoTotal,
-    aprobador_id: currentUser.id,
-    aprobador_nombre: currentProfile?.nombre || currentUser.email,
-    fecha_aprobacion: new Date().toISOString(),
-  };
-  if (estado === "Rechazado") {
-    cambios.motivo_rechazo = rechazados.map((it) => it.motivo_rechazo).filter(Boolean).join(" | ") || "Todos los ítems fueron rechazados.";
-  }
-
-  const res = await updateChecked("rendiciones", rendicion.id, cambios);
-  if (!res.ok) {
-    toast(res.mensaje);
-    if (/ya fue procesad/i.test(res.mensaje)) openDetalle(rendicion.id, false);
-    return;
-  }
-
-  toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
-  Object.assign(rendicion, cambios);
-
+  const duplicados = documentosDuplicados(items.filter((it) => it.estado !== "Rechazado"));
+  if (duplicados.length && !confirm("Hay documentos repetidos dentro de esta rendición. Verifica la distribución de montos antes de aprobar. ¿Continuar?")) return;
+  const { data, error } = await db.rpc("finalizar_rendicion", { p_id: rendicion.id });
+  if (error || !data) { toast(mensajeErrorAmigable(error || new Error("No se pudo finalizar."))); await openDetalle(rendicion.id, false); return; }
+  Object.assign(rendicion, data.rendicion);
+  toast(rendicion.estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
   notificarAsync("notificar-estado-rendicion", { rendicion_id: rendicion.id }, "No se pudo notificar al empleado:");
-
-  if (estado === "Aprobado") {
-    await descargarCSV(rendicion, aprobados);
-  }
+  if (rendicion.estado === "Aprobado") await descargarCSV(rendicion, data.items);
   replaceView("view-dashboard");
   loadDashboard();
 }
@@ -5355,18 +5453,6 @@ async function verComprobante(it) {
 // Deja registro en rendicion_items_historial de quién cambió qué y desde
 // qué valor a cuál. Importante sobre todo para la cuenta contable (Centro
 // de Costo) y el monto, que son los campos que afectan la contabilidad.
-async function registrarCambio(item, rendicionId, campo, valorAnterior, valorNuevo) {
-  if (String(valorAnterior ?? "") === String(valorNuevo ?? "")) return;
-  await db.from("rendicion_items_historial").insert({
-    item_id: item.id,
-    rendicion_id: rendicionId,
-    usuario_id: currentUser.id,
-    usuario_nombre: currentProfile?.nombre || currentUser.email,
-    campo,
-    valor_anterior: valorAnterior === null || valorAnterior === undefined ? null : String(valorAnterior),
-    valor_nuevo: valorNuevo === null || valorNuevo === undefined ? null : String(valorNuevo),
-  });
-}
 
 // Nombres de campo legibles para el historial (ver mostrarHistorialRendicion).
 const NOMBRE_CAMPO_HISTORIAL = {
@@ -5690,23 +5776,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
         const res = await updateChecked("rendicion_items", it.id, cambios);
         if (!res.ok) { toast(res.mensaje); return; }
 
-        // Solo se audita lo que realmente formaba parte del formulario editado
-        // (p.ej. un empleado no puede tocar cuenta_contable, así que no debe
-        // quedar un registro falso de "cambio" en ese campo).
-        await Promise.all(
-          Object.keys(cambios).map((campo) => registrarCambio(it, rendicion.id, campo, it[campo], cambios[campo]))
-        );
 
-        if (cambios.monto !== it.monto) {
-          // Excluir Rechazado: un aprobador puede editar el monto de un
-          // ítem mientras revisa uno por uno, antes de "Finalizar
-          // aprobación" -- si ya rechazó otro ítem de la misma rendición,
-          // sumarlo acá infla el Total mostrado (y el stat de Pendientes
-          // del dashboard) con plata que nunca va a quedar aprobada.
-          const { data: todos } = await db.from("rendicion_items").select("monto, estado").eq("rendicion_id", rendicion.id);
-          const nuevoTotal = (todos || []).filter((x) => x.estado !== "Rechazado").reduce((s, x) => s + Number(x.monto), 0);
-          await db.from("rendiciones").update({ monto_total: nuevoTotal }).eq("id", rendicion.id);
-        }
 
         toast("Ítem actualizado.");
         openDetalle(rendicion.id, false);
@@ -5730,7 +5800,7 @@ const CSV_HEADER = [
 ].join(";");
 
 function csvRow(fields) {
-  return fields.map((f) => (f === null || f === undefined ? "" : String(f))).join(";");
+  return fields.map(campoCSV).join(";");
 }
 
 // Arma las filas (sin encabezado) de UNA rendición: una línea por ítem más
@@ -5981,7 +6051,8 @@ async function generarInformePDF(rendicion, items) {
       linea("Rechazado por", rendicion.aprobador_nombre);
       linea("Motivo", rendicion.motivo_rechazo || "No se dejó un motivo.");
     }
-    linea("Monto total", fmtCLP(rendicion.monto_total));
+    linea("Monto rendido", fmtCLP((items || []).reduce((s,it) => s+Number(it.monto || 0),0)));
+    linea("Monto aprobado", fmtCLP((items || []).filter(it => it.estado === "Aprobado").reduce((s,it) => s+Number(it.monto || 0),0)));
     y += 4;
 
     doc.autoTable({
@@ -6200,7 +6271,8 @@ async function exportarExcel() {
       "Tipo": r.tipo_rendicion,
       "Fondo Asociado": r.solicitudes_fondos?.folio ? `S-${r.solicitudes_fondos.folio}` : "",
       "Comentario": r.comentario || "",
-      "Monto Total": Number(r.monto_total || 0),
+      "Monto rendido": Number(r.monto_rendido ?? r.monto_total ?? 0),
+      "Monto aprobado": Number(r.monto_aprobado ?? (r.estado === "Aprobado" ? r.monto_total : 0)),
       "Estado": r.estado,
       "Aprobador": r.aprobador_nombre || "",
       "Fecha Aprobación": r.fecha_aprobacion ? fmtDate(r.fecha_aprobacion) : "",

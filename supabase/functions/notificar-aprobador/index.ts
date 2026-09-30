@@ -35,6 +35,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
 import { esAprobadorEfectivo } from "../_shared/auth.ts";
+import { emailsDePerfiles, leerTodas } from "../_shared/data.ts";
 import { construirEmailHTML } from "../_shared/email.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -151,6 +152,7 @@ Deno.serve(async (req: Request) => {
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   let callerId: string | null = null;
   let rendicionId: string | null = null;
+  let solicitudId: string | null = null;
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
@@ -159,21 +161,18 @@ Deno.serve(async (req: Request) => {
 
     const { tipo, rendicion_id } = await req.json();
     if (!rendicion_id) throw new Error("Falta rendicion_id.");
-    rendicionId = rendicion_id;
     const esSolicitud = tipo === "solicitud";
+    if (esSolicitud) solicitudId = rendicion_id; else rendicionId = rendicion_id;
 
     // Límite de frecuencia: como cualquier sesión válida puede disparar
     // esta función (no solo aprobador/admin -- un empleado la llama al
     // enviar su propia rendición), sin esto alguien podía scriptear el
     // envío repetido y spamear a todo el equipo de aprobadores.
-    const recientesPorFila = await contarEventosRecientes(admin, "notificar_aprobador_ok", { rendicionId: rendicion_id }, 2);
-    if (recientesPorFila >= 1) {
-      throw new Error("Ya se avisó a los aprobadores sobre esto hace un momento.");
-    }
-    const recientesPorUsuario = await contarEventosRecientes(admin, "notificar_aprobador_ok", { usuarioId: callerId }, 60);
-    if (recientesPorUsuario >= 30) {
-      throw new Error("Demasiados avisos enviados en la última hora. Espera un poco.");
-    }
+    const { data: permitido, error: errorCupo } = await admin.rpc("reservar_cupo_notificacion", {
+      p_usuario: callerId, p_operacion: "notificar_aprobador", p_entidad: rendicion_id,
+    });
+    if (errorCupo) throw errorCupo;
+    if (!permitido) throw new Error("Demasiados avisos o ya se avisó hace un momento. Espera antes de reenviar.");
 
     const tabla = esSolicitud ? "solicitudes_fondos" : "rendiciones";
     const { data: row, error: errRow } = await admin.from(tabla).select("*").eq("id", rendicion_id).maybeSingle();
@@ -194,11 +193,9 @@ Deno.serve(async (req: Request) => {
     // cubriendo a un aprobador de vacaciones. Se filtra la vigencia acá
     // (no en el SELECT) porque Supabase-js no arma bien un OR con fecha
     // nula-o-futura en una sola llamada simple.
-    const { data: perfilesTodos, error: errPerfiles } = await admin
-      .from("profiles")
-      .select("id, nombre, rol, delegado_activo, delegado_hasta")
-      .or("rol.in.(aprobador,admin),delegado_activo.eq.true");
-    if (errPerfiles) throw errPerfiles;
+    const perfilesTodos = await leerTodas(() => admin.from("profiles")
+      .select("id, nombre, rol, activo, delegado_activo, delegado_hasta", { count: "exact" })
+      .eq("activo", true).or("rol.in.(aprobador,admin),delegado_activo.eq.true").order("id"));
     const ahora = Date.now();
     const aprobadores = (perfilesTodos || []).filter((p) =>
       ["aprobador", "admin"].includes(p.rol) ||
@@ -210,9 +207,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const { data: usersData, error: errUsers } = await admin.auth.admin.listUsers();
-    if (errUsers) throw errUsers;
-    const emailPorId = new Map(usersData.users.map((u) => [u.id, u.email]));
+    const emailPorId = await emailsDePerfiles(admin, aprobadores);
     const destinatarios = aprobadores.map((p) => emailPorId.get(p.id)).filter(Boolean) as string[];
 
     if (!destinatarios.length) {
@@ -247,14 +242,14 @@ Deno.serve(async (req: Request) => {
     const { resp, data } = await enviarConFallback(destinatarios, asunto, html);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
 
-    await logEvent(admin, "notificar_aprobador_ok", { usuarioId: callerId, rendicionId });
+    await logEvent(admin, "notificar_aprobador_ok", { usuarioId: callerId, rendicionId, solicitudId });
     return new Response(JSON.stringify({ ok: true, enviados: destinatarios.length }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
     const mensaje = String(err instanceof Error ? err.message : err);
     if (!/No autenticado|Sesión inválida|desactivada|Ya se avisó|Demasiados avisos/i.test(mensaje)) {
-      await logEvent(admin, "notificar_aprobador_fail", { usuarioId: callerId, rendicionId, detalle: mensaje });
+      await logEvent(admin, "notificar_aprobador_fail", { usuarioId: callerId, rendicionId, solicitudId, detalle: mensaje });
     }
     return new Response(JSON.stringify({ error: mensaje }), {
       status: 400,

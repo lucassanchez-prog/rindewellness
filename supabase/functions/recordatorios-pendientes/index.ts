@@ -23,6 +23,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent } from "../_shared/logging.ts";
 import { esAprobadorEfectivo } from "../_shared/auth.ts";
+import { emailsDePerfiles, leerTodas } from "../_shared/data.ts";
 import { construirEmailHTML } from "../_shared/email.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -96,19 +97,15 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const { data: perfilesTodos, error: errPerfilesTodos } = await admin
-      .from("profiles")
-      .select("id, rol, delegado_activo, delegado_hasta")
-      .or("rol.in.(aprobador,admin),delegado_activo.eq.true");
-    if (errPerfilesTodos) throw errPerfilesTodos;
+    const perfilesTodos = await leerTodas(() => admin.from("profiles")
+      .select("id, nombre, rol, activo, delegado_activo, delegado_hasta", { count: "exact" })
+      .eq("activo", true).or("rol.in.(aprobador,admin),delegado_activo.eq.true").order("id"));
     const ahoraMs = Date.now();
     const destinatariosPerfiles = (perfilesTodos || []).filter((p) =>
       ["aprobador", "admin"].includes(p.rol) ||
       (p.delegado_activo && (!p.delegado_hasta || new Date(p.delegado_hasta).getTime() > ahoraMs))
     );
-    const { data: usersData, error: errUsersData } = await admin.auth.admin.listUsers();
-    if (errUsersData) throw errUsersData;
-    const emailPorId = new Map((usersData?.users || []).map((u) => [u.id, u.email]));
+    const emailPorId = await emailsDePerfiles(admin, destinatariosPerfiles);
     const destinatarios = [...new Set(destinatariosPerfiles.map((p) => emailPorId.get(p.id)).filter((e): e is string => !!e))];
 
     if (!destinatarios.length) {

@@ -748,3 +748,42 @@ button {
 
   .detail-header { flex-direction: column; }
 }
+
+/* Montos presentados y decisiones de aprobación, visibles en móvil. */
+.resumen-gastos { margin:20px 0 24px; }
+.resumen-gastos-total { display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-bottom:18px; }
+.resumen-gastos-total span { color:var(--ink-soft);font-size:.9rem; }
+.resumen-gastos-total strong { color:var(--blue);font-size:clamp(1.6rem,4vw,2.3rem); }
+.resumen-gastos-grid { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px; }
+.resumen-gastos-tarjeta { padding:22px;border:1px solid var(--line);border-radius:14px;background:var(--card); }
+.resumen-gastos-tarjeta h3 { margin:0 0 8px;font-size:1rem; }
+.resumen-gastos-tarjeta p { margin:0 0 16px;color:var(--ink-soft); }
+.resumen-gastos-monto { display:block;font-size:clamp(1.2rem,3vw,1.8rem); }
+.resumen-gastos-tarjeta.aprobados .resumen-gastos-monto { color:#25834a; }
+.resumen-gastos-tarjeta.rechazados .resumen-gastos-monto { color:#bd362c; }
+.resumen-gastos-pendientes { color:var(--ink-soft);font-size:.9rem; }
+.ocr-verificacion { padding:12px 14px;margin-top:12px;border:1px solid var(--line);border-radius:10px;font-size:.85rem; }
+.ocr-verificacion summary { cursor:pointer;font-weight:600; }
+.ocr-verificacion p { margin:10px 0;overflow-wrap:anywhere; }
+@media(max-width:480px) { .resumen-gastos-grid {grid-template-columns:1fr;} .resumen-gastos-tarjeta {padding:18px;} }
+
+/* Nueva portada: mantiene los formularios y sus identificadores. */
+#view-login .login-wrap { display:grid;grid-template-columns:minmax(0,1.4fr) minmax(340px,.85fr);align-items:center;gap:7vw;padding:64px max(6vw,24px);background:radial-gradient(ellipse at top left,rgba(43,115,123,.17),transparent 65%),var(--paper); }
+.login-presentacion { max-width:650px; }
+.login-marca {display:flex;align-items:center;gap:12px;font-size:1.3rem;font-weight:800;margin-bottom:64px;}
+.login-marca img {width:42px;height:42px;object-fit:contain;}
+.login-eyebrow {display:block;color:var(--teal-dark);font-size:.72rem;letter-spacing:.16em;font-weight:800;margin-bottom:16px;}
+.login-presentacion h2 {font-size:clamp(2.4rem,4.5vw,4.4rem);line-height:1.08;letter-spacing:-.04em;margin:0 0 24px;color:var(--ink);}
+.login-presentacion>p {max-width:510px;font-size:1.08rem;line-height:1.65;color:var(--ink-soft);}
+.login-beneficios {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;margin-top:46px;}
+.login-beneficios span {display:block;color:var(--teal);font-size:.8rem;font-weight:800;margin-bottom:10px;}
+.login-beneficios strong {display:block;font-size:.88rem;line-height:1.4;}
+.login-beneficios p {font-size:.8rem;line-height:1.5;color:var(--ink-soft);margin:8px 0 0;}
+#view-login .login-card {width:100%;max-width:440px;padding:38px;border-radius:22px;border:1px solid var(--line);box-shadow:0 22px 70px rgba(10,35,55,.12);justify-self:end;}
+#view-login .login-card .dot {width:44px;margin-bottom:28px;}
+#view-login .login-card h1 {font-size:1.7rem;letter-spacing:-.03em;margin-bottom:12px;}
+#view-login .login-card .sub {line-height:1.6;margin-bottom:30px;}
+#view-login .login-card input {min-height:48px;border-radius:10px;}
+#view-login #btn-login-submit {min-height:48px;border-radius:10px;margin-top:12px;}
+@media(max-width:900px) {#view-login .login-wrap {grid-template-columns:1fr;padding:36px 24px;gap:32px;} .login-marca {margin-bottom:28px;} .login-beneficios {display:none;} .login-presentacion h2 {font-size:2.5rem;} #view-login .login-card {justify-self:center;} .login-presentacion {justify-self:center;width:100%;max-width:440px;} }
+@media(max-width:480px) {#view-login .login-wrap {padding:48px 18px 24px;} #view-login .login-card {padding:26px 22px;} .login-presentacion h2 {font-size:2rem;} .login-presentacion>p {font-size:.95rem;} }

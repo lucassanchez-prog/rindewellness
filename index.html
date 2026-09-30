@@ -8,7 +8,7 @@
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="assets/logo-gw.png" />
 <link rel="apple-touch-icon" href="assets/logo-gw.png" />
-<link rel="stylesheet" href="styles.css?v=3" />
+<link rel="stylesheet" href="styles.css?v=4" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -37,10 +37,23 @@
   <div id="view-login" class="view active">
     <button class="btn btn-ghost theme-toggle" id="btn-theme-toggle-login" title="Cambiar tema" type="button">🌙</button>
     <div class="login-wrap">
+      <section class="login-presentacion" aria-label="RindeWellness">
+        <div class="login-marca"><img src="assets/logo-gw.png" alt="Grupo Wellness" /><span>RindeWellness</span></div>
+        <span class="login-eyebrow">GRUPO WELLNESS</span>
+        <h2>Tus gastos,<br>en un solo lugar.</h2>
+        <p>Carga tus comprobantes, completa los datos y sigue la revisión de cada gasto.</p>
+        <div class="login-beneficios">
+          <div><span>01</span><strong>Carga el comprobante</strong><p>Adjunta una foto o un documento.</p></div>
+          <div><span>02</span><strong>Revisa los datos</strong><p>Confirma la lectura y completa lo que falta.</p></div>
+          <div><span>03</span><strong>Sigue tu rendición</strong><p>Consulta los montos aprobados y rechazados.</p></div>
+        </div>
+      </section>
+
       <div class="login-card">
         <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
-        <h1>RindeWellness</h1>
-        <p class="sub">Plataforma de <strong>Grupo Wellness</strong></p>
+        <span class="login-eyebrow">BIENVENIDO</span>
+        <h1>Ingresa a tu cuenta</h1>
+        <p class="sub">Continúa con tus rendiciones de <strong>Grupo Wellness</strong></p>
 
         <form id="form-login">
           <div class="field">
@@ -391,7 +404,7 @@
        app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
        2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
        el navegador seguía sirviendo la versión anterior. -->
-  <script src="pure.js?v=77"></script>
-  <script src="app.js?v=77"></script>
+  <script src="pure.js?v=78"></script>
+  <script src="app.js?v=78"></script>
 </body>
 </html>

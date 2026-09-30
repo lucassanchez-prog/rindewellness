@@ -1,3 +1,4 @@
+import { demoraTransitoriaOcr } from "../_shared/reintentos-ocr.ts";
 // Edge Function: ocr-reintento-pendientes
 // El "agente" que vive en Supabase que reintenta, en segundo plano, los
 // comprobantes que ocr-recibo no pudo leer en el momento (ej. Gemini con
@@ -56,8 +57,9 @@
 //          (además de GEMINI_API_KEY, que ya debería estar configurado)
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { rutaPropia } from "../_shared/data.ts";
 import { logEvent } from "../_shared/logging.ts";
-import { leerComprobante, PRESUPUESTO_SEGUNDO_PLANO } from "../_shared/gemini-ocr.ts";
+import { leerComprobante, tieneDatosUtiles, PRESUPUESTO_SEGUNDO_PLANO } from "../_shared/gemini-ocr.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -78,6 +80,10 @@ async function autorizar(req: Request): Promise<Autorizacion> {
   const anon = createClient(SUPABASE_URL, ANON_KEY);
   const { data, error } = await anon.auth.getUser(jwt);
   if (error || !data?.user) throw new Error("No autorizado.");
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+  const { data: perfil, error: errorPerfil } = await admin.from("profiles").select("activo").eq("id", data.user.id).maybeSingle();
+  if (errorPerfil) throw errorPerfil;
+  if (!perfil || !perfil.activo) throw new Error("Cuenta desactivada o sin perfil.");
   return { modo: "usuario", usuarioId: data.user.id };
 }
 
@@ -95,8 +101,6 @@ const corsHeaders = {
 // abajo, que corta antes de EMPEZAR un comprobante más si ya no queda
 // margen -- así la corrida nunca muere a la mitad de uno (que lo dejaría
 // contado como intento sin haberlo procesado de verdad).
-const LOTE_ITEMS = 2;
-const LOTE_PREVIOS = 2;
 const TIEMPO_MAX_FUNCION_MS = 110_000;
 // Tope de reintentos por comprobante. OJO con subir este número: la cuota
 // gratuita de Gemini es de ~20 solicitudes por modelo, así que con 6
@@ -177,19 +181,10 @@ function camposFaltantesDe(parciales: Record<string, unknown> | null): string[] 
 // documento, mientras que los del modelo salen de interpretar una imagen. Que
 // el reintento de segundo plano "corrija" un folio que ya estaba bien leído
 // sería un retroceso silencioso, y nadie lo estaría mirando cuando pasa.
-function fusionarConParciales(
-  parciales: Record<string, unknown> | null,
-  resultado: Record<string, unknown>,
-): Record<string, unknown> {
-  if (!parciales) return resultado;
-  const DETERMINISTAS = ["rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto"];
-  const fusionado: Record<string, unknown> = { ...resultado };
-  for (const campo of DETERMINISTAS) {
-    if (parciales[campo] !== null && parciales[campo] !== undefined && parciales[campo] !== "") {
-      fusionado[campo] = parciales[campo];
-    }
-  }
-  return fusionado;
+function fusionarConParciales(_parciales: Record<string, unknown> | null, resultado: Record<string, unknown>): Record<string, unknown> {
+  // La UI ya conserva sus valores locales y las ediciones de la persona.
+  // El resultado del agente mantiene únicamente lo respaldado por su lectura.
+  return resultado;
 }
 
 async function procesarPendiente(
@@ -199,20 +194,30 @@ async function procesarPendiente(
   storagePath: string,
   intentosPrevios: number,
   col: { estado: string; resultado: string; intentos: string; ultimo: string },
-  datosParciales: Record<string, unknown> | null = null,
+  datosParciales: Record<string, unknown> | null,
+  usuarioId: string,
+  token: string,
 ): Promise<boolean> {
+  const guardar = async (cambios: Record<string, unknown>) => {
+    const { data, error } = await admin.from(tabla)
+      .update({ ocr_lease_token: null, ocr_lease_hasta: null, ...cambios })
+      .eq("id", id).eq("ocr_lease_token", token).select("id");
+    if (error) throw error;
+    if (!data?.length) throw new Error("La reserva OCR venció; no se guardó el resultado.");
+  };
   try {
+    if (!rutaPropia(storagePath, usuarioId)) throw new Error("El comprobante no pertenece al usuario.");
     const { data: archivo, error: errDescarga } = await admin.storage.from("comprobantes").download(storagePath);
     // Comprobante ya no está en Storage (ej. "Limpiar archivos huérfanos"
     // lo borró, o se editó/reemplazó) -- reintentar no tiene sentido, se
     // agota de una sola vez en vez de esperar MAX_INTENTOS corridas para
     // darse cuenta de lo mismo.
     if (errDescarga || !archivo) {
-      await admin.from(tabla).update({
+      await guardar({
         [col.estado]: "agotado",
         [col.intentos]: MAX_INTENTOS,
         [col.ultimo]: new Date().toISOString(),
-      }).eq("id", id);
+      });
       console.error(`${tabla}: comprobante no encontrado para ${id}, se agota sin reintentar.`);
       return false;
     }
@@ -232,20 +237,23 @@ async function procesarPendiente(
       datosParciales,
     });
 
-    await admin.from(tabla).update({
+    if (!tieneDatosUtiles(resultado)) throw new Error("No se obtuvo ningún campo legible del comprobante.");
+    await guardar({
       [col.estado]: "listo",
       [col.resultado]: fusionarConParciales(datosParciales, resultado),
       [col.intentos]: intentosPrevios + 1,
       [col.ultimo]: new Date().toISOString(),
-    }).eq("id", id);
+    });
     return true;
   } catch (err) {
-    const intentos = intentosPrevios + 1;
-    await admin.from(tabla).update({
+    const demora = demoraTransitoriaOcr(err);
+    const intentos = intentosPrevios + (demora ? 0 : 1);
+    await guardar({
+      ocr_lease_hasta: demora ? new Date(Date.now()+demora).toISOString() : null,
       [col.estado]: intentos >= MAX_INTENTOS ? "agotado" : "pendiente",
       [col.intentos]: intentos,
       [col.ultimo]: new Date().toISOString(),
-    }).eq("id", id);
+    });
     console.error(`${tabla}: ${id} falló (intento ${intentos}):`, err);
     return false;
   }
@@ -273,45 +281,24 @@ Deno.serve(async (req: Request) => {
     }
 
     const inicioCorrida = Date.now();
-    const quedaTiempo = () => Date.now() - inicioCorrida < TIEMPO_MAX_FUNCION_MS;
     let procesados = 0;
     let exitosos = 0;
-
-    // ---- Cola 1: ocr_previos (comprobantes de antes de enviar la rendición) ----
-    let consultaPrevios = admin
-      .from("ocr_previos")
-      .select("id, storage_path, intentos, datos_parciales")
-      .eq("estado", "pendiente")
-      .order("ultimo_intento", { ascending: true, nullsFirst: true })
-      .limit(LOTE_PREVIOS);
-    if (auth.modo === "usuario") consultaPrevios = consultaPrevios.eq("usuario_id", auth.usuarioId);
-    const { data: previos, error: errPrevios } = await consultaPrevios;
-    if (errPrevios) throw errPrevios;
-    for (const p of previos || []) {
-      if (!quedaTiempo()) break;
+    const { data: trabajos, error: errReserva } = await admin.rpc("reservar_trabajos_ocr", {
+      p_usuario: auth.modo === "usuario" ? auth.usuarioId : null, p_lote: 1,
+    });
+    if (errReserva) throw errReserva;
+    for (const trabajo of trabajos || []) {
+      // No iniciar otra lectura si no quedan los 100s de su presupuesto.
+      if (procesados > 0 && Date.now() - inicioCorrida > TIEMPO_MAX_FUNCION_MS - PRESUPUESTO_SEGUNDO_PLANO.totalMs) {
+        const { error } = await admin.from(trabajo.tabla)
+          .update({ ocr_lease_token: null, ocr_lease_hasta: null }).eq("id", trabajo.id).eq("ocr_lease_token", trabajo.token);
+        if (error) throw error;
+        continue;
+      }
       procesados++;
-      if (await procesarPendiente(admin, "ocr_previos", p.id as string, p.storage_path as string, (p.intentos as number) || 0, COL_PREVIOS, (p.datos_parciales as Record<string, unknown> | null) || null)) exitosos++;
-    }
-
-    // ---- Cola 2: rendicion_items (ítems ya guardados sin OCR exitoso) ----
-    // !inner con rendiciones.estado: una rendición ya Aprobada/Rechazada no
-    // necesita seguir reintentando su OCR -- nadie va a revisar la
-    // sugerencia de un ítem que ya quedó resuelto.
-    let consultaItems = admin
-      .from("rendicion_items")
-      .select("id, adjunto_url, ocr_reintento_intentos, rendiciones!inner(estado, empleado_id)")
-      .eq("ocr_reintento_estado", "pendiente")
-      .eq("rendiciones.estado", "Pendiente")
-      .not("adjunto_url", "is", null)
-      .order("ocr_reintento_ultimo", { ascending: true, nullsFirst: true })
-      .limit(LOTE_ITEMS);
-    if (auth.modo === "usuario") consultaItems = consultaItems.eq("rendiciones.empleado_id", auth.usuarioId);
-    const { data: pendientes, error: errPend } = await consultaItems;
-    if (errPend) throw errPend;
-    for (const item of pendientes || []) {
-      if (!quedaTiempo()) break;
-      procesados++;
-      if (await procesarPendiente(admin, "rendicion_items", item.id as string, item.adjunto_url as string, (item.ocr_reintento_intentos as number) || 0, COL_ITEMS)) exitosos++;
+      const columnas = trabajo.tabla === "ocr_previos" ? COL_PREVIOS : COL_ITEMS;
+      if (await procesarPendiente(admin, trabajo.tabla, trabajo.id, trabajo.path, trabajo.intentos || 0,
+        columnas, trabajo.parciales || null, trabajo.usuario_id, trabajo.token)) exitosos++;
     }
 
     // Un solo evento por corrida (no uno por comprobante) -- corre cada 5

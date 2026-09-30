@@ -13,16 +13,18 @@ type AdminClient = ReturnType<typeof createClient>;
 export async function logEvent(
   admin: AdminClient,
   tipo: string,
-  opts: { usuarioId?: string | null; rendicionId?: string | null; detalle?: string; metadata?: Record<string, unknown> } = {},
+  opts: { usuarioId?: string | null; rendicionId?: string | null; solicitudId?: string | null; detalle?: string; metadata?: Record<string, unknown> } = {},
 ) {
   try {
-    await admin.from("system_events").insert({
+    const { error } = await admin.from("system_events").insert({
       tipo,
       usuario_id: opts.usuarioId ?? null,
       rendicion_id: opts.rendicionId ?? null,
+      solicitud_id: opts.solicitudId ?? null,
       detalle: opts.detalle ?? null,
       metadata: opts.metadata ?? null,
     });
+    if (error) throw error;
   } catch (err) {
     // Si ni siquiera se puede dejar el registro del fallo, no hay más
     // remedio que loguearlo en la consola de la función -- pero nunca debe
@@ -45,11 +47,12 @@ export async function contarEventosRecientes(
   const desde = new Date(Date.now() - minutos * 60_000).toISOString();
   let query = admin.from("system_events").select("id", { count: "exact", head: true }).eq("tipo", tipo).gte("created_at", desde);
   if (opts.usuarioId) query = query.eq("usuario_id", opts.usuarioId);
+  if (opts.solicitudId) query = query.eq("solicitud_id", opts.solicitudId);
   if (opts.rendicionId) query = query.eq("rendicion_id", opts.rendicionId);
   const { count, error } = await query;
   if (error) {
     console.error("No se pudo contar eventos recientes:", error);
-    return 0; // si falla el chequeo, no bloqueamos la operación real por esto
+    throw new Error("No se pudo comprobar el límite de frecuencia.");
   }
   return count || 0;
 }

@@ -73,14 +73,49 @@
   // esto para decidir qué mostrar -- sin esto, un delegado con permiso real
   // en la base nunca vería los botones para ejercerlo.
   function esAprobadorEfectivo(profile) {
-    if (!profile) return false;
+    if (!profile || profile.activo === false) return false;
     if (profile.rol === "aprobador" || profile.rol === "admin") return true;
     if (!profile.delegado_activo) return false;
     if (!profile.delegado_hasta) return true;
     return new Date(profile.delegado_hasta).getTime() > Date.now();
   }
 
-  const RindeCore = { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo };
+  function claveDocumento(item) {
+    const rut = String(item.rut_proveedor || "").replace(/[^0-9kK]/g, "").toUpperCase();
+    const tipo = String(item.tipo_documento || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+    const folio = String(item.nro_documento || "").trim().toUpperCase().replace(/^0+(?=\d)/, "");
+    return rut && tipo && folio ? JSON.stringify([rut, tipo, folio]) : null;
+  }
+
+  function documentosDuplicados(items) {
+    const grupos = new Map();
+    items.forEach((item, indice) => {
+      const clave = claveDocumento(item);
+      if (!clave) return;
+      if (!grupos.has(clave)) grupos.set(clave, []);
+      grupos.get(clave).push(indice);
+    });
+    return [...grupos.values()].filter((indices) => indices.length > 1);
+  }
+
+  function campoCSV(valor) {
+    const texto = valor === null || valor === undefined ? "" : String(valor);
+    return /[;"\r\n]/.test(texto) ? '"' + texto.replace(/"/g, '""') + '"' : texto;
+  }
+
+  function resumenRendicion(items) {
+    const resumen = { rendido: 0, aprobado: 0, rechazado: 0, pendiente: 0, total: items.length, aprobados: 0, rechazados: 0, pendientes: 0 };
+    items.forEach((item) => {
+      const monto = Number(item.monto || 0);
+      resumen.rendido += monto;
+      if (item.estado === "Aprobado") { resumen.aprobado += monto; resumen.aprobados++; }
+      else if (item.estado === "Rechazado") { resumen.rechazado += monto; resumen.rechazados++; }
+      else { resumen.pendiente += monto; resumen.pendientes++; }
+    });
+    return resumen;
+  }
+
+  const RindeCore = { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {
