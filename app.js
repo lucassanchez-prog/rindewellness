@@ -2463,8 +2463,15 @@ async function leerFotoLocal(file) {
     // a su etiqueta, que es el dato correcto y el único que importaba. Con
     // el filtro viejo, todo ese tipo de comprobante quedaba fuera por
     // definición, sin importar lo bien que se hubiera leído.
+    // También vale un folio o un tipo de documento reconocido. Se agregó tras
+    // el comprobante de pago municipal del 2026-09-24: el lector había sacado
+    // bien el tipo ("Comprobante de Pago") y el folio (1501346), pero el
+    // documento no trae desglose de IVA y su único RUT es el NUESTRO -- somos
+    // quienes pagamos la multa --, así que no cumplía ninguna de las dos
+    // condiciones y se descartaba entero. La persona terminó escribiendo a
+    // mano dos datos que ya estaban leídos.
     const montoConRespaldo = datos.monto && (datos.monto_origen === "aritmetica" || datos.monto_origen === "etiqueta");
-    if (!datos.rut_proveedor && !montoConRespaldo) return null;
+    if (!datos.rut_proveedor && !montoConRespaldo && !datos.nro_documento && !datos.tipo_documento) return null;
 
     // Desde una foto, el monto solo se acepta si hay EVIDENCIA de que es el
     // total: o la aritmética del documento lo confirma, o venía pegado a una
@@ -2523,8 +2530,15 @@ async function leerFotoLocal(file) {
     }
     const MONTO_FUERTE = ["palabras+digitos", "aritmetica", "palabras"];
     if (!MONTO_FUERTE.includes(datos.monto_origen)) datos.monto = null;
-    if (datos.nro_documento && datos.folio_origen !== "tipo") datos.nro_documento = null;
+    // El folio se conserva SIEMPRE, incluso el "suelto" (un número con
+    // etiqueta N° en cualquier parte de la hoja), que medido acierta unas 4
+    // de cada 10 veces. Antes se descartaba por eso. Se cambió a pedido, con
+    // el criterio de que un folio no es plata: uno equivocado no genera un
+    // pago mal hecho, se nota al cruzarlo con contabilidad y el aviso pide
+    // compararlo. El monto, que sí es plata, mantiene su barra alta.
     if (datos.nro_documento) datos.confianza_baja.push("nro_documento");
+    // El tipo de documento también puede venir de una lectura floja.
+    if (datos.tipo_documento) datos.confianza_baja.push("tipo_documento");
 
     // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
     // 2026, un solo dígito mal que manda el gasto a otro período contable.
