@@ -846,3 +846,24 @@ button {
 .resumen-gastos-tarjeta.rechazados .resumen-gastos-monto {color:var(--danger);}
 @media(max-width:640px) {.btn-sm {min-height:44px;} .acciones-cell .btn-success {margin-left:0;} .hero-row h1 {font-size:1.5rem;} .filter-bar {padding:16px;} .tab-btn {padding:10px 12px;font-size:.8rem;} .stat-card {padding:18px;} }
 @media(prefers-reduced-motion:reduce) {.btn {transition:none;} .btn:hover:not(:disabled) {transform:none;} }
+
+/* Revisión de rendiciones: cada grupo mantiene sus acciones y editor. */
+.revision-filtros{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:22px 0 18px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:14px}
+.revision-estados{display:flex;gap:6px;flex-wrap:wrap}.revision-estados button[aria-pressed="true"]{background:var(--blue);color:#fff;border-color:var(--blue)}
+.revision-buscar{flex:1;min-width:230px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink);font:inherit}.revision-resultado{font-size:.8rem;color:var(--ink-soft)}
+.revision-contenedor .revision-gastos{display:block;border:0;overflow:visible;background:transparent}.revision-gastos thead{display:none}
+.revision-gastos .revision-gasto{display:block;border:1px solid var(--line);border-radius:14px;margin-bottom:16px;background:var(--card);overflow:hidden}
+.revision-gastos .revision-gasto[hidden]{display:none!important}
+.revision-gastos .revision-datos{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px 24px;padding:22px 24px;border:0;margin:0;background:transparent}
+.revision-gastos .revision-datos td{display:block;padding:0;border:0;width:auto!important;min-width:0;font-size:.88rem;text-align:left;grid-column:span 3}
+.revision-gastos .revision-datos td::before{content:attr(data-label);display:block;margin-bottom:7px;font-size:.65rem;font-weight:650;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-soft)}
+.revision-gastos .revision-datos td[data-label="Proveedor / Categoría"]{grid-column:1 / span 6;grid-row:1;font-size:1rem;font-weight:650}
+.revision-gastos .revision-datos td[data-label="Monto"]{grid-column:7 / span 3;grid-row:1;font-size:1.35rem;text-align:right;align-self:start}
+.revision-gastos .revision-datos td[data-label="Estado"]{grid-column:10 / span 3;grid-row:1;text-align:right}
+.revision-gastos .revision-datos td[data-label="Descripción"]{grid-column:span 6}
+.revision-gastos tr.acciones-row{display:block;margin:0;padding:0;border:0;border-radius:0;background:transparent}
+.revision-gastos tr.acciones-row td{display:block;border:0;border-top:1px solid var(--line);padding:14px 24px;background:var(--paper-top)}
+.revision-gastos .acciones-cell{gap:10px}.revision-gastos .acciones-cell .btn-success{margin-left:auto}
+.revision-gastos .item-extra-row{width:100%;margin:0!important;padding:0!important;border:0!important}.revision-gastos .item-extra-row td{padding:20px 24px;border-top:1px solid var(--line)}
+.revision-gastos tr:not(.revision-datos):not(.acciones-row):not(.item-extra-row){display:block;border:0;margin:0;border-radius:0;padding:0}.revision-gastos tr:not(.revision-datos):not(.acciones-row)>td{display:block;width:auto;border-bottom:0}
+@media(max-width:700px){.revision-gastos .revision-datos{padding:18px;gap:16px;grid-template-columns:repeat(2,minmax(0,1fr))}.revision-gastos .revision-datos td{grid-column:span 1}.revision-gastos .revision-datos td[data-label="Proveedor / Categoría"]{grid-column:1 / -1;grid-row:1}.revision-gastos .revision-datos td[data-label="Monto"]{grid-column:1;grid-row:2;text-align:left}.revision-gastos .revision-datos td[data-label="Estado"]{grid-column:2;grid-row:2}.revision-gastos .revision-datos td[data-label="Descripción"]{grid-column:1 / -1}.revision-gastos tr.acciones-row td{padding:14px 18px}.revision-gastos .acciones-cell .btn-success{margin-left:0}.revision-gastos .acciones-cell .btn{flex:1 1 auto}.revision-buscar{min-width:0;width:100%;flex-basis:100%}.revision-gastos .item-extra-row td{padding:18px}}

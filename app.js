@@ -5068,13 +5068,15 @@ async function openDetalle(id, pushHistory = true) {
   if (esAprobadorViewer) columnas.push("Cuenta Contable");
   columnas.push("Centro de Costo", "Descripción", "Monto", "Estado");
 
-  const tabla = el("table", { class: "items-table" });
+  const tabla = el("table", { class: "items-table revision-gastos" });
   const thead = el("thead", {}, [el("tr", {}, columnas.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]);
-  const tbody = el("tbody");
   tabla.appendChild(thead);
-  tabla.appendChild(tbody);
 
   (items || []).forEach((it) => {
+    const tbody = el("tbody", { class: "revision-gasto" });
+    tbody.dataset.estado = it.estado || "Pendiente";
+    tbody.dataset.busqueda = [it.nombre_proveedor,it.categoria,it.rut_proveedor,it.nro_documento,it.descripcion,it.centro_costo].filter(Boolean).join(" ").toLocaleLowerCase("es");
+    tabla.appendChild(tbody);
     const esCon = it.tipo_item === "ConDocumento";
 
     const celdas = [
@@ -5124,7 +5126,7 @@ async function openDetalle(id, pushHistory = true) {
     // achica a el ancho de una sola columna en vez de todas).
     const accionesCell = el("div", { class: "acciones-cell" });
     if (it.adjunto_url) {
-      accionesCell.appendChild(el("button", { class: "btn btn-sm", type: "button", onclick: () => verComprobante(it) }, "Ver"));
+      accionesCell.appendChild(el("button", { class: "btn btn-sm", type: "button", onclick: () => verComprobante(it) }, "Ver comprobante"));
     }
     if (puedeEditarItems) {
       accionesCell.appendChild(el("button", {
@@ -5197,7 +5199,7 @@ async function openDetalle(id, pushHistory = true) {
         },
       }, "Rechazar ítem"));
     }
-    tbody.appendChild(el("tr", {}, celdas));
+    tbody.appendChild(el("tr", { class: "revision-datos" }, celdas));
     tbody.appendChild(el("tr", { class: "acciones-row" }, [el("td", { colspan: String(columnas.length) }, [accionesCell])]));
     tbody.appendChild(filaExtra);
 
@@ -5246,7 +5248,34 @@ async function openDetalle(id, pushHistory = true) {
     }
   });
 
-  box.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+  const filtrosRevision = el("div", { class: "revision-filtros" });
+  const estadosRevision = el("div", { class: "revision-estados", role: "group", "aria-label": "Filtrar gastos por estado" });
+  const buscarRevision = el("input", { type: "search", placeholder: "Buscar proveedor, folio o descripción…", "aria-label": "Buscar gastos", class: "revision-buscar" });
+  const resultadoRevision = el("span", { class: "revision-resultado", role: "status", "aria-live": "polite" });
+  let estadoRevision = "Todos";
+  const botonesRevision = [];
+  function filtrarRevision() {
+    const texto = buscarRevision.value.trim().toLocaleLowerCase("es");
+    let visibles = 0;
+    Array.from(tabla.tBodies).forEach(grupo => {
+      const mostrar = (estadoRevision === "Todos" || grupo.dataset.estado === estadoRevision) && grupo.dataset.busqueda.includes(texto);
+      grupo.hidden = !mostrar;
+      if (mostrar) visibles++;
+    });
+    botonesRevision.forEach(({boton,estado}) => boton.setAttribute("aria-pressed", String(estado === estadoRevision)));
+    resultadoRevision.textContent = visibles + " de " + items.length + " gastos";
+  }
+  ["Todos","Pendiente","Aprobado","Rechazado"].forEach(estado => {
+    const cantidad = estado === "Todos" ? items.length : items.filter(it => (it.estado || "Pendiente") === estado).length;
+    const boton = el("button", { type: "button", class: "btn btn-sm", "aria-pressed": String(estado === "Todos"), onclick: () => {estadoRevision = estado; filtrarRevision();} }, estado + " · " + cantidad);
+    botonesRevision.push({boton,estado});
+    estadosRevision.appendChild(boton);
+  });
+  buscarRevision.addEventListener("input", filtrarRevision);
+  filtrosRevision.append(estadosRevision,buscarRevision,resultadoRevision);
+  box.appendChild(filtrosRevision);
+  box.appendChild(el("div", { class: "revision-contenedor" }, [tabla]));
+  filtrarRevision();
 
 
 
