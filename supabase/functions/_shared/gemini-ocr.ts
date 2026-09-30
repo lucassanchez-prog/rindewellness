@@ -359,16 +359,28 @@ async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknow
     (err as Error & { reintentable?: boolean }).reintentable = true;
     throw err;
   }
-  // Tope duro de candidatos por intento. El presupuesto de tiempo no alcanza
-  // como freno: un error de cuota vuelve en menos de un segundo, así que la
-  // comprobación de tiempo de abajo nunca corta y se terminaban llamando los
-  // cuatro modelos para juntar cuatro veces el mismo rechazo. Con una cuota
-  // diaria de ~20 por modelo, ese abanico es el mayor desperdicio del
-  // sistema: 2 candidatos dan margen real de recuperación sin cuadruplicar
-  // el gasto de cada fallo.
-  const MAX_CANDIDATOS = 2;
+  // El freno se aplica a los fallos de CUOTA, no a la cantidad de
+  // candidatos, y la diferencia importa.
+  //
+  // Antes era un tope duro de 2 modelos por intento, puesto para no gastar
+  // cuatro solicitudes juntando cuatro veces el mismo "quota exceeded". Pero
+  // frenaba por igual el otro modo de fallo, y el 2026-09-30 se vio la
+  // consecuencia: Google devolvía "high demand" (capacidad, no cuota) en los
+  // dos primeros modelos, y los otros dos de la lista no se probaban desde
+  // hacía una semana. La lista de respaldo existe exactamente para ese caso
+  // y el tope la volvía decorativa.
+  //
+  // Son cosas distintas: "quota exceeded" dice que ESE modelo gastó su cupo
+  // -- y cada modelo tiene el suyo, así que pasar al siguiente cuesta una
+  // solicitud de otra bolsa, no cuatro de la misma --, mientras que "high
+  // demand" dice literalmente que se pruebe más tarde o con otro. Seguir
+  // después de un par de fallos de cuota sí es tirar solicitudes a la basura
+  // (fue lo que dejó la app sin OCR un día entero), así que ese caso
+  // conserva su freno.
+  const MAX_FALLOS_DE_CUOTA = 2;
+  let fallosDeCuota = 0;
   let ultimoError: Error = new Error("No hay modelos de Gemini configurados (GEMINI_MODELS_ORDEN).");
-  for (let i = 0; i < Math.min(modelosOrdenados.length, MAX_CANDIDATOS); i++) {
+  for (let i = 0; i < modelosOrdenados.length; i++) {
     // Solo se empieza con otro candidato si queda tiempo para darle una
     // oportunidad REAL (no arrancar una llamada que vamos a cortar a los 2
     // segundos -- ese fue justamente el error del presupuesto anterior).
@@ -383,6 +395,7 @@ async function llamarGeminiConCandidatos(admin: AdminClient | null, body: unknow
       ultimoError = err instanceof Error ? err : new Error(String(err));
       const reintentable = (ultimoError as Error & { reintentable?: boolean }).reintentable ?? esErrorDeModelo(ultimoError.message);
       if (!reintentable) throw ultimoError;
+      if (esErrorDeCuota(ultimoError.message) && ++fallosDeCuota >= MAX_FALLOS_DE_CUOTA) break;
     }
   }
   throw ultimoError;

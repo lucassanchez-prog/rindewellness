@@ -1987,7 +1987,22 @@ async function cargarSolicitudesDisponibles() {
     .order("created_at", { ascending: false });
   if (error) { console.error("Error cargando solicitudes de fondos:", error); return; }
   if (!solicitudes || !solicitudes.length) {
-    sel.appendChild(el("option", { value: "" }, "No tienes fondos aprobados en esta empresa"));
+    // Sin fondos para ESTA empresa, se busca si los tiene en otra. El
+    // formulario abre siempre en la primera empresa de la lista, que casi
+    // nunca es la del fondo, así que el caso normal es que la persona vea
+    // "no tienes fondos" teniéndolos. Le pasó a alguien con dos fondos
+    // aprobados el 2026-09-30: leyó el aviso como "no tengo fondos" y no
+    // como "no en esta empresa", que es lo que decía. Decirle DÓNDE están
+    // convierte un callejón sin salida en una instrucción.
+    const { data: enOtras } = await db
+      .from("solicitudes_fondos")
+      .select("empresa")
+      .eq("empleado_id", currentUser.id)
+      .eq("estado", "Aprobado");
+    const otras = [...new Set((enOtras || []).map((s) => s.empresa).filter((e) => e && e !== empresa))];
+    sel.appendChild(el("option", { value: "" }, otras.length
+      ? `Sin fondos en ${empresa} — los tienes en: ${otras.join(", ")}. Cambia la Empresa arriba.`
+      : "No tienes fondos aprobados"));
     return;
   }
   const ids = solicitudes.map((s) => s.id);
