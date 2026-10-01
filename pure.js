@@ -100,7 +100,7 @@
 
   function campoCSV(valor) {
     const texto = valor === null || valor === undefined ? "" : String(valor);
-    return /[;"\r\n]/.test(texto) ? '"' + texto.replace(/"/g, '""') + '"' : texto;
+    return /[,;"\r\n]/.test(texto) ? '"' + texto.replace(/"/g, '""') + '"' : texto;
   }
 
   function resumenRendicion(items) {

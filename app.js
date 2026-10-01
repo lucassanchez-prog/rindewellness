@@ -1225,11 +1225,11 @@ async function renderReportes() {
     // rendiciones) -- se pide una sola vez, ya filtrado por las
     // rendiciones del rango, y se reusa para los tres reportes en vez de
     // repetir la consulta.
-    const { data: items, error } = await db
-      .from("rendicion_items")
-      .select("categoria, monto, empresa, tipo_item, estado, cuenta_contable, centro_costo")
-      .in("rendicion_id", rendicionesEnRango.map((r) => r.id))
-      .eq("estado", "Aprobado");
+    let items=[],error=null;
+    try {
+      const ids=rendicionesEnRango.map(r=>r.id);
+      for(let i=0;i<ids.length;i+=100)items.push(...await consultarTodas(()=>db.from("rendicion_items").select("id,categoria, monto, empresa, tipo_item, estado, cuenta_contable, centro_costo",{count:"exact"}).in("rendicion_id",ids.slice(i,i+100)).eq("estado","Aprobado").order("id")));
+    }catch(err){error=err;}
     if (error) {
       console.error("Error cargando ítems para reportes:", error);
     } else {
@@ -1277,7 +1277,7 @@ async function renderReportes() {
         ...seccionCSV("Por centro de costo", porCentroCosto),
         ...seccionCSV("Tendencia mensual", porMes),
       ];
-      csvContenido = todasLasFilas.map((fila) => fila.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+      csvContenido = todasLasFilas.map(fila => fila.map(c => campoCSV(c)).join(",")).join("\r\n");
     }
 
     // Métricas de aprobación: tiempo promedio y % de rechazo por
@@ -2455,12 +2455,16 @@ function cargarPdfJs() {
   if (pdfjsCargando) return pdfjsCargando;
   pdfjsCargando = new Promise((resolve, reject) => {
     const s = document.createElement("script");
+    const fallo=()=>{clearTimeout(timer);s.remove();pdfjsCargando=null;reject(new Error("No se pudo cargar el lector de PDF. Puedes reintentar."));};
+    const timer=setTimeout(fallo,30000);
     s.src = PDFJS_URL;
     s.onload = () => {
+      clearTimeout(timer);
+      if(!window.pdfjsLib){fallo();return;}
       window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
       resolve(window.pdfjsLib);
     };
-    s.onerror = () => reject(new Error("No se pudo cargar el lector de PDF."));
+    s.onerror = fallo;
     document.head.appendChild(s);
   });
   return pdfjsCargando;
@@ -2491,13 +2495,15 @@ function cargarTesseract() {
   tesseractCargando = new Promise((resolve, reject) => {
     const s = document.createElement("script");
     s.src = TESSERACT_URL;
+    const timer=setTimeout(()=>{s.remove();reject(new Error("El escáner no terminó de cargar. Intenta nuevamente."));},30000);
     s.onload = () => {
+      clearTimeout(timer);
       // Si el script cargó pero no dejó el global, tirar acá adentro dejaría
       // la promesa colgada para siempre y el ítem clavado en "Analizando".
       if (window.Tesseract) resolve(window.Tesseract);
       else reject(new Error("El lector de fotos cargó incompleto."));
     };
-    s.onerror = () => reject(new Error("No se pudo cargar el lector de fotos."));
+    s.onerror = () => {clearTimeout(timer);s.remove();reject(new Error("No se pudo cargar el lector de fotos."));};
     document.head.appendChild(s);
   });
   // Una promesa rechazada quedaba cacheada para siempre: un corte de red
@@ -2514,10 +2520,11 @@ function cargarTesseract() {
 // archivo pese poco para subirlo: acá los artefactos de compresión son
 // justamente lo que hace que un 8 se lea como 3.
 const LADO_MAXIMO_OCR = 2000;
-async function prepararImagenParaOcr(file) {
+async function prepararImagenParaOcr(file, ampliar = false) {
   try {
     const bitmap = await createImageBitmap(file);
-    const escala = Math.min(1, LADO_MAXIMO_OCR / Math.max(bitmap.width, bitmap.height));
+    // Aumentar comprobantes pequeños ayuda al escáner a separar los caracteres.
+    const escala = Math.min(ampliar ? 3 : 1, LADO_MAXIMO_OCR / Math.max(bitmap.width, bitmap.height));
     if (escala === 1) { bitmap.close(); return file; }
     const w = Math.round(bitmap.width * escala);
     const h = Math.round(bitmap.height * escala);
@@ -2527,8 +2534,8 @@ async function prepararImagenParaOcr(file) {
     ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
     ctx.drawImage(bitmap, 0, 0, w, h);
     bitmap.close();
-    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.92));
-    return blob ? new File([blob], file.name, { type: "image/jpeg" }) : file;
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+    return blob ? new File([blob], file.name, { type: "image/png" }) : file;
   } catch (err) {
     console.error("No se pudo preparar la imagen para OCR, se usa la original:", err);
     return file;
@@ -2536,14 +2543,30 @@ async function prepararImagenParaOcr(file) {
 }
 
 
+const lectorLocalPersistente=window.RindeOcrLocal.crearLector(cargarTesseract);
+window.addEventListener("pagehide",()=>{lectorLocalPersistente.cerrar();});
+
 async function leerFotoLocal(file) {
   if (!(file.type || "").startsWith("image/")) return null;
   try {
-    const tess = await cargarTesseract();
-    const { data } = await tess.recognize(await prepararImagenParaOcr(file), "spa");
-    const texto = data?.text || "";
+    let preparado=await prepararImagenParaOcr(file);
+    const { data } = await lectorLocalPersistente.leer(preparado);
+    let texto = data?.text || "";
+    let lecturaAlternativa=null;
+    // Los comprobantes deslavados o con bloques separados pueden quedar
+    // vacíos con la segmentación automática. Prueba bloques dispersos una vez.
+    if(texto.replace(/\s/g, "").length < 40){
+      preparado=await prepararImagenParaOcr(file,true);
+      lecturaAlternativa=await lectorLocalPersistente.leer(preparado,11);
+      texto=lecturaAlternativa.data?.text || "";
+    }
     if (texto.replace(/\s/g, "").length < 40) return null; // no salió texto legible
-    const datos = parsearTextoFactura(texto);
+    let datos = parsearTextoFactura(texto);
+    if(!datos.rut_proveedor && !datos.tipo_documento && !datos.nro_documento && !["aritmetica","etiqueta","palabras+digitos"].includes(datos.monto_origen) && !lecturaAlternativa){
+      preparado=await prepararImagenParaOcr(file,true);
+      lecturaAlternativa=await lectorLocalPersistente.leer(preparado,11);
+      datos=parsearTextoFactura(lecturaAlternativa.data?.text || "");
+    }
     // Umbral de utilidad: hace falta AL MENOS un dato con respaldo propio.
     // Vale un RUT (lo valida su dígito verificador) o un monto con
     // procedencia fuerte (aritmética del documento, o pegado a su etiqueta).
@@ -2561,7 +2584,7 @@ async function leerFotoLocal(file) {
     // quienes pagamos la multa --, así que no cumplía ninguna de las dos
     // condiciones y se descartaba entero. La persona terminó escribiendo a
     // mano dos datos que ya estaban leídos.
-    const montoConRespaldo = datos.monto && (datos.monto_origen === "aritmetica" || datos.monto_origen === "etiqueta");
+    const montoConRespaldo = datos.monto && ["aritmetica","etiqueta","palabras+digitos"].includes(datos.monto_origen);
     if (!datos.rut_proveedor && !montoConRespaldo && !datos.nro_documento && !datos.tipo_documento) return null;
 
     // Desde una foto, el monto solo se acepta si hay EVIDENCIA de que es el
@@ -2612,15 +2635,20 @@ async function leerFotoLocal(file) {
     // y aplicarRespaldoFoto se lo nombra a la persona uno por uno. Rellenar
     // sin avisar sería lo único peor que dejar en blanco.
     datos.confianza_baja = [];
-    // En una discrepancia entre dígitos y letras gana el número escrito en
-    // letras: es el único de los dos que se autoverifica (una palabra mal
-    // leída rompe el parseo en vez de producir otro número).
-    if (datos.monto_origen === "discrepancia" && datos.monto_en_palabras) {
-      datos.monto = datos.monto_en_palabras;
-      datos.monto_origen = "palabras";
+    let totalCoincidente=false;
+    if(datos.monto && datos.monto_origen === "etiqueta"){
+      const segunda=lecturaAlternativa ? await lectorLocalPersistente.leer(preparado,3) : await lectorLocalPersistente.leer(preparado,11);
+      const otro=parsearTextoFactura(segunda.data?.text || "");
+      totalCoincidente=Number(otro.monto)===Number(datos.monto) && ["etiqueta","aritmetica","palabras+digitos"].includes(otro.monto_origen) && !otro.monto_discrepante;
+      if(otro.monto && Number(otro.monto)!==Number(datos.monto))datos.monto_discrepante=true;
+    }
+    // Una discrepancia exige confirmación humana, aunque un valor parezca plausible.
+    if (datos.monto_origen === "discrepancia" || datos.monto_discrepante) {
+      datos.monto=null;datos.monto_discrepante=true;datos.monto_verificado=false;
     }
     const MONTO_FUERTE = ["palabras+digitos", "aritmetica", "palabras"];
-    if (!MONTO_FUERTE.includes(datos.monto_origen)) datos.monto = null;
+    if (!MONTO_FUERTE.includes(datos.monto_origen) && !totalCoincidente) datos.monto = null;
+    if(totalCoincidente){datos.confianza_baja.push("monto");datos.monto_verificado=false;datos.monto_origen="dos_escaneos";}
     // El folio se conserva SIEMPRE, incluso el "suelto" (un número con
     // etiqueta N° en cualquier parte de la hoja), que medido acierta unas 4
     // de cada 10 veces. Antes se descartaba por eso. Se cambió a pedido, con
@@ -2640,8 +2668,17 @@ async function leerFotoLocal(file) {
       const hoy = new Date();
       const haceUnAnio = new Date(hoy.getFullYear() - 1, hoy.getMonth(), hoy.getDate());
       const enUnMes = new Date(hoy.getFullYear(), hoy.getMonth() + 1, hoy.getDate());
-      if (isNaN(f) || f < haceUnAnio || f > enUnMes) datos.fecha = null;
+      const calendario=/^(\d{4})-(\d{2})-(\d{2})$/.exec(datos.fecha);
+      if (isNaN(f) || !calendario || f.getFullYear()!==Number(calendario[1]) || f.getMonth()+1!==Number(calendario[2]) || f.getDate()!==Number(calendario[3]) || f < haceUnAnio || f > enUnMes) datos.fecha = null;
     }
+    datos.verificacion_campos={};
+    for(const campo of ["nombre_proveedor","rut_proveedor","tipo_documento","nro_documento","fecha","monto"]){
+      const valor=datos[campo];
+      if(valor && !datos.confianza_baja.includes(campo))datos.confianza_baja.push(campo);
+      datos.verificacion_campos[campo]={estado:valor?"por_confirmar":"ilegible",texto:valor?String(valor):"",motivo:valor?"Leído por el escáner local. Compara este dato con el comprobante.":"El escáner local no encontró evidencia suficiente para completar este campo."};
+    }
+    if(datos.monto && datos.monto_verificado){datos.verificacion_campos.monto.motivo="El importe concuerda con la aritmética o las cifras y palabras leídas. Revisa también el documento.";}
+    if(datos.monto_discrepante){datos.verificacion_campos.monto={estado:"por_confirmar",motivo:"Hay montos contradictorios. Confirma el total mirando el comprobante."};}
     return datos;
   } catch (err) {
     console.error("No se pudo leer la foto localmente:", err);
@@ -2966,8 +3003,11 @@ function parsearTextoFactura(texto) {
   }
 
   let fecha = null;
-  const mNum = /\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/.exec(t);
-  const mTxt = /\b(\d{1,2})\s+de\s+([a-záéíóú]+)\s+(?:del?\s+)?(\d{4})\b/i.exec(t);
+  // Prefiere emisión: vencimiento puede aparecer antes y corresponder a otro año.
+  const emision=/(?:fecha\s*(?:de\s*)?emisi[oó]n|emitid[ao]\s*(?:el)?)\s*:?\s*(\d{1,2}(?:[/-]\d{1,2}[/-]\d{4}|\s+de\s+[a-záéíóú]+\s+(?:del?\s+)?\d{4}))/i.exec(t);
+  const textoFecha=emision?.[1] || t;
+  const mNum = /\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/.exec(textoFecha);
+  const mTxt = /\b(\d{1,2})\s+de\s+([a-záéíóú]+)\s+(?:del?\s+)?(\d{4})\b/i.exec(textoFecha);
   const iso = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
   if (mNum) fecha = iso(mNum[3], mNum[2], mNum[1]);
   else if (mTxt && MESES_ES[mTxt[2].toLowerCase()]) fecha = iso(mTxt[3], MESES_ES[mTxt[2].toLowerCase()], mTxt[1]);
@@ -3262,7 +3302,9 @@ function fusionarLecturas(local, ia, contable) {
   for(const campo of conflictos){datos[campo]=null;aporteIA[campo]=null;}
   if(conflictos.size){datos.campos_discrepantes=[...conflictos];aporteIA.campos_discrepantes=[...conflictos];}
   if (I.requiere_separacion) {datos.requiere_separacion=true; datos.aviso_documento=I.aviso_documento || "Este archivo requiere separar los comprobantes por gasto."; aporteIA.requiere_separacion=true; aporteIA.aviso_documento=datos.aviso_documento;}
-  if (I.verificacion_campos) {datos.verificacion_campos=I.verificacion_campos;aporteIA.verificacion_campos=I.verificacion_campos;}
+  if (Array.isArray(L.confianza_baja)) datos.confianza_baja=[...L.confianza_baja];
+  if (L.verificacion_campos || I.verificacion_campos) datos.verificacion_campos={...(L.verificacion_campos || {}),...(I.verificacion_campos || {})};
+  if (I.verificacion_campos) aporteIA.verificacion_campos=I.verificacion_campos;
   if (I.analisis_documento) datos.analisis_documento = I.analisis_documento;
   return { datos, aporteIA, avisos };
 }
@@ -4110,11 +4152,30 @@ async function analizarComprobante(id, file, statusEl) {
 // Devuelve true si logró llenar algo (y entonces el llamador no muestra el
 // error), false si no hubo nada rescatable y hay que seguir con el camino
 // de error de siempre.
+async function leerEscaneadoLocal(file){
+  if((file.type || "").startsWith("image/"))return leerFotoLocal(file);
+  if(file.type!=="application/pdf")return null;
+  let pdf;
+  try{
+    const pdfjs=await cargarPdfJs();
+    pdf=await pdfjs.getDocument({data:await file.arrayBuffer()}).promise;
+    if(pdf.numPages!==1)return null;
+    const pagina=await pdf.getPage(1),base=pagina.getViewport({scale:1});
+    const escala=Math.min(2.5,LADO_MAXIMO_OCR/Math.max(base.width,base.height));
+    const viewport=pagina.getViewport({scale:escala});
+    const canvas=document.createElement("canvas");canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
+    await pagina.render({canvasContext:canvas.getContext("2d"),viewport,background:"rgb(255,255,255)"}).promise;
+    const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
+    return blob?await leerFotoLocal(new File([blob],"comprobante.png",{type:"image/png"})):null;
+  }catch(error){console.error("El respaldo local no pudo leer el PDF:",error);return null;}
+  finally{if(pdf)await pdf.destroy();}
+}
+
 async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
-  if (!(file.type || "").startsWith("image/")) return false;
-  statusEl.textContent = "🪄 La IA no está disponible. Leyendo la foto acá mismo, puede tardar unos segundos...";
+  if (!(file.type || "").startsWith("image/") && file.type!=="application/pdf") return false;
+  statusEl.textContent = "La IA no está disponible. El bot está escaneando el comprobante en este navegador...";
   statusEl.className = "ocr-status show";
-  const local = await leerFotoLocal(file);
+  const local = await leerEscaneadoLocal(file);
   if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return true;
   if (!local) return false;
 
@@ -4155,12 +4216,12 @@ async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
   // que la persona crea que el lector no vio nada y busque el problema.
   const faltaMonto = !datos.monto;
   const otrosFaltantes = faltan.filter((f) => f !== ETIQUETA_CAMPO_OCR.monto);
-  statusEl.textContent = `⚠ La IA no está disponible, así que la foto se leyó acá mismo, que es menos preciso.`
+  statusEl.textContent = `El bot recuperó datos con el escáner local. Compara los campos con el comprobante.`
     + (datos.monto_verificado ? " El monto sí quedó confirmado contra el propio documento." : "")
-    + (faltaMonto ? " El monto quedó en blanco a propósito: de una foto no se puede confirmar, y un monto equivocado es peor que uno en blanco. Escríbelo mirando el comprobante." : "")
+    + (faltaMonto ? " El monto necesita confirmación: no se encontró evidencia suficiente. Escríbelo mirando el comprobante." : "")
     + (otrosFaltantes.length ? ` Completa a mano: ${otrosFaltantes.join(", ")}.` : "")
     + (dudosos.length
-      ? ` Y compara con el comprobante: ${dudosos.join(", ")}. De una foto suelen salir con un dígito cambiado, y el número igual se ve bien formado.`
+      ? ` Revisa: ${[...new Set(dudosos)].join(", ")}.`
       : "");
   statusEl.className = "ocr-status show";
   return true;
@@ -6123,6 +6184,11 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
   const fondoFolio = split?.fondoFolio ?? rendicion.solicitudes_fondos?.folio;
   const referenciaFondo = rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondoFolio != null ? " · FONDO S-" + fondoFolio : "";
   const glosa = (`RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}` + referenciaFondo).replace(/\s+/g, " ").trim();
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && !split) throw new Error("Falta comprobar la distribución del fondo; no se generó el CSV.");
+  const aprobados = (items || []).filter(it => it.estado === "Aprobado");
+  const debe = aprobados.reduce((s,it)=>s+Number(it.monto || 0),0);
+  const haber = split ? Number(split.dentroDelFondo)+Number(split.excedente) : Number(rendicion.monto_total);
+  if(!Number.isFinite(debe) || !Number.isFinite(haber) || debe !== haber) throw new Error("Los gastos aprobados y la contrapartida no coinciden. Actualiza la rendición antes de generar el CSV.");
   const rows = [];
 
   // "Comentario Linea" va con el mismo texto en todas las líneas de la
@@ -6210,8 +6276,8 @@ async function conDatosActualesDeEmpleado(rendicion) {
   }
   if (!perfil) return {...rendicion,solicitudes_fondos:fondo};
   return {
-    solicitudes_fondos:fondo,
     ...rendicion,
+    solicitudes_fondos:fondo,
     rut_empleado: perfil.rut || rendicion.rut_empleado,
     empleado_nombre: perfil.nombre || rendicion.empleado_nombre,
   };
@@ -6301,6 +6367,8 @@ async function generarInformePDF(rendicion, items) {
   try {
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF();
+    doc.setProperties({title:"Informe de rendición N° "+(rendicion.folio ?? "-"),author:"RindeWellness",subject:"Rendición y comprobantes adjuntos"});
+    const corteInforme=new Intl.DateTimeFormat("es-CL",{timeZone:"America/Santiago",dateStyle:"medium",timeStyle:"short"}).format(new Date());
 
     const ancho = doc.internal.pageSize.getWidth();
     const margen = 14, util = ancho - margen*2;
@@ -6333,27 +6401,32 @@ async function generarInformePDF(rendicion, items) {
       doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(cantidad+" gastos",x+4,y+24);
     });
     y+=38;
+    linea("Corte del informe: "+corteInforme);
+    const cantidadAdjuntos=(items || []).filter(it=>it.adjunto_url).length;
+    linea("Respaldos: "+cantidadAdjuntos+" de "+resumen.total+" gastos con archivo adjunto."+(cantidadAdjuntos<resumen.total?" Hay gastos sin adjunto.":""));
     if(rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id){
       const {data:fondo,error:errorFondo}=await db.from("solicitudes_fondos").select("id,folio,monto_solicitado").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
       if(!errorFondo && fondo){
         const consumo=await cargarConsumoFondos([fondo]);const filas=consumo.get(fondo.id);
         const saldo=filas?resumirConsumoFondo(filas,fondo.monto_solicitado):null;
-        if(y+34>245){doc.addPage();y=20;}
-        doc.setFillColor(237,245,241);doc.roundedRect(margen,y,util,28,3,3,"F");
+        if(y+45>245){doc.addPage();y=20;}
+        doc.setFillColor(237,245,241);doc.roundedRect(margen,y,util,39,3,3,"F");
         doc.setFont("helvetica","bold");doc.setFontSize(9);doc.setTextColor(...verde);
         doc.text("FONDO S-"+fondo.folio+" · Monto del fondo: "+fmtCLP(fondo.monto_solicitado),margen+5,y+9);
         doc.setTextColor(...tinta);doc.text(saldo?"Consumido total: "+fmtCLP(saldo.consumido)+" · Saldo: "+fmtCLP(saldo.saldo):"Consumo y saldo no disponibles",margen+5,y+18);
-        doc.setFont("helvetica","normal");doc.setFontSize(6.5);doc.text("Consumo: aprobados y pendientes de todas las rendiciones del fondo; excluye rechazados.",margen+5,y+24);y+=36;
+        doc.setFont("helvetica","normal");doc.setFontSize(8);
+        if(saldo)doc.text("Aprobado: "+fmtCLP(saldo.aprobado)+" · Por revisar: "+fmtCLP(saldo.porRevisar),margen+5,y+25);
+        doc.setFontSize(6.5);doc.text("Consumo: aprobados y pendientes de todas las rendiciones del fondo; excluye rechazados.",margen+5,y+33);y+=47;
       }else linea("Fondo asociado: no se pudo consultar su referencia y saldo.");
     }
     doc.setFont("helvetica","bold");doc.setFontSize(12);doc.setTextColor(...tinta);doc.text("Detalle de gastos",margen,y);y+=6;
     doc.autoTable({
       startY:y,margin:{left:margen,right:margen,top:18,bottom:19},
-      head:[["Gasto / proveedor","Documento","Centro de costo / descripción","Monto","Estado"]],
+      head:[["Gasto / proveedor","Documento","Descripción / centro de costo / cuenta","Monto","Estado"]],
       body:(items || []).map((it,i)=>[
         (i+1)+". "+(it.nombre_proveedor || it.categoria || "Sin proveedor")+"\n"+[it.categoria,it.rut_proveedor,tipoItemLabel(it.tipo_item)].filter(Boolean).join(" · "),
         (it.tipo_documento || "Comprobante")+(it.nro_documento?" #"+it.nro_documento:"")+(it.fecha_vencimiento?"\n"+fmtDate(it.fecha_vencimiento):""),
-        [it.centro_costo,it.descripcion].filter(Boolean).join("\n") || "-",
+        [it.centro_costo,it.descripcion,it.cuenta_contable ? it.cuenta_contable+" · "+(nombreCuenta(it.cuenta_contable)||"Nombre de cuenta no disponible") : null].filter(Boolean).join("\n") || "-",
         fmtCLP(it.monto),(it.estado || "Pendiente")+(it.motivo_rechazo?"\n"+it.motivo_rechazo:"")
       ]),
       theme:"striped",styles:{font:"helvetica",fontSize:8,cellPadding:3,textColor:tinta,lineColor:[226,233,237]},
@@ -6372,11 +6445,16 @@ async function generarInformePDF(rendicion, items) {
       .map((it, indiceOriginal) => ({ it, indiceOriginal }))
       .filter(({ it }) => it.adjunto_url);
     let adjuntosFallidos=0;
-    for(const {it,indiceOriginal} of itemsConAdjunto){
+    const adjuntosPorRuta=new Map();
+    for(const dato of itemsConAdjunto){if(!adjuntosPorRuta.has(dato.it.adjunto_url))adjuntosPorRuta.set(dato.it.adjunto_url,[]);adjuntosPorRuta.get(dato.it.adjunto_url).push(dato);}
+    if(itemsConAdjunto.length){doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(16);doc.setTextColor(...tinta);doc.text("Anexo de comprobantes",margen,23);doc.setFont("helvetica","normal");doc.setFontSize(9);doc.text("Imágenes originales y todas las páginas de cada PDF, en orden de gasto.",margen,32);doc.autoTable({startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[["Gasto(s)","Proveedor / documento","Monto CLP","Estado"]],body:[...adjuntosPorRuta.values()].map(grupo=>[grupo.map(x=>x.indiceOriginal+1).join(", "),(grupo[0].it.nombre_proveedor || "Comprobante")+"\n"+(grupo[0].it.tipo_documento || "")+(grupo[0].it.nro_documento?" #"+grupo[0].it.nro_documento:""),fmtCLP(grupo.reduce((s,x)=>s+Number(x.it.monto||0),0)),[...new Set(grupo.map(x=>x.it.estado || "Pendiente"))].join(" / ")]),theme:"striped",styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:"right"},3:{cellWidth:35}}});}
+    for(const grupoAdjunto of adjuntosPorRuta.values()){
+      const {it,indiceOriginal}=grupoAdjunto[0];
+      const numeroGastos=grupoAdjunto.map(x=>x.indiceOriginal+1).join(", ");
       try{
         for await (const {imagen,pagina,total} of iterarImagenesAdjunto(it.adjunto_url)){
           doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(11);doc.setTextColor(33,54,66);
-          const titulo="Comprobante · Gasto "+(indiceOriginal+1)+" · Página "+pagina+" de "+total;
+          const titulo="Comprobante · Gasto(s) "+numeroGastos+" · Página "+pagina+" de "+total;
           doc.text(titulo,14,16);doc.setFont("helvetica","normal");doc.setFontSize(8);
           const subtitulo=doc.splitTextToSize((it.nombre_proveedor || it.categoria || "")+" · "+fmtCLP(it.monto)+" · "+(it.estado || "Pendiente"),182).slice(0,2); doc.text(subtitulo,14,22);
           const inicioImagen=27+subtitulo.length*3;
@@ -6401,7 +6479,8 @@ async function generarInformePDF(rendicion, items) {
       .normalize("NFD").replace(/[̀-ͯ]/g, "") // saca tildes
       .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     doc.save(`informe_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}${nombreArchivo ? "_" + nombreArchivo : ""}.pdf`);
-    toast(adjuntosFallidos ? "PDF generado con "+adjuntosFallidos+" adjunto(s) no disponibles. Revisa las advertencias del informe." : "PDF generado con todos los adjuntos disponibles.");
+    const sinAdjunto=resumen.total-cantidadAdjuntos;
+    toast(adjuntosFallidos || sinAdjunto ? "PDF generado: "+adjuntosFallidos+" archivo(s) no disponibles y "+sinAdjunto+" gasto(s) sin adjunto. Revisa las advertencias del informe." : "PDF generado con todos los comprobantes adjuntos.");
   } catch (err) {
     console.error("Error generando el PDF:", err);
     toast("No se pudo generar el PDF: " + (err.message || ""));
@@ -6510,87 +6589,31 @@ async function generarComprobantesPorRango(desde, hasta) {
 // Reporte general (no es el comprobante para Kame): un .xlsx con todas las
 // rendiciones, en dos hojas -- Resumen (una fila por rendición) y Detalle
 // (una fila por ítem) -- que se descarga directo al PC de quien lo pide.
+let excelJsCargando = null;
+function cargarExcelJs() {
+  if(window.ExcelJS)return Promise.resolve(window.ExcelJS);
+  if(excelJsCargando)return excelJsCargando;
+  excelJsCargando=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');script.src='assets/vendor/exceljs-4.4.0.min.js';
+    const timer=setTimeout(()=>{script.remove();reject(new Error('El generador de Excel tardó demasiado. Intenta nuevamente.'));},30000);
+    script.onload=()=>{clearTimeout(timer);window.ExcelJS?resolve(window.ExcelJS):reject(new Error('No se pudo iniciar el generador de Excel.'));};
+    script.onerror=()=>{clearTimeout(timer);script.remove();reject(new Error('No se pudo cargar el generador de Excel.'));};
+    document.head.appendChild(script);
+  });excelJsCargando.catch(()=>{excelJsCargando=null;});return excelJsCargando;
+}
 async function exportarExcel() {
-  toast("Generando Excel...");
+  toast('Generando Excel...');
   try {
-    const rendiciones=await consultarTodas(() => db.from("rendiciones").select("*, solicitudes_fondos(folio)",{count:"exact"}).order("folio").order("id"));
-
-    const items=await consultarTodas(() => db.from("rendicion_items").select("*, rendiciones(folio, empleado_nombre, rut_empleado, empresa)",{count:"exact"}).order("rendicion_id").order("id"));
-
-    const solicitudes=await consultarTodas(() => db.from("solicitudes_fondos").select("*",{count:"exact"}).order("folio").order("id"));
-
-    const rendicionesFondoAprobadas = rendiciones.filter(r => r.tipo_rendicion === "FondoPorRendir" && r.estado === "Aprobado" && r.solicitud_fondo_id);
-    const rendidoPorSolicitud = {};
-    (rendicionesFondoAprobadas || []).forEach((r) => {
-      rendidoPorSolicitud[r.solicitud_fondo_id] = (rendidoPorSolicitud[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0);
-    });
-
-    const resumen = (rendiciones || []).map((r) => ({
-      "Folio": r.folio ?? "",
-      "Fecha": fmtDate(r.created_at),
-      "Empleado": r.empleado_nombre,
-      "RUT Empleado": r.rut_empleado || "",
-      "Empresa": r.empresa || "",
-      "Tipo": r.tipo_rendicion,
-      "Fondo Asociado": r.solicitudes_fondos?.folio ? `S-${r.solicitudes_fondos.folio}` : "",
-      "Comentario": r.comentario || "",
-      "Monto rendido": Number(r.monto_rendido ?? r.monto_total ?? 0),
-      "Monto aprobado": Number(r.monto_aprobado ?? (r.estado === "Aprobado" ? r.monto_total : 0)),
-      "Estado": r.estado,
-      "Aprobador": r.aprobador_nombre || "",
-      "Fecha Aprobación": r.fecha_aprobacion ? fmtDate(r.fecha_aprobacion) : "",
-    }));
-
-    const solicitudesSheet = (solicitudes || []).map((s) => {
-      const rendido = rendidoPorSolicitud[s.id] || 0;
-      return {
-        "Folio": s.folio ? `S-${s.folio}` : "",
-        "Fecha": fmtDate(s.created_at),
-        "Empleado": s.empleado_nombre,
-        "RUT Empleado": s.rut_empleado || "",
-        "Empresa": s.empresa || "",
-        "Centro de Costo": s.centro_costo || "",
-        "Monto Solicitado": Number(s.monto_solicitado || 0),
-        "Motivo": s.motivo || "",
-        "Fecha Necesaria": s.fecha_necesaria ? fmtDate(s.fecha_necesaria) : "",
-        "Estado": s.estado,
-        "Monto Rendido": rendido,
-        "Saldo Disponible": s.estado === "Aprobado" ? Math.max(0, Number(s.monto_solicitado || 0) - rendido) : "",
-        "Aprobador": s.aprobador_nombre || "",
-        "Fecha Aprobación": s.fecha_aprobacion ? fmtDate(s.fecha_aprobacion) : "",
-        "Motivo Rechazo": s.motivo_rechazo || "",
-      };
-    });
-
-    const detalle = (items || []).map((it) => ({
-      "Folio Rendición": it.rendiciones?.folio ?? "",
-      "Empleado": it.rendiciones?.empleado_nombre || "",
-      "RUT Empleado": it.rendiciones?.rut_empleado || "",
-      "Empresa": it.empresa || it.rendiciones?.empresa || "",
-      "Centro de Costo": it.centro_costo || "",
-      "Tipo Ítem": it.tipo_item,
-      "Proveedor": it.nombre_proveedor || "",
-      "RUT Proveedor": it.rut_proveedor || "",
-      "Tipo Documento": it.tipo_documento || "",
-      "N° Documento": it.nro_documento || "",
-      "Fecha Vencimiento": it.fecha_vencimiento ? fmtDate(it.fecha_vencimiento) : "",
-      "Categoría": it.categoria || "",
-      "Cuenta Contable": it.cuenta_contable || "",
-      "Nombre Cuenta": nombreCuenta(it.cuenta_contable),
-      "Monto": Number(it.monto || 0),
-      "Descripción": it.descripcion || "",
-    }));
-
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(resumen), "Resumen");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(detalle), "Detalle");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(solicitudesSheet), "Solicitudes Fondos");
-
-    const fecha = new Date().toISOString().slice(0, 10);
-    XLSX.writeFile(wb, `rendiciones_${fecha}.xlsx`);
-    toast("Excel descargado.");
-  } catch (err) {
-    console.error("Error exportando a Excel:", err);
-    toast("No se pudo generar el Excel: " + (err.message || ""));
-  }
+    const rendiciones=await consultarTodas(() => db.from('rendiciones').select('*, solicitudes_fondos(folio)',{count:'exact'}).order('folio').order('id'));
+    const ids=rendiciones.map(r=>r.id),items=[];
+    for(let i=0;i<ids.length;i+=100)items.push(...await consultarTodas(() => db.from('rendicion_items').select('*',{count:'exact'}).in('rendicion_id',ids.slice(i,i+100)).order('rendicion_id').order('id')));
+    const solicitudes=await consultarTodas(() => db.from('solicitudes_fondos').select('*',{count:'exact'}).order('folio').order('id'));
+    const datos=window.RindeReportes.preparar(rendiciones,items,solicitudes,nombreCuenta);
+    const corte=new Date(),ExcelJS=await cargarExcelJs();
+    const libro=window.RindeReportes.crearLibro(ExcelJS,datos,corte);
+    const buffer=await libro.xlsx.writeBuffer();
+    const blob=new Blob([buffer],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='rendiciones_'+corte.toISOString().slice(0,10)+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);
+    toast('Excel descargado: resumen, detalle y fondos.');
+  }catch(err){console.error('Error exportando a Excel:',err);toast('No se pudo generar el Excel: '+(err.message||''));}
 }
