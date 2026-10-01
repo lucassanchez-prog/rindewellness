@@ -8,7 +8,7 @@
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="assets/logo-gw.png" />
 <link rel="apple-touch-icon" href="assets/logo-gw.png" />
-<link rel="stylesheet" href="styles.css?v=6" />
+<link rel="stylesheet" href="styles.css?v=7" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -216,6 +216,10 @@
               <option value="">Todas</option>
             </select>
           </div>
+          <div class="field" id="campo-filtro-empleado" style="display:none">
+            <label for="filtro-empleado">Empleado</label>
+            <input type="search" id="filtro-empleado" placeholder="Buscar por nombre del empleado…" />
+          </div>
           <div class="field">
             <label for="filtro-texto">Buscar</label>
             <input type="text" id="filtro-texto" placeholder="Comentario o nombre..." />
@@ -404,7 +408,7 @@
        app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
        2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
        el navegador seguía sirviendo la versión anterior. -->
-  <script src="pure.js?v=80"></script>
-  <script src="app.js?v=80"></script>
+  <script src="pure.js?v=81"></script>
+  <script src="app.js?v=81"></script>
 </body>
 </html>

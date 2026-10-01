@@ -654,6 +654,7 @@ function wireDashboard() {
     document.getElementById(id).addEventListener("change", applyDashboardFilters)
   );
   document.getElementById("filtro-texto").addEventListener("input", applyDashboardFilters);
+  document.getElementById("filtro-empleado").addEventListener("input", applyDashboardFilters);
   const LISTAS_POR_TAB = {
     "mias": "list-mias",
     "aprobaciones": "list-aprobaciones",
@@ -665,6 +666,7 @@ function wireDashboard() {
       document.querySelectorAll(".tab-btn").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       const tab = b.dataset.tab;
+      document.getElementById("campo-filtro-empleado").style.display = tab === "aprobaciones" ? "" : "none";
       Object.entries(LISTAS_POR_TAB).forEach(([t, listId]) => {
         document.getElementById(listId).style.display = t === tab ? "flex" : "none";
       });
@@ -673,7 +675,7 @@ function wireDashboard() {
 }
 
 // Cache de la última carga, para poder filtrar sin volver a golpear la base.
-const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [] };
+const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [], consumoFondos: new Map() };
 
 // Tope de seguridad para las listas de "Mis rendiciones"/"Mis solicitudes"
 // -- sin esto, el historial de alguien con años de antigüedad crece sin
@@ -687,6 +689,35 @@ const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicit
 // para Reportes (no depender de traer todas las filas al navegador), no
 // un límite acá.
 const TOPE_LISTA_PROPIA = 300;
+
+function resumirConsumoFondo(rendiciones, montoFondo) {
+  const vigentes = (rendiciones || []).filter(r => r.estado === "Pendiente" || r.estado === "Aprobado");
+  const consumido = vigentes.reduce((sum,r) => sum + Number(r.monto_total || 0),0);
+  const aprobado = vigentes.reduce((sum,r) => sum + Number(r.monto_aprobado ?? (r.estado === "Aprobado" ? r.monto_total : 0)),0);
+  return {consumido, aprobado, porRevisar: Math.max(0,consumido-aprobado), saldo: Number(montoFondo || 0)-consumido};
+}
+
+async function cargarConsumoFondos(solicitudes) {
+  const resultado = new Map();
+  const ids = [...new Set(solicitudes.map(s => s.id))];
+  for (let inicio = 0; inicio < ids.length; inicio += 100) {
+    const lote = ids.slice(inicio,inicio+100);
+    const rendiciones = [];
+    let correcto = true;
+    for (let pagina = 0; ;) {
+      const {data,error,count} = await db.from("rendiciones")
+        .select("id,solicitud_fondo_id,monto_total,monto_aprobado,estado", {count:"exact"})
+        .in("solicitud_fondo_id",lote).order("id").range(pagina,pagina+499);
+      if (error) {console.error("No se pudo calcular el consumo de fondos",error); correcto=false; break;}
+      rendiciones.push(...(data || []));
+      if (!data || !data.length) {if (count && rendiciones.length < count) correcto=false; break;}
+      pagina += data.length;
+      if (count !== null && pagina >= count) break;
+    }
+    if (correcto) lote.forEach(id => resultado.set(id, rendiciones.filter(r => r.solicitud_fondo_id === id)));
+  }
+  return resultado;
+}
 
 async function loadDashboard() {
   const { data: mias } = await db
@@ -734,6 +765,8 @@ async function loadDashboard() {
     dashboardData.solicitudesAprobacion = [];
   }
 
+  dashboardData.consumoFondos = await cargarConsumoFondos([...dashboardData.solicitudesMias,...dashboardData.solicitudesAprobacion]);
+
   // El admin ve totales de TODA la empresa (ya tiene los datos: dashboardData.aprobaciones
   // trae cada rendición, sin filtrar por estado, cuando el rol es admin) --
   // antes siempre se mostraban los propios, aunque quien mirara fuera admin
@@ -753,6 +786,10 @@ async function loadDashboard() {
   applyDashboardFilters();
 }
 
+function normalizarBusquedaEmpleado(texto) {
+  return String(texto || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim().toLocaleLowerCase("es");
+}
+
 function applyDashboardFilters() {
   const estado = document.getElementById("filtro-estado").value;
   const empresa = document.getElementById("filtro-empresa").value;
@@ -769,7 +806,7 @@ function applyDashboardFilters() {
     (!texto || `${s.motivo || ""} ${s.empleado_nombre || ""}`.toLowerCase().includes(texto));
 
   renderList(document.getElementById("list-mias"), dashboardData.mias.filter(pasaFiltro), false);
-  renderList(document.getElementById("list-aprobaciones"), dashboardData.aprobaciones.filter(pasaFiltro), true);
+  renderList(document.getElementById("list-aprobaciones"), dashboardData.aprobaciones.filter(r => pasaFiltro(r) && normalizarBusquedaEmpleado(r.empleado_nombre).includes(normalizarBusquedaEmpleado(document.getElementById("filtro-empleado").value))), true);
   renderListSolicitudes(document.getElementById("list-solicitudes-mias"), dashboardData.solicitudesMias.filter(pasaFiltroSolicitud), false);
   renderListSolicitudes(document.getElementById("list-solicitudes-aprobacion"), dashboardData.solicitudesAprobacion.filter(pasaFiltroSolicitud), true);
 }
@@ -850,17 +887,22 @@ function renderListSolicitudes(container, rows, showEmpleado) {
 
   const columnas = ["Folio"];
   if (showEmpleado) columnas.push("Empleado");
-  columnas.push("Empresa", "Centro de Costo", "Motivo", "Fecha", "Monto", "Estado");
+  columnas.push("Empresa", "Centro de Costo", "Motivo", "Fecha", "Monto del fondo", "Consumido", "Saldo disponible", "Estado");
 
   const columnasCentradas = new Set(["Folio", "Fecha", "Estado"]);
-  const tabla = el("table", { class: "items-table" });
+  const tabla = el("table", { class: "items-table fondos-tabla" });
   tabla.appendChild(el("thead", {}, [
-    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c === "Monto" ? "right" : "") }, c))),
+    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (["Monto del fondo","Consumido","Saldo disponible"].includes(c) ? "right" : "") }, c))),
   ]));
   const tbody = el("tbody");
   tabla.appendChild(tbody);
 
   rows.forEach((s) => {
+    const disponibles = dashboardData.consumoFondos.get(s.id);
+    const consumo = disponibles ? resumirConsumoFondo(disponibles,s.monto_solicitado) : null;
+    const consume = s.estado === "Aprobado";
+    const consumoTexto = !consume ? "—" : consumo ? fmtCLP(consumo.consumido) : "No disponible";
+    const saldoTexto = !consume ? "—" : consumo ? fmtCLP(consumo.saldo) : "No disponible";
     const celdas = [el("td", { class: "center" }, `S-${s.folio ?? "-"}`)];
     if (showEmpleado) celdas.push(el("td", {}, s.empleado_nombre || "-"));
     celdas.push(
@@ -869,13 +911,16 @@ function renderListSolicitudes(container, rows, showEmpleado) {
       el("td", { class: "wrap" }, s.motivo || "-"),
       el("td", { class: "center" }, fmtDate(s.created_at)),
       el("td", { class: "monto" }, fmtCLP(s.monto_solicitado)),
+      el("td", {class:"monto", title:"Gastos aprobados y pendientes de revisión; excluye rechazados."}, consumoTexto),
+      el("td", {class:"monto", style: consumo && consumo.saldo < 0 ? "color:var(--danger)" : "", title:consumo && consumo.saldo < 0 ? "El consumo excede el fondo entregado." : "Monto del fondo menos gastos no rechazados."}, saldoTexto),
       el("td", { class: "center" }, el("span", { class: "pill " + s.estado }, s.estado)),
     );
     celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
     tbody.appendChild(filaClickable(() => openDetalleSolicitud(s.id), celdas));
   });
 
-  container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+  container.appendChild(el("p", {style:"color:var(--ink-soft);font-size:.8rem;margin:0 0 12px"}, "Consumido: gastos aprobados y pendientes de revisión, sin gastos rechazados. Un saldo negativo indica exceso del fondo."));
+  container.appendChild(el("div", { class: "table-scroll fondos-scroll" }, [tabla]));
 }
 
 // ------------------------------------------------------------
@@ -1299,7 +1344,7 @@ async function renderReportes() {
           el("td", { "data-label": "Empleado" }, s.empleado_nombre || "-"),
           el("td", { "data-label": "Empresa" }, s.empresa || "-"),
           el("td", { class: "monto", "data-label": "Otorgado" }, fmtCLP(s.monto_solicitado)),
-          el("td", { class: "monto", "data-label": "Rendido" }, fmtCLP(rendido)),
+          el("td", { class: "monto", "data-label": "Rendido" }, rendido === null ? "No disponible" : fmtCLP(rendido)),
           el("td", { class: "monto", "data-label": "Saldo" }, fmtCLP(saldo)),
         ]));
       });
@@ -2007,7 +2052,7 @@ async function cargarSolicitudesDisponibles() {
     return;
   }
   const ids = solicitudes.map((s) => s.id);
-  const { data: rendidas } = await db.from("rendiciones").select("solicitud_fondo_id, monto_total").in("solicitud_fondo_id", ids).eq("estado", "Aprobado");
+  const { data: rendidas, error: errorConsumo } = await db.from("rendiciones").select("solicitud_fondo_id, monto_total").in("solicitud_fondo_id", ids).eq("estado", "Aprobado");
   const rendidoPorId = {};
   (rendidas || []).forEach((r) => { rendidoPorId[r.solicitud_fondo_id] = (rendidoPorId[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0); });
 
@@ -4863,21 +4908,21 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     // calcularSplitFondo), no como parte de este fondo.
     const { data: rendidas } = await db
       .from("rendiciones")
-      .select("id, folio, monto_total, estado")
+      .select("id, folio, monto_total, monto_aprobado, estado")
       .eq("solicitud_fondo_id", s.id)
       .order("created_at", { ascending: true });
     const aprobadas = (rendidas || []).filter((r) => r.estado === "Aprobado");
-    const rendido = aprobadas.reduce((sum, r) => sum + Number(r.monto_total || 0), 0);
-    const saldo = Number(s.monto_solicitado) - rendido;
+    const rendido = errorConsumo ? null : resumirConsumoFondo(rendidas,s.monto_solicitado).consumido;
+    const saldo = rendido === null ? null : Number(s.monto_solicitado) - rendido;
 
     box.appendChild(el("div", {
       style: "margin-top:14px; padding:12px 14px; border-radius:8px; background:var(--bg-soft, rgba(120,120,120,0.06));",
     }, [
-      el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" }, "Monto ya rendido (aprobado)"),
-      el("p", { style: "margin:0 0 10px;font-weight:700" }, fmtCLP(rendido)),
+      el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" }, "Monto consumido (aprobado y pendiente, sin rechazados)"),
+      el("p", { style: "margin:0 0 10px;font-weight:700" }, rendido === null ? "No disponible" : fmtCLP(rendido)),
       el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" },
         saldo >= 0 ? "Saldo disponible" : "Exceso rendido (va a Rendiciones por Pagar)"),
-      el("p", { style: `margin:0;font-weight:700;color:${saldo >= 0 ? "var(--success)" : "var(--danger)"}` }, fmtCLP(Math.abs(saldo))),
+      el("p", { style: `margin:0;font-weight:700;color:${saldo >= 0 ? "var(--success)" : "var(--danger)"}` }, saldo === null ? "No disponible" : fmtCLP(Math.abs(saldo))),
     ]));
 
     if (rendidas && rendidas.length) {
