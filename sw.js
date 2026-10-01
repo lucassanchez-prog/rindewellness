@@ -11,8 +11,8 @@
 // "cache-first" alguien podía quedar viendo una versión vieja de la app
 // indefinidamente sin darse cuenta -- justo el problema de caché que ya
 // nos mordió varias veces con index.html/styles.css durante el desarrollo.
-const CACHE_NAME = "rindewellness-shell-v84";
-const SHELL_FILES = ["/", "/index.html", "/styles.css?v=8", "/pure.js?v=84", "/app.js?v=84", "/config.js", "/manifest.json", "/assets/logo-gw.png"];
+const CACHE_NAME = "rindewellness-shell-v85";
+const SHELL_FILES = ["/", "/index.html", "/styles.css?v=8", "/pure.js?v=85", "/app.js?v=85", "/config.js", "/manifest.json", "/assets/logo-gw.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

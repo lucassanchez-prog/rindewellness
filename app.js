@@ -3565,7 +3565,7 @@ async function prepararArchivoParaLectura(input, status, analizar) {
         status.textContent=tipo==="Ficha de rendición" ? "Esta página es una ficha. Selecciona la página con la boleta, factura o voucher original." : "Confirma la página antes de leerla. Se adjuntará solo este comprobante al gasto.";
       } catch (error) {if(vigente()){status.textContent="No se pudo preparar esta página. Elige otra o adjunta una foto del comprobante.";status.className="ocr-status show err";}}
     }
-    select.addEventListener("change",mostrarPagina);
+    select.addEventListener("change",()=>{const id=input.id.replace(/-foto2?$/,"");nuevaGeneracionOcr(id);mostrarPagina();});
     usar.addEventListener("click",async()=>{
       if(!vigente() || !archivoPagina || usar.disabled)return;
       usar.disabled=true;
@@ -6176,8 +6176,8 @@ async function descargarCSV(rendicion, items) {
 // para un informe que se ve en pantalla o se imprime esa resolución sobra,
 // y sin reescalar el PDF de una rendición con un par de fotos pesaba
 // varios MB (uno de prueba real llegó a 7+ MB con solo 2 fotos).
-const PDF_IMG_MAX_DIM = 1400;
-const PDF_IMG_CALIDAD = 0.72;
+const PDF_IMG_MAX_DIM = 2200;
+const PDF_IMG_CALIDAD = 0.9;
 
 function canvasAJpegRedimensionado(canvasOrigen) {
   let { width, height } = canvasOrigen;
@@ -6192,37 +6192,30 @@ function canvasAJpegRedimensionado(canvasOrigen) {
   return chico.toDataURL("image/jpeg", PDF_IMG_CALIDAD);
 }
 
-async function obtenerImagenDeAdjunto(path) {
-  try {
-    const { data: signed, error } = await db.storage.from("comprobantes").createSignedUrl(path, 120);
-    if (error || !signed?.signedUrl) return null;
-    const resp = await fetch(signed.signedUrl);
-    const blob = await resp.blob();
-
-    if (blob.type === "application/pdf" || path.toLowerCase().endsWith(".pdf")) {
-      const buf = await blob.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-      const page = await pdf.getPage(1);
-      const viewport = page.getViewport({ scale: 2 });
-      const canvas = document.createElement("canvas");
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-      return canvasAJpegRedimensionado(canvas);
-    }
-
-    // Foto normal (jpg/png del celular): la pasamos por un canvas igual,
-    // así se reescala/comprime como cualquier otro adjunto en vez de
-    // meterse íntegra al PDF.
-    const bitmap = await createImageBitmap(blob);
-    const canvas = document.createElement("canvas");
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.getContext("2d").drawImage(bitmap, 0, 0);
-    return canvasAJpegRedimensionado(canvas);
-  } catch (err) {
-    console.error("No se pudo preparar el adjunto para el PDF:", err);
-    return null;
+async function* iterarImagenesAdjunto(path) {
+  const {data:signed,error}=await db.storage.from("comprobantes").createSignedUrl(path,120);
+  if(error || !signed?.signedUrl)throw new Error("No se pudo acceder al adjunto");
+  const resp=await fetch(signed.signedUrl);if(!resp.ok)throw new Error("No se pudo descargar el adjunto");
+  const blob=await resp.blob();
+  if(blob.type === "application/pdf" || path.toLowerCase().endsWith(".pdf")){
+    const pdfjs=await cargarPdfJs();const pdf=await pdfjs.getDocument({data:await blob.arrayBuffer()}).promise;
+    try{
+      for(let n=1;n<=pdf.numPages;n++){
+        const page=await pdf.getPage(n);const viewport=page.getViewport({scale:1});
+        const v=page.getViewport({scale:Math.min(3,2200/Math.max(viewport.width,viewport.height))});
+        const canvas=document.createElement("canvas");canvas.width=Math.ceil(v.width);canvas.height=Math.ceil(v.height);
+        await page.render({canvasContext:canvas.getContext("2d"),viewport:v}).promise;
+        yield {imagen:canvasAJpegRedimensionado(canvas),pagina:n,total:pdf.numPages};
+        page.cleanup();canvas.width=canvas.height=0;
+      }
+    }finally{await pdf.destroy();}
+  }else{
+    const bitmap=await createImageBitmap(blob);
+    try{
+      const canvas=document.createElement("canvas");canvas.width=bitmap.width;canvas.height=bitmap.height;
+      const ctx=canvas.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,canvas.width,canvas.height);ctx.drawImage(bitmap,0,0);
+      yield {imagen:canvasAJpegRedimensionado(canvas),pagina:1,total:1};
+    }finally{bitmap.close();}
   }
 }
 
@@ -6236,57 +6229,65 @@ async function generarInformePDF(rendicion, items) {
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF();
 
-    doc.setFontSize(15);
-    doc.text(`RindeWellness · Informe de rendición N° ${rendicion.folio ?? "-"}`, 14, 16);
-    doc.setFontSize(10);
-    doc.setTextColor(90);
-    let y = 24;
-    const linea = (label, valor) => {
-      doc.setTextColor(90);
-      doc.text(`${label}:`, 14, y);
-      doc.setTextColor(20);
-      doc.text(String(valor ?? "-"), 55, y);
-      y += 6;
+    const ancho = doc.internal.pageSize.getWidth();
+    const margen = 14, util = ancho - margen*2;
+    const tinta = [33,54,66], tenue = [117,135,145], verde = [22,127,118];
+    doc.setFont("helvetica","bold");doc.setFontSize(19);doc.setTextColor(...verde);
+    doc.text("GW",margen,18);doc.setTextColor(...tinta);doc.setFontSize(14);doc.text("RindeWellness",30,18);
+    doc.setFontSize(20);doc.text("Informe de rendición N° " + (rendicion.folio ?? "-"),margen,33);
+    doc.setDrawColor(226,233,237);doc.line(margen,41,ancho-margen,41);
+    let y = 51;
+    const linea = (texto,negrita=false) => {
+      doc.setFont("helvetica",negrita?"bold":"normal");doc.setFontSize(negrita?11:9);doc.setTextColor(...(negrita?tinta:tenue));
+      const partes=doc.splitTextToSize(String(texto || "-"),util);
+      if(y+partes.length*5>230){doc.addPage();y=20;}
+      doc.text(partes,margen,y);y+=partes.length*5+3;
     };
-    linea("Empleado", rendicion.empleado_nombre);
-    linea("RUT", rendicion.rut_empleado);
-    linea("Empresa", rendicion.empresa);
-    linea("Fecha", fmtDate(rendicion.created_at));
-    linea("Tipo", rendicion.tipo_rendicion === "FondoPorRendir" ? "Rendición de fondo por rendir" : "Reembolso");
-    linea("Estado", rendicion.estado);
-    if (rendicion.comentario) linea("Comentario", rendicion.comentario);
-    if (rendicion.estado === "Aprobado") {
-      linea("Aprobado por", rendicion.aprobador_nombre);
-      linea("Fecha aprobación", fmtDate(rendicion.fecha_aprobacion));
+    linea(rendicion.empleado_nombre,true);
+    linea("RUT: " + (rendicion.rut_empleado || "-") + " · " + (rendicion.empresa || "-"));
+    linea("Fecha: " + fmtDate(rendicion.created_at) + " · " + (rendicion.tipo_rendicion === "FondoPorRendir" ? "Fondo por rendir" : "Reembolso") + " · Estado: " + rendicion.estado);
+    if(rendicion.comentario)linea("Motivo: " + rendicion.comentario);
+    if(rendicion.estado === "Aprobado")linea("Aprobado por " + (rendicion.aprobador_nombre || "-") + " · " + fmtDate(rendicion.fecha_aprobacion));
+    if(rendicion.estado === "Rechazado")linea("Rechazado por " + (rendicion.aprobador_nombre || "-") + ". " + (rendicion.motivo_rechazo || "Sin motivo registrado"));
+    const resumen = resumenRendicion(items || []);
+    if(y+36>245){doc.addPage();y=20;}
+    const anchoMetrica=(util-9)/4;
+    const metricas=[["RENDIDO",resumen.rendido,resumen.total,tinta],["APROBADO",resumen.aprobado,resumen.aprobados,verde],["RECHAZADO",resumen.rechazado,resumen.rechazados,[195,93,74]],["PENDIENTE",resumen.pendiente,resumen.pendientes,[165,121,41]]];
+    metricas.forEach(([titulo,monto,cantidad,color],i)=>{
+      const x=margen+i*(anchoMetrica+3);doc.setFillColor(243,247,248);doc.roundedRect(x,y,anchoMetrica,29,3,3,"F");
+      doc.setFont("helvetica","bold");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(titulo,x+4,y+7);
+      const importe=fmtCLP(monto);doc.setFontSize(importe.length>12?11:14);doc.setTextColor(...color);doc.text(importe,x+4,y+17);
+      doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(cantidad+" gastos",x+4,y+24);
+    });
+    y+=38;
+    if(rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id){
+      const {data:fondo,error:errorFondo}=await db.from("solicitudes_fondos").select("id,folio,monto_solicitado").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
+      if(!errorFondo && fondo){
+        const consumo=await cargarConsumoFondos([fondo]);const filas=consumo.get(fondo.id);
+        const saldo=filas?resumirConsumoFondo(filas,fondo.monto_solicitado):null;
+        if(y+34>245){doc.addPage();y=20;}
+        doc.setFillColor(237,245,241);doc.roundedRect(margen,y,util,28,3,3,"F");
+        doc.setFont("helvetica","bold");doc.setFontSize(9);doc.setTextColor(...verde);
+        doc.text("FONDO S-"+fondo.folio+" · Monto del fondo: "+fmtCLP(fondo.monto_solicitado),margen+5,y+9);
+        doc.setTextColor(...tinta);doc.text(saldo?"Consumido total: "+fmtCLP(saldo.consumido)+" · Saldo: "+fmtCLP(saldo.saldo):"Consumo y saldo no disponibles",margen+5,y+18);
+        doc.setFont("helvetica","normal");doc.setFontSize(6.5);doc.text("Consumo: aprobados y pendientes de todas las rendiciones del fondo; excluye rechazados.",margen+5,y+24);y+=36;
+      }else linea("Fondo asociado: no se pudo consultar su referencia y saldo.");
     }
-    if (rendicion.estado === "Rechazado") {
-      linea("Rechazado por", rendicion.aprobador_nombre);
-      linea("Motivo", rendicion.motivo_rechazo || "No se dejó un motivo.");
-    }
-    linea("Monto rendido", fmtCLP((items || []).reduce((s,it) => s+Number(it.monto || 0),0)));
-    linea("Monto aprobado", fmtCLP((items || []).filter(it => it.estado === "Aprobado").reduce((s,it) => s+Number(it.monto || 0),0)));
-    y += 4;
-
+    doc.setFont("helvetica","bold");doc.setFontSize(12);doc.setTextColor(...tinta);doc.text("Detalle de gastos",margen,y);y+=6;
     doc.autoTable({
-      startY: y,
-      head: [["#", "Tipo", "Proveedor / Categoría", "RUT", "Documento", "C. Costo", "Descripción", "Monto", "Estado"]],
-      body: (items || []).map((it, i) => {
-        const esCon = it.tipo_item === "ConDocumento";
-        return [
-          i + 1,
-          tipoItemLabel(it.tipo_item),
-          [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-",
-          esCon ? (it.rut_proveedor || "-") : "-",
-          esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-",
-          it.centro_costo || "-",
-          it.descripcion || "-",
-          fmtCLP(it.monto),
-          it.estado || "Pendiente",
-        ];
-      }),
-      styles: { fontSize: 8, cellPadding: 2 },
-      headStyles: { fillColor: [21, 156, 142] },
-      columnStyles: { 7: { halign: "right" } },
+      startY:y,margin:{left:margen,right:margen,top:18,bottom:19},
+      head:[["Gasto / proveedor","Documento","Centro de costo / descripción","Monto","Estado"]],
+      body:(items || []).map((it,i)=>[
+        (i+1)+". "+(it.nombre_proveedor || it.categoria || "Sin proveedor")+"\n"+[it.categoria,it.rut_proveedor,tipoItemLabel(it.tipo_item)].filter(Boolean).join(" · "),
+        (it.tipo_documento || "Comprobante")+(it.nro_documento?" #"+it.nro_documento:"")+(it.fecha_vencimiento?"\n"+fmtDate(it.fecha_vencimiento):""),
+        [it.centro_costo,it.descripcion].filter(Boolean).join("\n") || "-",
+        fmtCLP(it.monto),(it.estado || "Pendiente")+(it.motivo_rechazo?"\n"+it.motivo_rechazo:"")
+      ]),
+      theme:"striped",styles:{font:"helvetica",fontSize:8,cellPadding:3,textColor:tinta,lineColor:[226,233,237]},
+      headStyles:{fillColor:verde,textColor:[255,255,255],fontSize:7.5,fontStyle:"bold"},
+      alternateRowStyles:{fillColor:[244,247,248]},rowPageBreak:"avoid",
+      columnStyles:{0:{cellWidth:53},1:{cellWidth:37},2:{cellWidth:45},3:{cellWidth:23,halign:"right",fontStyle:"bold"},4:{cellWidth:24}},
+      didParseCell:datos=>{if(datos.section==="body" && datos.column.index===4 && String(datos.cell.raw).startsWith("Rechazado"))datos.cell.styles.textColor=[195,93,74];}
     });
 
     // Una página por cada comprobante adjunto, para que el informe quede
@@ -6297,26 +6298,29 @@ async function generarInformePDF(rendicion, items) {
     const itemsConAdjunto = (items || [])
       .map((it, indiceOriginal) => ({ it, indiceOriginal }))
       .filter(({ it }) => it.adjunto_url);
-    const imagenes = await Promise.all(itemsConAdjunto.map(({ it }) => obtenerImagenDeAdjunto(it.adjunto_url)));
-    for (const [i, { it, indiceOriginal }] of itemsConAdjunto.entries()) {
-      const img = imagenes[i];
-      if (!img) continue;
-      doc.addPage();
-      doc.setFontSize(11);
-      doc.setTextColor(20);
-      const titulo = `Comprobante · Ítem ${indiceOriginal + 1}${it.nombre_proveedor ? " · " + it.nombre_proveedor : it.categoria ? " · " + it.categoria : ""}`;
-      doc.text(titulo, 14, 16);
-      const propiedades = doc.getImageProperties(img);
-      const pageWidth = doc.internal.pageSize.getWidth() - 20;
-      const pageHeight = doc.internal.pageSize.getHeight() - 30;
-      let w = pageWidth;
-      let h = (propiedades.height * w) / propiedades.width;
-      if (h > pageHeight) {
-        h = pageHeight;
-        w = (propiedades.width * h) / propiedades.height;
+    let adjuntosFallidos=0;
+    for(const {it,indiceOriginal} of itemsConAdjunto){
+      try{
+        for await (const {imagen,pagina,total} of iterarImagenesAdjunto(it.adjunto_url)){
+          doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(11);doc.setTextColor(33,54,66);
+          const titulo="Comprobante · Gasto "+(indiceOriginal+1)+" · Página "+pagina+" de "+total;
+          doc.text(titulo,14,16);doc.setFont("helvetica","normal");doc.setFontSize(8);
+          const subtitulo=doc.splitTextToSize((it.nombre_proveedor || it.categoria || "")+" · "+fmtCLP(it.monto)+" · "+(it.estado || "Pendiente"),182).slice(0,2); doc.text(subtitulo,14,22);
+          const inicioImagen=27+subtitulo.length*3;
+          const propiedades=doc.getImageProperties(imagen);
+          const limiteW=doc.internal.pageSize.getWidth()-28,limiteH=doc.internal.pageSize.getHeight()-inicioImagen-18;
+          const escala=Math.min(limiteW/propiedades.width,limiteH/propiedades.height);
+          const w=propiedades.width*escala,h=propiedades.height*escala;
+          doc.addImage(imagen,"JPEG",(ancho-w)/2,inicioImagen,w,h);
+        }
+      }catch(error){
+        adjuntosFallidos++;doc.addPage();doc.setTextColor(195,93,74);doc.setFontSize(12);
+        doc.text("Adjunto no disponible · Gasto "+(indiceOriginal+1),14,22);doc.setTextColor(33,54,66);doc.setFontSize(10);
+        doc.text(doc.splitTextToSize("No se pudo incorporar el comprobante de "+(it.nombre_proveedor || it.categoria || "este gasto")+". Este informe tiene respaldo incompleto; vuelve a generarlo cuando el archivo esté disponible.",182),14,34);
       }
-      doc.addImage(img, "JPEG", 10, 24, w, h);
     }
+
+    for(let pagina=1;pagina<=doc.getNumberOfPages();pagina++){doc.setPage(pagina);doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(117,135,145);doc.text("Grupo Wellness · Montos en CLP",14,doc.internal.pageSize.getHeight()-9);doc.text("Página "+pagina+" de "+doc.getNumberOfPages(),ancho-14,doc.internal.pageSize.getHeight()-9,{align:"right"});}
 
     // Nombre de archivo con quién rinde, para poder identificarlo de un
     // vistazo entre varios PDFs descargados (ej. "informe_rendicion_1_nataly_alvarez.pdf").
@@ -6324,7 +6328,7 @@ async function generarInformePDF(rendicion, items) {
       .normalize("NFD").replace(/[̀-ͯ]/g, "") // saca tildes
       .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     doc.save(`informe_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}${nombreArchivo ? "_" + nombreArchivo : ""}.pdf`);
-    toast("PDF generado.");
+    toast(adjuntosFallidos ? "PDF generado con "+adjuntosFallidos+" adjunto(s) no disponibles. Revisa las advertencias del informe." : "PDF generado con todos los adjuntos disponibles.");
   } catch (err) {
     console.error("Error generando el PDF:", err);
     toast("No se pudo generar el PDF: " + (err.message || ""));
