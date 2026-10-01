@@ -5894,7 +5894,9 @@ function csvRow(fields) {
 // por Pagar" -- como si esa parte fuera un reembolso normal de bolsillo.
 function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null) {
   const fecha = fmtDateSlash(rendicion.created_at) || rendicion.created_at;
-  const glosa = `RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}`.replace(/\s+/g, " ").trim();
+  const fondoFolio = split?.fondoFolio ?? rendicion.solicitudes_fondos?.folio;
+  const referenciaFondo = rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondoFolio != null ? " · FONDO S-" + fondoFolio : "";
+  const glosa = (`RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}` + referenciaFondo).replace(/\s+/g, " ").trim();
   const rows = [];
 
   // "Comentario Linea" va con el mismo texto en todas las líneas de la
@@ -5959,7 +5961,7 @@ async function calcularSplitFondo(rendicionesFondo) {
   const solicitudIds = [...new Set((rendicionesFondo || []).map((r) => r.solicitud_fondo_id).filter(Boolean))];
   if (!solicitudIds.length) return splitPorId;
 
-  const { data: solicitudes } = await db.from("solicitudes_fondos").select("id, monto_solicitado").in("id", solicitudIds);
+  const { data: solicitudes } = await db.from("solicitudes_fondos").select("id, folio, monto_solicitado").in("id", solicitudIds);
   const solicitudPorId = new Map((solicitudes || []).map((s) => [s.id, s]));
 
   const { data: historial } = await db
@@ -5977,7 +5979,7 @@ async function calcularSplitFondo(rendicionesFondo) {
     const saldoAntes = Math.max(0, Number(solicitud.monto_solicitado) - antes);
     const dentroDelFondo = Math.min(Number(r.monto_total), saldoAntes);
     const excedente = Math.max(0, Number(r.monto_total) - saldoAntes);
-    splitPorId.set(r.id, { dentroDelFondo, excedente });
+    splitPorId.set(r.id, { dentroDelFondo, excedente, fondoFolio: solicitud.folio });
     consumido.set(r.solicitud_fondo_id, antes + Number(r.monto_total));
   });
   return splitPorId;
@@ -5998,8 +6000,15 @@ function construirCSV(rendicion, items, split = null) {
 // el perfil ACTUAL, cada vez que se genera un comprobante.
 async function conDatosActualesDeEmpleado(rendicion) {
   const { data: perfil } = await db.from("profiles").select("nombre, rut").eq("id", rendicion.empleado_id).maybeSingle();
-  if (!perfil) return rendicion;
+  let fondo = rendicion.solicitudes_fondos;
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondo?.folio == null) {
+    const {data,error} = await db.from("solicitudes_fondos").select("folio").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
+    if (error || !data || data.folio == null) throw new Error("No se pudo identificar el fondo del comprobante. Intenta nuevamente.");
+    fondo=data;
+  }
+  if (!perfil) return {...rendicion,solicitudes_fondos:fondo};
   return {
+    solicitudes_fondos:fondo,
     ...rendicion,
     rut_empleado: perfil.rut || rendicion.rut_empleado,
     empleado_nombre: perfil.nombre || rendicion.empleado_nombre,
