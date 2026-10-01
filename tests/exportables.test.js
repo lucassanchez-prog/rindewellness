@@ -1,5 +1,8 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const reportes=require('../reportes-exportacion.js');
+test('CSV general conserva comas y neutraliza fórmulas sin convertir importes numéricos en texto',()=>{
+ const core=require('../pure.js');assert.equal(core.campoCSVSeguro('Proveedor, sucursal'),'"Proveedor, sucursal"');assert.equal(core.campoCSVSeguro('=SUM(1,2)'), '"\'=SUM(1,2)"');assert.equal(core.campoCSVSeguro(' @SUM(A1)'),"' @SUM(A1)");assert.equal(core.campoCSVSeguro(-10),'-10');
+});
 const rendiciones=[{id:'r1',folio:18,empleado_nombre:'Persona de prueba',solicitud_fondo_id:'f',tipo_rendicion:'FondoPorRendir',estado:'Pendiente',monto_total:999,created_at:'2026-10-01T01:00:00Z'},{id:'r2',folio:19,empleado_nombre:'Persona de prueba',solicitud_fondo_id:'f',tipo_rendicion:'FondoPorRendir',estado:'Aprobado'}];
 const items=[{id:'i1',rendicion_id:'r1',monto:70,estado:'Aprobado',nro_documento:'00123',adjunto_url:'privado/foto',cuenta_contable:'4.01'},{id:'i2',rendicion_id:'r1',monto:15,estado:'Rechazado',motivo_rechazo:'Documento duplicado'},{id:'i3',rendicion_id:'r1',monto:30,estado:'Pendiente'},{id:'i4',rendicion_id:'r2',monto:50,estado:'Aprobado'}];
 const solicitudes=[{id:'f',folio:2,monto_solicitado:100,estado:'Aprobado'}];

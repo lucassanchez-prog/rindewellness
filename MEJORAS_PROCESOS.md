@@ -42,6 +42,7 @@ Este respaldo corre mientras el navegador está abierto. El trabajador de Supaba
 
 El Excel contiene resumen conciliado por estados, detalle con cuenta y nombre, motivos de rechazo, referencia de fondo y presencia de adjuntos, y solicitudes con consumo/saldo/exceso. Conserva fechas y montos como valores tipados, folios como texto, filtros y encabezados inmovilizados. ExcelJS está fijado a 4.4.0 y se carga desde un recurso local al exportar.
 
-El PDF conserva el diseño aprobado, incorpora el índice de adjuntos, todas las páginas de los PDF e imágenes originales y evita repetir un archivo compartido entre ítems. Advierte por gastos sin adjunto y archivos no disponibles. El CSV contable rechaza diferencias entre gastos aprobados y contrapartida; el reporte general pagina todos los registros y escapa comas, comillas y saltos de línea.
+El PDF conserva el diseño aprobado, incorpora el índice de adjuntos, todas las páginas de los PDF e imágenes originales y evita repetir un archivo compartido entre ítems. Advierte por gastos sin adjunto y archivos no disponibles. El CSV contable rechaza diferencias entre gastos aprobados y contrapartida; el reporte general pagina todos los registros y escapa comas, comillas y saltos de línea. Los textos del CSV general se neutralizan para evitar que Excel los interprete como fórmulas.
 
-Validación ampliada: 56 pruebas automatizadas y ESLint. PDF generado con el código real de la aplicación y fotografías históricas, renderizado para comprobar su presencia. Excel generado, reabierto y sus hojas inspeccionadas; no se modificaron gastos reales durante estas pruebas.
+Validación ampliada: 57 pruebas automatizadas y ESLint. PDF generado con el código real de la aplicación y fotografías históricas, renderizado para comprobar su presencia. Excel generado, reabierto y sus hojas inspeccionadas; no se modificaron gastos reales durante estas pruebas.
+

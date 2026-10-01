@@ -103,6 +103,12 @@
     return /[,;"\r\n]/.test(texto) ? '"' + texto.replace(/"/g, '""') + '"' : texto;
   }
 
+  function campoCSVSeguro(valor) {
+    // Los textos del reporte general no deben ejecutarse como fórmulas al abrir Excel.
+    const protegido=typeof valor === "string" && /^[\s]*[=+@\-\t\r]/.test(valor) ? "'"+valor : valor;
+    return campoCSV(protegido);
+  }
+
   function resumenRendicion(items) {
     const resumen = { rendido: 0, aprobado: 0, rechazado: 0, pendiente: 0, total: items.length, aprobados: 0, rechazados: 0, pendientes: 0 };
     items.forEach((item) => {
@@ -122,7 +128,7 @@
     return {monto:grupo.reduce((sum,i)=>sum+Number(i.monto||0),0),miembros:grupo.map(i=>({id:i.id,monto:Number(i.monto||0),estado:i.estado})).sort((a,b)=>String(a.id).localeCompare(String(b.id)))};
   }
 
-  const RindeCore = { grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, resumenRendicion };
+  const RindeCore = { grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

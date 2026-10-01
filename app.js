@@ -6,7 +6,7 @@
 // viven en pure.js (cargado antes que este archivo, ver index.html) -- son
 // funciones puras sin DOM ni red, separadas para poder testearlas con Node
 // (ver tests/pure.test.js) sin arrastrar el resto de la app.
-const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, documentosDuplicados, campoCSV, resumenRendicion } = window.RindeCore;
+const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion } = window.RindeCore;
 
 const CFG = window.RINDE_WELLNESS_CONFIG || {};
 let db = null; // proyecto propio de la app (lectura/escritura)
@@ -1277,7 +1277,7 @@ async function renderReportes() {
         ...seccionCSV("Por centro de costo", porCentroCosto),
         ...seccionCSV("Tendencia mensual", porMes),
       ];
-      csvContenido = todasLasFilas.map(fila => fila.map(c => campoCSV(c)).join(",")).join("\r\n");
+      csvContenido = todasLasFilas.map(fila => fila.map(c => campoCSVSeguro(c)).join(",")).join("\r\n");
     }
 
     // Métricas de aprobación: tiempo promedio y % de rechazo por
