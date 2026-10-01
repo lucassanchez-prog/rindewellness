@@ -94,7 +94,7 @@ Deno.serve(async (req: Request) => {
     const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
     const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
     const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
-    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",1).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
+    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",2).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
     if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
     if (anterior?.resultado) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
 
@@ -138,7 +138,7 @@ Deno.serve(async (req: Request) => {
     }
 
     if (tieneDatosUtiles(resultado)) {
-      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:1,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
+      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:2,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
       if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);
     }
     return new Response(JSON.stringify(resultado), {

@@ -2335,8 +2335,8 @@ function buildConDocumentoFields(id) {
   const fotoInput = foto.querySelector("input[type=file]");
   fotoInput.addEventListener("change", async () => {
     if (!validarTamanoArchivo(fotoInput)) return;
-    await reemplazarConVersionComprimida(fotoInput);
-    if (fotoInput.files && fotoInput.files[0]) analizarComprobante(id, fotoInput.files[0], ocrStatus);
+    nuevaGeneracionOcr(id);
+    await prepararArchivoParaLectura(fotoInput,ocrStatus,file => analizarComprobante(id,file,ocrStatus));
   });
 
   // Si ese RUT ya aparece en la contabilidad, usamos su razón social real
@@ -3240,12 +3240,15 @@ function fusionarLecturas(local, ia, contable) {
       datos.monto_verificado = true;
       avisos.push({ ok: true, texto: `Monto confirmado: la IA leyó el mismo total (${fmtCLP(montoLocal)}).` });
     } else {
-      avisos.push({ ok: false, texto: `⚠ Ojo con el monto: del texto del PDF se leyó ${fmtCLP(montoLocal)}, pero la IA leyó ${fmtCLP(montoIA)}. Se dejó el primero. Confirma cuál corresponde mirando la factura antes de enviar.` });
+      datos.monto = null; datos.monto_verificado = false; datos.monto_discrepante = true;
+      avisos.push({ ok: false, texto: `⚠ Ojo con el monto: del texto del PDF se leyó ${fmtCLP(montoLocal)}, pero la IA leyó ${fmtCLP(montoIA)}. Se requiere confirmación del monto mirando la factura antes de enviar.` });
     }
   } else if (!montoLocal && montoIA) {
     aporteIA.monto = montoIA;
   }
 
+  if (I.verificacion_campos) datos.verificacion_campos = I.verificacion_campos;
+  if (I.analisis_documento) datos.analisis_documento = I.analisis_documento;
   return { datos, aporteIA, avisos };
 }
 
@@ -3489,18 +3492,108 @@ function folioDesdeNombreArchivo(nombre) {
 
 // Devuelve los datos si el PDF traía texto suficiente, o null para que siga
 // el camino normal con IA (PDF escaneado, protegido, o sin los datos clave).
+function clasificarPaginaComprobante(texto) {
+  const t = String(texto || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (/gasto\s+\d+\s*\/\s*\d+|campos adicionales:|monto original|resumen de rendicion|total informe|detalle de gastos incluidos/.test(t)) return "Ficha de rendición";
+  if (/factura/.test(t)) return "Factura";
+  if (/boleta/.test(t)) return "Boleta";
+  if (/transbank|redcompra|comprobante de venta|tarjeta de credito/.test(t)) return "Voucher";
+  if (/transferencia/.test(t)) return "Transferencia";
+  return t.trim().length < 40 ? "Comprobante en imagen" : "Documento";
+}
+
+const preparacionesArchivo = new WeakMap();
+async function prepararArchivoParaLectura(input, status, analizar) {
+  const original = input.files?.[0];
+  preparacionesArchivo.get(input)?.limpiar?.();
+  input.dataset.paginaPendiente = original?.type === "application/pdf" ? "true" : "false";
+  const token = {}; preparacionesArchivo.set(input, token);
+  const vigente = () => preparacionesArchivo.get(input) === token && input.isConnected;
+  input.parentElement.querySelector(".selector-pagina-ocr")?.remove();
+  if (!original) return;
+  try {
+    if (original.type !== "application/pdf") {
+      await reemplazarConVersionComprimida(input);
+      if (vigente() && input.files?.[0]) await analizar(input.files[0]);
+      return;
+    }
+    status.className = "ocr-status show"; status.textContent = "Revisando las páginas del PDF…";
+    const pdfjs = await cargarPdfJs();
+    const pdf = await pdfjs.getDocument({data:await original.arrayBuffer()}).promise;
+    if (!vigente()) {await pdf.destroy(); return;}
+    if (pdf.numPages === 1) {input.dataset.paginaPendiente="false";await pdf.destroy(); await analizar(original); return;}
+    const panel = el("div", {class:"selector-pagina-ocr"});
+    panel.appendChild(el("p", {}, "Este PDF contiene " + pdf.numPages + " páginas. Elige el comprobante de este gasto; las fichas de rendición no son el documento original."));
+    const select = el("select", {"aria-label":"Página del comprobante"});
+    let sugerida = null;
+    for (let n=1;n<=pdf.numPages;n++) {
+      const page = await pdf.getPage(n);
+      const contenido = await page.getTextContent();
+      if (!vigente()) {await pdf.destroy();return;}
+      const tipo = clasificarPaginaComprobante(contenido.items.map(i=>i.str).join(" "));
+      select.appendChild(el("option", {value:String(n)}, "Página " + n + " · " + tipo));
+      if (sugerida === null && tipo !== "Ficha de rendición" && tipo !== "Documento") sugerida=n;
+      status.textContent="Identificando páginas: " + n + " de " + pdf.numPages;
+      page.cleanup();
+    }
+    if (sugerida !== null) select.value=String(sugerida);
+    panel.appendChild(select);
+    const vista = el("img", {alt:"Vista previa de la página seleccionada"}); panel.appendChild(vista);
+    const usar = el("button", {type:"button",class:"btn btn-primary",disabled:true}, "Leer este comprobante"); panel.appendChild(usar);
+    input.parentElement.appendChild(panel);
+    let renderToken=0, archivoPagina=null, url=null;
+    token.limpiar = () => {if(url)URL.revokeObjectURL(url);pdf.destroy();};
+    async function mostrarPagina() {
+      const lectura=++renderToken; usar.disabled=true; archivoPagina=null; input.dataset.paginaPendiente="true";
+      try {
+        const pagina=await pdf.getPage(Number(select.value));
+        const contenido=await pagina.getTextContent();
+        const tipo=clasificarPaginaComprobante(contenido.items.map(i=>i.str).join(" "));
+        const viewport=pagina.getViewport({scale:1});
+        const escala=Math.min(3,2400/Math.max(viewport.width,viewport.height));
+        const v=pagina.getViewport({scale:escala});
+        const canvas=document.createElement("canvas");canvas.width=Math.ceil(v.width);canvas.height=Math.ceil(v.height);
+        await pagina.render({canvasContext:canvas.getContext("2d"),viewport:v}).promise;
+        const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",.94));
+        if (!vigente() || lectura!==renderToken || !blob) return;
+        if (url) URL.revokeObjectURL(url);
+        url=URL.createObjectURL(blob);vista.src=url;
+        panel.querySelector(".pagina-clasificacion")?.remove();
+        panel.insertBefore(el("p", {class:"pagina-clasificacion"}, "Página " + select.value + " · " + tipo),vista);
+        archivoPagina=new File([blob],original.name.replace(/\.pdf$/i,"")+"-pagina-"+select.value+".jpg",{type:"image/jpeg"});
+        usar.disabled=tipo==="Ficha de rendición";
+        status.textContent=tipo==="Ficha de rendición" ? "Esta página es una ficha. Selecciona la página con la boleta, factura o voucher original." : "Confirma la página antes de leerla. Se adjuntará solo este comprobante al gasto.";
+      } catch (error) {if(vigente()){status.textContent="No se pudo preparar esta página. Elige otra o adjunta una foto del comprobante.";status.className="ocr-status show err";}}
+    }
+    select.addEventListener("change",mostrarPagina);
+    usar.addEventListener("click",async()=>{
+      if(!vigente() || !archivoPagina || usar.disabled)return;
+      usar.disabled=true;
+      const dt=new DataTransfer();dt.items.add(archivoPagina);input.files=dt.files;input.dataset.paginaPendiente="false";
+      await analizar(archivoPagina);
+      if(vigente())usar.disabled=false;
+    });
+    await mostrarPagina();
+  } catch(error) {
+    if(vigente()){status.className="ocr-status show err";status.textContent="No se pudo abrir el archivo. Prueba con una foto o un PDF del comprobante original.";}
+  }
+}
+
 async function leerPdfLocal(file) {
   if ((file.type || "") !== "application/pdf") return null;
   try {
     const pdfjs = await cargarPdfJs();
     const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
     let texto = "";
+    if (pdf.numPages !== 1) {await pdf.destroy(); return null;}
     // Tope de páginas: una factura tiene 1-2; leer un PDF enorme entero solo
     // para buscar un RUT no aporta y traba el navegador.
     for (let p = 1; p <= Math.min(pdf.numPages, 3); p++) {
       const contenido = await (await pdf.getPage(p)).getTextContent();
       texto += contenido.items.map((i) => i.str).join(" ") + "\n";
     }
+    if (clasificarPaginaComprobante(texto) === "Ficha de rendición") {await pdf.destroy(); return null;}
+    await pdf.destroy();
     if (texto.trim().length < 50) return null; // PDF escaneado: es una imagen, no hay texto que leer
     const datos = parsearTextoFactura(texto);
     // El piso para considerarlo bueno: RUT válido + monto. Sin esos dos no
@@ -3566,6 +3659,10 @@ async function llamarOcrRecibo(file, camposFaltantes, datosParciales) {
     throw err;
   }
   if (data?.error) throw new Error(data.error);
+  if (data?.requiere_separacion) {
+    const err = new Error(data.aviso_documento || "Selecciona un comprobante por gasto.");
+    err.noReintentar = true; throw err;
+  }
   return data;
 }
 
@@ -3732,9 +3829,11 @@ function montoValidoCLP(valor) {
 // evita pisar datos más nuevos si la persona ya seleccionó otro archivo
 // mientras tanto.
 async function aplicarResultadoOcrCon(id, data, gen) {
+  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}return;}
   if (!esGeneracionVigenteOcr(id, gen)) return;
   mostrarVerificacionOcr(id, data);
   data = protegerEdicionOcr(id, data);
+  if (data.monto_discrepante) {for(const sufijo of ["monto","monto2"]) {const campo=document.getElementById(id+"-"+sufijo);if(campo && !camposEditadosOcr.has(id+"-"+sufijo))campo.value="";}}
   ocrExitoso.set(id, true);
   if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
   if (data.rut_proveedor) {
@@ -3929,6 +4028,7 @@ async function analizarComprobante(id, file, statusEl) {
       : "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
   } catch (err) {
+    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
 
@@ -4053,9 +4153,11 @@ async function mostrarHistorialProveedor(id, nombreProveedor) {
 // Par de aplicarResultadoOcrCon, para "Boleta" (Gasto directo) -- ver el
 // comentario de aquella.
 async function aplicarResultadoOcrSin(id, data, gen) {
+  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}return;}
   if (!esGeneracionVigenteOcr(id, gen)) return;
   mostrarVerificacionOcr(id, data);
   data = protegerEdicionOcr(id, data);
+  if (data.monto_discrepante) {for(const sufijo of ["monto","monto2"]) {const campo=document.getElementById(id+"-"+sufijo);if(campo && !camposEditadosOcr.has(id+"-"+sufijo))campo.value="";}}
   ocrExitoso.set(id, true);
   if (data.nombre_proveedor) {
     document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
@@ -4139,6 +4241,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
     statusEl.className = "ocr-status show ok";
   } catch (err) {
+    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
     // Mismo respaldo que en "Documento electrónico": una foto sin IA
@@ -4242,8 +4345,8 @@ function buildSinDocumentoFields(id) {
   const fotoInput2 = foto.querySelector("input[type=file]");
   fotoInput2.addEventListener("change", async () => {
     if (!validarTamanoArchivo(fotoInput2)) return;
-    await reemplazarConVersionComprimida(fotoInput2);
-    if (fotoInput2.files && fotoInput2.files[0]) analizarComprobanteGastoDirecto(id, fotoInput2.files[0], ocrStatus);
+    nuevaGeneracionOcr(id);
+    await prepararArchivoParaLectura(fotoInput2,ocrStatus,file => analizarComprobanteGastoDirecto(id,file,ocrStatus));
   });
 
   const catSelect = row1.querySelector("select");
@@ -4305,15 +4408,18 @@ async function comprimirImagenSiCorresponde(file) {
   if (!file.type || !file.type.startsWith("image/") || file.type === "image/svg+xml") return file;
   try {
     const bitmap = await createImageBitmap(file);
-    const LADO_MAXIMO = 1600;
+    const LADO_MAXIMO = 2600;
     const escala = Math.min(1, LADO_MAXIMO / Math.max(bitmap.width, bitmap.height));
     const w = Math.round(bitmap.width * escala);
     const h = Math.round(bitmap.height * escala);
     const canvas = document.createElement("canvas");
     canvas.width = w;
     canvas.height = h;
-    canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.75));
+    const contexto = canvas.getContext("2d");
+    contexto.fillStyle = "#fff"; contexto.fillRect(0,0,w,h);
+    contexto.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.94));
     if (!blob || blob.size >= file.size) return file; // no vale la pena si no achica
     return new File([blob], file.name.replace(/\.\w+$/, "") + ".jpg", { type: "image/jpeg" });
   } catch (err) {
@@ -4413,6 +4519,23 @@ async function buscarNombreProveedorPorRut(rut) {
 
 // Verificación contra contabilidad: la hace quien aprueba, desde la pantalla de detalle
 // (ver openDetalle). Actualiza el ítem en la base para dejar registrada la cuenta real.
+function compararMontoContable(item, movimientos) {
+  const cuentaProveedor = CUENTA_POR_TIPO_DOC[item.tipo_documento];
+  const lineas = movimientos.filter(m => m.cuenta_cod === cuentaProveedor);
+  const grupos = new Map();
+  for (const m of lineas) {
+    if (m.debe == null || m.haber == null || !Number.isFinite(Number(m.debe)) || !Number.isFinite(Number(m.haber))) return {estado:"sin_monto"};
+    const clave = m.comprobante || "fila:"+m.id;
+    grupos.set(clave,(grupos.get(clave)||0)+Number(m.haber)-Number(m.debe));
+  }
+  if (!grupos.size) return {estado:"sin_monto"};
+  if (grupos.size !== 1) return {estado:"ambiguo",cantidad:grupos.size};
+  const contable = Math.abs([...grupos.values()][0]);
+  const rendido = Number(item.monto);
+  if (!Number.isFinite(rendido) || !Number.isInteger(contable) || contable <= 0) return {estado:"sin_monto"};
+  return {estado:contable===rendido ? "coincide" : "diferente",contable,rendido,diferencia:rendido-contable};
+}
+
 async function verificarDocumentoItem(item, box, empresaRendicion) {
   box.className = "verify-box show";
   box.textContent = "Consultando...";
@@ -4435,14 +4558,16 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     // que son substring de otros (ej. "277" no debe matchear "#115277").
     let query = dbContabilidad
       .from("movimientos")
-      .select("*")
+      .select("*",{count:"exact"})
       .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor)
       .ilike(MOVIMIENTOS_COLS.folioDoc, `%#${item.nro_documento}`);
     if (empresaRendicion) query = query.ilike(MOVIMIENTOS_COLS.empresa, empresaRendicion);
-    const { data, error } = await query.limit(1);
+    const { data, error, count } = await query.limit(500);
+    if (count != null && count > (data || []).length) throw new Error("Resultado contable incompleto");
     if (error) throw error;
 
     const match = data && data[0];
+    const comparacionMonto = match ? compararMontoContable(item,data) : null;
     const cuenta = (match && match[MOVIMIENTOS_COLS.cuentaCod]) || CUENTA_POR_TIPO_DOC[item.tipo_documento];
     const comprobante = (match && match[MOVIMIENTOS_COLS.comprobante]) || null;
 
@@ -4463,13 +4588,15 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     item.existe_en_contabilidad = !!match;
     item.cuenta_contable = cuenta;
 
-    box.className = "verify-box show " + (match ? "ok" : "no");
-    box.textContent = match
-      ? `✔ Registrada en contabilidad · Cuenta ${cuenta}`
-      : "✘ Todavía no aparece registrada en contabilidad.";
+    box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" ? "ok" : "err");
+    box.textContent = !match ? "✘ Todavía no aparece registrada en contabilidad. El monto no se pudo comprobar."
+      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · Monto coincide: " + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta
+      : comparacionMonto.estado === "diferente" ? "⚠ Documento encontrado, pero el monto difiere. Rendido: " + fmtCLP(comparacionMonto.rendido) + ". Contabilidad: " + fmtCLP(comparacionMonto.contable) + ". Diferencia: " + fmtCLP(comparacionMonto.diferencia) + ". Si distribuiste la factura entre varios gastos, revisa la suma de esas partes."
+      : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
+      : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
   } catch (err) {
     box.className = "verify-box show err";
-    box.textContent = "No se pudo verificar (revisa los nombres de columnas de 'movimientos').";
+    box.textContent = "No se pudo verificar el documento ni el monto. Intenta nuevamente o revisa el registro en contabilidad.";
   }
 }
 
@@ -4487,6 +4614,7 @@ function recalcTotal() {
 }
 
 async function submitRendicion() {
+  if (document.querySelector('#items-container input[data-pagina-pendiente="true"]')) {toast("Selecciona y confirma el comprobante de cada PDF antes de enviar la rendición.");return;}
   const cards = Array.from(document.querySelectorAll(".item-card"));
   if (!cards.length) { toast("Agrega al menos un ítem."); return; }
 

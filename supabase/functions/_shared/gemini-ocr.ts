@@ -1,3 +1,4 @@
+import { revisarEstructuraDocumento } from "./analisis-documento.ts";
 import { verificarCampos } from "./verificacion-ocr.ts";
 // Lógica compartida para leer un comprobante con Gemini: arma el prompt,
 // prueba una cadena de modelos candidatos con reintentos, y valida/limpia
@@ -217,6 +218,17 @@ ni explicaciones, con esta forma (incluye además evidencias por campo):
   "monto_en_palabras": "el total escrito EN LETRAS tal como aparece impreso en el documento, ej: 'CIENTO ONCE MIL CIENTO SETENTA'" o null si el documento no lo trae,
   "categoria_sugerida": una de estas opciones EXACTAS: ${CATEGORIAS.map((c) => `"${c}"`).join(", ")} -- la que mejor calce con el gasto, o null si ninguna calza bien
 }
+Incluye "analisis_documento": {"tipo":"factura"|"boleta"|"voucher"|"transferencia"|"deposito"|"recibo"|"ficha_rendicion"|"mixto"|"otro", "gastos_independientes": número entero o null, "pago_adjunto": boolean, "legibilidad":"buena"|"parcial"|"baja"}.
+Primero distingue páginas de ficha/resumen de rendición y comprobantes originales.
+Los datos de una ficha NO prueban lo impreso en el comprobante. No completes desde
+la ficha del gasto. Si hay gastos independientes, informa su cantidad y no mezcles
+sus campos. Una factura y su voucher por la MISMA compra cuentan como UN gasto:
+prioriza RUT del emisor, folio y total de la factura; no el número de operación del
+voucher. Un voucher solo acredita pago, no sustituye el folio tributario.
+En tickets extensos examina encabezado, desglose de impuestos, TOTAL y sección de
+pago por separado. Una foto borrosa no autoriza reconstruir dígitos ilegibles.
+Descripción: describe únicamente los productos o servicios legibles; no inventes
+participantes, propósito comercial o motivo del gasto. Categoría es una sugerencia.
 Incluye "evidencias": un objeto con las claves nombre_proveedor, rut_proveedor,
 tipo_documento, nro_documento, fecha y monto. Cada una contiene {"texto": la
 transcripción LITERAL que respalda el valor o null, "ubicacion": ubicación
@@ -477,6 +489,9 @@ export function normalizarMonto(valor: unknown): number | null {
 }
 
 export interface ResultadoOcr {
+  analisis_documento?: Record<string, unknown>;
+  requiere_separacion?: boolean;
+  aviso_documento?: string;
   verificacion_campos?: Record<string, unknown>;
   monto_discrepante?: boolean;
   nombre_proveedor: string | null;
@@ -638,6 +653,7 @@ export function interpretarRespuestaOcr(data: any): ResultadoOcr {
     parsed.monto_origen = "palabras";
   }
 
+  revisarEstructuraDocumento(parsed);
   parsed.verificacion_campos = verificarCampos(parsed);
   return parsed as ResultadoOcr;
 }
@@ -646,5 +662,6 @@ export function interpretarRespuestaOcr(data: any): ResultadoOcr {
 // inútil para la persona -- ni ocr-recibo ni ocr-reintento-pendientes
 // deberían tratarlo como éxito silencioso.
 export function tieneDatosUtiles(resultado: ResultadoOcr): boolean {
+  if (resultado.requiere_separacion) return true;
   return ["nombre_proveedor", "rut_proveedor", "monto", "nro_documento"].some((campo) => (resultado as Record<string, unknown>)[campo]);
 }
