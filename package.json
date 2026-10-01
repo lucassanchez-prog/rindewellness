@@ -2,8 +2,12 @@
   "name": "rindewellness",
   "private": true,
   "version": "1.0.0",
-  "description": "RindeWellness -- app de rendición de gastos (frontend estático, sin build step). Este package.json existe solo para correr los tests de pure.js con el test runner incorporado de Node.",
+  "description": "RindeWellness: interfaz, reglas de rendiciones y validación automática.",
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "lint": "eslint app.js pure.js data-access.js sw.js"
+  },
+  "devDependencies": {
+    "eslint": "10.11.0"
   }
 }

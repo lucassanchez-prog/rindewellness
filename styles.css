@@ -872,3 +872,6 @@ button {
 @media(min-width:701px){.fondos-scroll{overflow-x:auto}.fondos-tabla{min-width:1200px}.fondos-tabla td.monto{white-space:nowrap}}
 
 .selector-pagina-ocr{padding:16px;border:1px solid var(--line);border-radius:12px;margin-top:12px;background:var(--paper)}.selector-pagina-ocr p{font-size:.84rem;color:var(--ink-soft)}.selector-pagina-ocr img{display:block;max-width:100%;max-height:420px;object-fit:contain;margin:16px auto;border-radius:6px}.selector-pagina-ocr select{width:100%;padding:12px}.selector-pagina-ocr button{width:100%}
+
+/* Un estado oculto no debe mostrarse por las reglas visuales del OCR. */
+#dashboard-carga-status[hidden]{display:none!important}

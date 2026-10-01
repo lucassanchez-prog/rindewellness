@@ -1,3 +1,4 @@
+import { revisarCompletitud } from "./estado-lectura.ts";
 import { revisarEstructuraDocumento } from "./analisis-documento.ts";
 import { verificarCampos } from "./verificacion-ocr.ts";
 // Lógica compartida para leer un comprobante con Gemini: arma el prompt,
@@ -563,7 +564,7 @@ export async function leerComprobante(
       const otro = interpretarRespuestaOcr(segunda);
       for (const campo of campos) {
         const primeroValor = (primero as any)[campo], segundoValor = (otro as any)[campo];
-        if (!primeroValor && segundoValor && !(primero as any).monto_discrepante) {
+        if (!primeroValor && segundoValor && (campo !== "monto" || !(primero as any).monto_discrepante)) {
           (primero as any)[campo] = segundoValor;
           (primero.verificacion_campos as any)[campo] = (otro.verificacion_campos as any)[campo];
           continue;
@@ -573,7 +574,7 @@ export async function leerComprobante(
         const revision = (primero.verificacion_campos as any)[campo];
         if (normalizar(primeroValor) !== normalizar(segundoValor)) {
           (primero as any)[campo] = null;
-          if (campo === "monto") primero.monto_verificado = false;
+          if (campo === "monto") {primero.monto_verificado = false;primero.monto_discrepante = true;}
           revision.estado = "por_confirmar";
           revision.motivo = "Dos lecturas discrepan: " + String(primeroValor) + " / " + String(segundoValor) + ". Confirma este campo en el comprobante.";
         } else {
@@ -585,7 +586,7 @@ export async function leerComprobante(
       console.error("La segunda revisión OCR no estuvo disponible; se conserva la primera lectura:",error instanceof Error ? error.message : String(error));
     }
   }
-  return primero;
+  return revisarCompletitud(primero as unknown as Record<string, unknown>) as unknown as ResultadoOcr;
 }
 
 export function interpretarRespuestaOcr(data: any): ResultadoOcr {
@@ -655,7 +656,7 @@ export function interpretarRespuestaOcr(data: any): ResultadoOcr {
 
   revisarEstructuraDocumento(parsed);
   parsed.verificacion_campos = verificarCampos(parsed);
-  return parsed as ResultadoOcr;
+  return revisarCompletitud(parsed) as unknown as ResultadoOcr;
 }
 
 // "200 OK con {} o casi vacío" es un resultado válido para Gemini pero

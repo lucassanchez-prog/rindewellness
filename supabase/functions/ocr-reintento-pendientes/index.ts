@@ -1,3 +1,4 @@
+import { revisarCompletitud, estadoTrasIntento } from "../_shared/estado-lectura.ts";
 import { demoraTransitoriaOcr } from "../_shared/reintentos-ocr.ts";
 // Edge Function: ocr-reintento-pendientes
 // El "agente" que vive en Supabase que reintenta, en segundo plano, los
@@ -231,16 +232,26 @@ async function procesarPendiente(
     // fallara la llamada en vivo. Se le dice a Gemini qué falta y qué ya se
     // sabe: la solicitud cuesta lo mismo, pero rinde más y no se gasta en
     // releer lo ya leído.
-    const faltantes = camposFaltantesDe(datosParciales);
+    // Recupera los campos guardados y la lectura anterior dentro de la reserva.
+    const columnasLectura=tabla === "ocr_previos" ? "datos_parciales,resultado" : "tipo_item,nombre_proveedor,rut_proveedor,tipo_documento,nro_documento,fecha_vencimiento,monto,descripcion,ocr_reintento_resultado";
+    const {data:actual,error:errorActual}=await admin.from(tabla).select(columnasLectura).eq("id",id).eq("ocr_lease_token",token).maybeSingle();
+    if(errorActual || !actual) throw errorActual || new Error("La reserva OCR dejó de estar vigente.");
+    const previo=(tabla === "ocr_previos" ? actual.resultado : actual.ocr_reintento_resultado) || {};
+    const guardados=tabla === "ocr_previos" ? (actual.datos_parciales || datosParciales || {}) : {...actual,fecha:actual.fecha_vencimiento};
+    const conocidos={...previo,...Object.fromEntries(Object.entries(guardados).filter(([,v])=>v !== null && v !== undefined && v !== ""))};
+    const faltantes = camposFaltantesDe(conocidos);
     const resultado = await leerComprobante(admin, base64, mimeType, PRESUPUESTO_SEGUNDO_PLANO, {
       camposFaltantes: faltantes,
-      datosParciales,
+      datosParciales: conocidos,
     });
 
     if (!tieneDatosUtiles(resultado)) throw new Error("No se obtuvo ningún campo legible del comprobante.");
+    const revision=revisarCompletitud({...previo,...fusionarConParciales(datosParciales, resultado),monto_discrepante:!!resultado.monto_discrepante},conocidos);
+    const siguiente=estadoTrasIntento(revision,intentosPrevios+1,MAX_INTENTOS);
     await guardar({
-      [col.estado]: "listo",
-      [col.resultado]: fusionarConParciales(datosParciales, resultado),
+      ocr_lease_hasta:siguiente === "pendiente" ? new Date(Date.now()+5*60*1000).toISOString() : null,
+      [col.estado]: siguiente,
+      [col.resultado]: revision,
       [col.intentos]: intentosPrevios + 1,
       [col.ultimo]: new Date().toISOString(),
     });

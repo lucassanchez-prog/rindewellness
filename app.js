@@ -677,19 +677,7 @@ function wireDashboard() {
 // Cache de la última carga, para poder filtrar sin volver a golpear la base.
 const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [], consumoFondos: new Map() };
 
-// Tope de seguridad para las listas de "Mis rendiciones"/"Mis solicitudes"
-// -- sin esto, el historial de alguien con años de antigüedad crece sin
-// límite y cada carga del dashboard se pone más lenta con el tiempo. OJO:
-// a propósito NO se le pone límite a la consulta de "aprobaciones" que ve
-// el admin más abajo -- Reportes (openReportes/renderReportes) depende de
-// que dashboardData.aprobaciones tenga TODO el histórico para calcular
-// tendencias, anomalías y presupuestos; limitarla rompería esos cálculos
-// en silencio, sin ningún error que lo delate. Si esto llega a pesar
-// demasiado, la solución real es una consulta de agregación server-side
-// para Reportes (no depender de traer todas las filas al navegador), no
-// un límite acá.
-const TOPE_LISTA_PROPIA = 300;
-
+// Los indicadores y filtros se calculan sobre consultas completas.
 function resumirConsumoFondo(rendiciones, montoFondo) {
   const vigentes = (rendiciones || []).filter(r => r.estado === "Pendiente" || r.estado === "Aprobado");
   const consumido = vigentes.reduce((sum,r) => sum + Number(r.monto_total || 0),0);
@@ -719,24 +707,22 @@ async function cargarConsumoFondos(solicitudes) {
   return resultado;
 }
 
+// Recorre todas las páginas y rechaza resultados truncados o inconsistentes.
+const {consultarTodas} = window.RindeData;
+
+let dashboardCarga=0;
 async function loadDashboard() {
-  const { data: mias } = await db
-    .from("rendiciones")
-    .select("*")
-    .eq("empleado_id", currentUser.id)
-    .order("created_at", { ascending: false })
-    .limit(TOPE_LISTA_PROPIA);
-  dashboardData.mias = mias || [];
+  const gen=++dashboardCarga, usuario=currentUser, perfil=currentProfile;
+  if(!usuario || !perfil)return;
+  const nuevo={...dashboardData};
+  const aviso=document.getElementById("dashboard-carga-status");
+  if(aviso){aviso.hidden=false;aviso.textContent="Actualizando rendiciones y montos…";}
+  try {
+  nuevo.mias=await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).eq("empleado_id",usuario.id).order("created_at",{ascending:false}).order("id"));
 
-  const { data: solicitudesMias } = await db
-    .from("solicitudes_fondos")
-    .select("*")
-    .eq("empleado_id", currentUser.id)
-    .order("created_at", { ascending: false })
-    .limit(TOPE_LISTA_PROPIA);
-  dashboardData.solicitudesMias = solicitudesMias || [];
+  nuevo.solicitudesMias=await consultarTodas(() => db.from("solicitudes_fondos").select("*",{count:"exact"}).eq("empleado_id",usuario.id).order("created_at",{ascending:false}).order("id"));
 
-  if (esAprobadorEfectivo(currentProfile)) {
+  if (esAprobadorEfectivo(perfil)) {
     // Aprobadores y admin ven TODAS las rendiciones del grupo, en cualquier
     // estado. Antes un aprobador solo recibía las que estaban Pendiente, y
     // eso le tapaba justamente el contexto con el que se aprueba bien: qué
@@ -748,31 +734,34 @@ async function loadDashboard() {
     //
     // La base ya lo permitía: la policy rendiciones_select habilita a
     // 'aprobador' y 'admin' por igual. El límite era solo de la app.
-    const { data: todas } = await db.from("rendiciones").select("*").order("created_at", { ascending: false });
-    dashboardData.aprobaciones = todas || [];
+    const todas = await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).order("created_at", { ascending: false }).order("id"));
+    nuevo.aprobaciones = todas || [];
     document.getElementById("tab-aprobaciones").textContent = "Todas las rendiciones";
 
-    let querySolicitudes = db.from("solicitudes_fondos").select("*");
-    querySolicitudes = currentProfile.rol === "admin"
+    const crearQuerySolicitudes = () => { let querySolicitudes = db.from("solicitudes_fondos").select("*",{count:"exact"});
+    querySolicitudes = perfil.rol === "admin"
       ? querySolicitudes.order("created_at", { ascending: false })
       : querySolicitudes.eq("estado", "Pendiente").order("created_at", { ascending: true });
-    const { data: solicitudesPendientes } = await querySolicitudes;
-    dashboardData.solicitudesAprobacion = solicitudesPendientes || [];
+    return querySolicitudes.order("id"); };
+    const solicitudesPendientes = await consultarTodas(crearQuerySolicitudes);
+    nuevo.solicitudesAprobacion = solicitudesPendientes || [];
     document.getElementById("tab-solicitudes-aprobacion").textContent =
-      currentProfile.rol === "admin" ? "Todas las solicitudes de fondos" : "Solicitudes de fondos pendientes";
+      perfil.rol === "admin" ? "Todas las solicitudes de fondos" : "Solicitudes de fondos pendientes";
   } else {
-    dashboardData.aprobaciones = [];
-    dashboardData.solicitudesAprobacion = [];
+    nuevo.aprobaciones = [];
+    nuevo.solicitudesAprobacion = [];
   }
 
-  dashboardData.consumoFondos = await cargarConsumoFondos([...dashboardData.solicitudesMias,...dashboardData.solicitudesAprobacion]);
+  nuevo.consumoFondos = await cargarConsumoFondos([...nuevo.solicitudesMias,...nuevo.solicitudesAprobacion]);
 
-  // El admin ve totales de TODA la empresa (ya tiene los datos: dashboardData.aprobaciones
+  // El admin ve totales de TODA la empresa (ya tiene los datos: nuevo.aprobaciones
   // trae cada rendición, sin filtrar por estado, cuando el rol es admin) --
   // antes siempre se mostraban los propios, aunque quien mirara fuera admin
   // y le sirviera más ver el conjunto completo de un vistazo.
-  const esAdmin = currentProfile?.rol === "admin";
-  const paraStats = esAdmin ? dashboardData.aprobaciones : dashboardData.mias;
+  if(gen!==dashboardCarga || currentUser?.id!==usuario.id)return;
+  Object.assign(dashboardData,nuevo);
+  const esAdmin = perfil?.rol === "admin";
+  const paraStats = esAdmin ? nuevo.aprobaciones : nuevo.mias;
   const pendienteStats = paraStats.filter((r) => r.estado === "Pendiente");
   const pendiente = pendienteStats.reduce((s, r) => s + Number(r.monto_total), 0);
   const aprobado = paraStats.filter((r) => r.estado === "Aprobado").reduce((s, r) => s + Number(r.monto_total), 0);
@@ -784,6 +773,13 @@ async function loadDashboard() {
   renderStats(pendiente, aprobado, paraStats.length, esAdmin, antiguas);
 
   applyDashboardFilters();
+  if(aviso)aviso.hidden=true;
+  } catch (error) {
+    if(gen!==dashboardCarga || currentUser?.id!==usuario.id)return;
+    if(aviso){aviso.hidden=false;aviso.textContent="No se pudieron actualizar los datos. Se conserva la última lectura disponible. ";aviso.appendChild(el("button",{type:"button",class:"btn btn-ghost",onclick:loadDashboard},"Reintentar"));}
+    console.error("No se pudo cargar el dashboard completo",error);
+    toast("No se pudieron actualizar los datos completos. Intenta nuevamente; los montos no se han recalculado.");
+  }
 }
 
 function normalizarBusquedaEmpleado(texto) {
@@ -2112,6 +2108,9 @@ function openNuevaRendicion(pushHistory = true) {
   //    segundo plano nunca lo toma, sin ninguna señal visible.
   ocrGeneracion.clear();
   ocrExitoso.clear();
+  ocrArchivoActual.clear();
+  ocrBloqueado.clear();
+  ocrConflictos.clear();
   ocrOrigen.clear();
   ocrMonto.clear();
   addItemRow();
@@ -3208,11 +3207,18 @@ function fusionarLecturas(local, ia, contable) {
   const datos = {};
   const aporteIA = {};
   const avisos = [];
+  const conflictos = new Set((Array.isArray(I.campos_discrepantes) ? I.campos_discrepantes : []).filter(c => ["rut_proveedor","tipo_documento","nro_documento","fecha","monto"].includes(c)));
 
   // Determinista primero: lo local manda, la IA solo rellena.
   ["rut_proveedor", "tipo_documento", "nro_documento", "fecha"].forEach((campo) => {
     datos[campo] = L[campo] || I[campo] || null;
     if (!L[campo] && I[campo]) aporteIA[campo] = I[campo];
+    const normalizar = v => campo === "rut_proveedor" ? String(v).replace(/[^0-9kK]/g,"").toUpperCase() : campo === "nro_documento" ? String(v).trim().replace(/^0+(?=\d)/,"") : String(v).normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim().toLowerCase();
+    const revision=I.verificacion_campos?.[campo];
+    if ((L[campo] && I[campo] && normalizar(L[campo])!==normalizar(I[campo])) || (revision?.estado === "por_confirmar" && /discrepan|contradict/i.test(revision.motivo || ""))) {
+      conflictos.add(campo);
+      avisos.push({ok:false,texto:"Hay lecturas contradictorias del campo "+campo+". Confirma el valor mirando el comprobante."});
+    }
   });
 
   // Contabilidad manda: son datos de personas y de asientos reales, no de
@@ -3247,7 +3253,16 @@ function fusionarLecturas(local, ia, contable) {
     aporteIA.monto = montoIA;
   }
 
-  if (I.verificacion_campos) datos.verificacion_campos = I.verificacion_campos;
+  if (L.monto_discrepante || I.monto_discrepante || datos.monto_discrepante) {
+    datos.monto=null; datos.monto_verificado=false; datos.monto_discrepante=true;
+    aporteIA.monto=null; aporteIA.monto_discrepante=true; aporteIA.monto_verificado=false;
+    if (!avisos.some(a => !a.ok)) avisos.push({ok:false,texto:"El comprobante contiene montos contradictorios. Confirma el total mirando el documento antes de enviar."});
+  }
+  if (datos.monto_discrepante) conflictos.add("monto");
+  for(const campo of conflictos){datos[campo]=null;aporteIA[campo]=null;}
+  if(conflictos.size){datos.campos_discrepantes=[...conflictos];aporteIA.campos_discrepantes=[...conflictos];}
+  if (I.requiere_separacion) {datos.requiere_separacion=true; datos.aviso_documento=I.aviso_documento || "Este archivo requiere separar los comprobantes por gasto."; aporteIA.requiere_separacion=true; aporteIA.aviso_documento=datos.aviso_documento;}
+  if (I.verificacion_campos) {datos.verificacion_campos=I.verificacion_campos;aporteIA.verificacion_campos=I.verificacion_campos;}
   if (I.analisis_documento) datos.analisis_documento = I.analisis_documento;
   return { datos, aporteIA, avisos };
 }
@@ -3277,13 +3292,15 @@ async function completarConIA({ id, file, gen, statusEl, local, contable, datos,
 
     const { datos: fusion, aporteIA, avisos } = fusionarLecturas(local, ia, contableFinal);
     mostrarVerificacionOcr(id, ia);
-    await aplicar(id, aporteIA, gen);
+    const revisionAplicada = await aplicar(id, aporteIA, gen);
+    if (revisionAplicada?.estado === "requiere_separacion" || revisionAplicada?.estado === "obsoleto") return;
     if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
     // La IA aportó algo: queda registrado como origen mixto. Y el monto pudo
     // pasar a confirmado justo acá, si los dos lectores leyeron el mismo
     // total -- dos fuentes independientes que coinciden valen tanto como la
     // aritmética del documento.
     registrarOrigenOcr(id, local ? "local+ia" : "ia", fusion);
+    if(ia.previaId)dispararAgenteYEsperar(id,ia.previaId,gen,(data,g)=>aplicar(id,data,g),statusEl);
 
     // Una discrepancia de monto se come el mensaje entero: es lo único que
     // hay que mirar antes de enviar, y mezclarlo con "la IA completó el
@@ -3297,9 +3314,10 @@ async function completarConIA({ id, file, gen, statusEl, local, contable, datos,
     const llenados = Object.keys(aporteIA).filter((c) => campos.includes(c)).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
     const extra = (llenados.length ? ` La IA completó lo que faltaba: ${llenados.join(", ")}.` : "")
       + avisos.map((a) => ` ${a.texto}`).join("");
-    statusEl.textContent = `${textoBase}${extra}`;
-    statusEl.className = "ocr-status show ok";
+    statusEl.textContent = `${textoBase}${extra} ${revisionAplicada?.mensaje || ""}`;
+    statusEl.className = "ocr-status show " + (revisionAplicada?.estado === "completo" ? "ok" : "err");
   } catch (err) {
+    if (err.noReintentar && esGeneracionVigenteOcr(id,gen)) {ocrBloqueado.add(id);statusEl.textContent=err.message;statusEl.className="ocr-status show err";return;}
     // Que falle la segunda fuente no es un problema: la lectura local ya
     // llenó los campos. Se registra y se sigue, sin alarmar a nadie.
     console.error("No se pudieron completar los campos faltantes con la IA:", err);
@@ -3511,6 +3529,7 @@ async function prepararArchivoParaLectura(input, status, analizar) {
   const vigente = () => preparacionesArchivo.get(input) === token && input.isConnected;
   input.parentElement.querySelector(".selector-pagina-ocr")?.remove();
   if (!original) return;
+  nuevaGeneracionOcr(input.id.replace(/-foto2?$/, ""));
   try {
     if (original.type !== "application/pdf") {
       await reemplazarConVersionComprimida(input);
@@ -3701,11 +3720,13 @@ function mostrarVerificacionOcr(id, data) {
 }
 
 const ocrGeneracion = new Map();
-function nuevaGeneracionOcr(id) {
-  for (const campo of camposEditadosOcr) if (campo.startsWith(id+"-")) camposEditadosOcr.delete(campo);
+const ocrArchivoActual = new Map();
+function nuevaGeneracionOcr(id, conservarEdiciones = false) {
+  if (!conservarEdiciones) for (const campo of camposEditadosOcr) if (campo.startsWith(id+"-")) camposEditadosOcr.delete(campo);
   document.getElementById(id)?.querySelector(".ocr-verificacion")?.remove();
   const gen = (ocrGeneracion.get(id) || 0) + 1;
   ocrGeneracion.set(id, gen);
+  if(!conservarEdiciones){ocrBloqueado.delete(id);ocrConflictos.delete(id);}
   return gen;
 }
 function esGeneracionVigenteOcr(id, gen) {
@@ -3719,6 +3740,8 @@ function esGeneracionVigenteOcr(id, gen) {
 // migracion_ocr_reintento.sql) lo sigue intentando cada 5 minutos aunque la
 // persona ya haya cerrado el navegador.
 const ocrExitoso = new Map();
+const ocrBloqueado = new Set();
+const ocrConflictos = new Map();
 
 // Encolar tiene un costo real: cada reintento del agente gasta solicitudes de
 // la cuota gratuita de Gemini, que es de ~20 por modelo AL DÍA. Antes se
@@ -3727,8 +3750,35 @@ const ocrExitoso = new Map();
 // durante horas para "sugerir" exactamente lo que ya estaba en pantalla, y
 // esa cuota le faltaba después a un comprobante que sí la necesitaba. Solo
 // vale la pena encolar si queda algún hueco que el agente pueda llenar.
+function aplicarConflictosOcr(id,data) {
+  const conflictos=new Set(ocrConflictos.get(id) || []);
+  for(const campo of [...(data.campos_discrepantes || []),...(data.monto_discrepante ? ["monto"] : [])]) {
+    if(!SUFIJOS_OCR[campo])continue;
+    conflictos.add(campo);
+    for(const sufijo of SUFIJOS_OCR[campo]){
+      const entrada=document.getElementById(id+"-"+sufijo);
+      if(entrada && !camposEditadosOcr.has(id+"-"+sufijo))entrada.value="";
+    }
+  }
+  ocrConflictos.set(id,[...conflictos]);
+}
+function conflictosSinConfirmar(id) {
+  return (ocrConflictos.get(id)||[]).filter(c => !SUFIJOS_OCR[c]?.some(s => camposEditadosOcr.has(id+"-"+s)));
+}
+function estadoLecturaFormulario(id, directo, data) {
+  const campos=directo ? ["nombreprov2","fecha2","monto2","desc2"] : ["nombreprov","rut","tipodoc","folio","venc","monto","desc"];
+  const etiquetas={nombreprov:"Proveedor",nombreprov2:"Proveedor",rut:"RUT",tipodoc:"Documento",folio:"Folio",venc:"Fecha",fecha2:"Fecha",monto:"Monto",monto2:"Monto",desc:"Descripción",desc2:"Descripción"};
+  const faltantes=campos.filter(s => !document.getElementById(id+"-"+s)?.value?.trim());
+  const pendientesConflicto=conflictosSinConfirmar(id);
+  const conflicto=pendientesConflicto.length>0 || (data.monto_discrepante && !["monto","monto2"].some(s => camposEditadosOcr.has(id+"-"+s)));
+  const completo=!faltantes.length && !conflicto;
+  ocrExitoso.set(id,completo);
+  return {estado:conflicto ? "conflicto" : completo ? "completo" : "parcial",mensaje:conflicto ? "Datos contradictorios: confirma "+(pendientesConflicto.join(", ") || "monto")+" mirando el comprobante." : completo ? "Lectura completa. Revisa los datos y su evidencia; se conservaron tus correcciones." : "Lectura parcial. Falta revisar: "+faltantes.map(s => etiquetas[s]).join(", ")+". El agente puede reintentar los campos pendientes."};
+}
+
 function estadoReintentoOcr(id, huecos) {
-  if (ocrExitoso.get(id) === true) return null;
+  // Una respuesta parcial no cancela la cola de campos pendientes.
+  if (ocrBloqueado.has(id)) return null;
   return huecos.some((v) => !v) ? "pendiente" : null;
 }
 
@@ -3829,11 +3879,12 @@ function montoValidoCLP(valor) {
 // evita pisar datos más nuevos si la persona ya seleccionó otro archivo
 // mientras tanto.
 async function aplicarResultadoOcrCon(id, data, gen) {
-  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}return;}
+  if (!esGeneracionVigenteOcr(id, gen)) return {estado:"obsoleto"};
+  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}ocrBloqueado.add(id);return {estado:"requiere_separacion",mensaje:data.aviso_documento};}
   if (!esGeneracionVigenteOcr(id, gen)) return;
   mostrarVerificacionOcr(id, data);
   data = protegerEdicionOcr(id, data);
-  if (data.monto_discrepante) {for(const sufijo of ["monto","monto2"]) {const campo=document.getElementById(id+"-"+sufijo);if(campo && !camposEditadosOcr.has(id+"-"+sufijo))campo.value="";}}
+  aplicarConflictosOcr(id,data);
   ocrExitoso.set(id, true);
   if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
   if (data.rut_proveedor) {
@@ -3882,6 +3933,7 @@ async function aplicarResultadoOcrCon(id, data, gen) {
     }
   }
   if (esGeneracionVigenteOcr(id, gen)) { recalcTotal(); chequearDuplicadoHistorico(id); }
+  return estadoLecturaFormulario(id,false,data);
 }
 
 // Dispara el agente de reintento en segundo plano AHORA MISMO (en vez de
@@ -3898,8 +3950,8 @@ function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
   notificarAsync("ocr-reintento-pendientes", {}, "No se pudo disparar el reintento inmediato de OCR:");
 
   const INTERVALO_MS = 5000;
-  const MAX_SONDEOS = 18; // ~90s de sondeo -- pasado eso, se deja que el cron lo siga intentando solo, sin seguir consultando desde un formulario que quizás ni sigue abierto
-  let intento = 0;
+  const MAX_SONDEOS = 24; // ~90s de sondeo -- pasado eso, se deja que el cron lo siga intentando solo, sin seguir consultando desde un formulario que quizás ni sigue abierto
+  let intento = 0, ultimaLectura = null;
   const sondear = async () => {
     intento++;
     // Se corta en silencio (no es un error, es solo dejar de esperar) si:
@@ -3908,13 +3960,15 @@ function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
     if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
     const { data, error } = await db.from("ocr_previos").select("estado, resultado").eq("id", previaId).maybeSingle();
     if (error || !data) return;
-    if (data.estado === "listo" && data.resultado) {
-      await aplicar(data.resultado, gen);
-      if (esGeneracionVigenteOcr(id, gen)) {
-        statusEl.textContent = "El agente completó la lectura. Revisa los campos y su evidencia; se conservaron tus correcciones.";
-        statusEl.className = "ocr-status show ok";
+    const huella = data.resultado ? JSON.stringify(data.resultado) : null;
+    if (data.resultado && huella !== ultimaLectura) {
+      ultimaLectura = huella;
+      const resultado = await aplicar(data.resultado, gen);
+      if (esGeneracionVigenteOcr(id, gen) && resultado?.estado !== "obsoleto") {
+        statusEl.textContent = resultado?.mensaje || "Lectura parcial: revisa los campos pendientes y su evidencia.";
+        statusEl.className = "ocr-status show " + (resultado?.estado === "completo" ? "ok" : "err");
       }
-      return;
+      if (data.estado === "listo" || data.estado === "agotado") return;
     }
     if (data.estado === "agotado" || intento >= MAX_SONDEOS) return;
     setTimeout(sondear, INTERVALO_MS);
@@ -3944,8 +3998,10 @@ function limpiarCamposDeComprobante(ids) {
 }
 
 async function analizarComprobante(id, file, statusEl) {
-  const gen = nuevaGeneracionOcr(id);
-  limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`, `${id}-tipodoc`, `${id}-categoriacon`]);
+  const esReintento=ocrArchivoActual.get(id)===file;
+  const gen = nuevaGeneracionOcr(id,esReintento);
+  ocrArchivoActual.set(id,file);
+  if(!esReintento)limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`, `${id}-tipodoc`, `${id}-categoriacon`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -3978,7 +4034,7 @@ async function analizarComprobante(id, file, statusEl) {
 
       const { datos } = fusionarLecturas(datosLocales, null, contable);
       registrarOrigenOcr(id, "local", datos);
-      await aplicarResultadoOcrCon(id, datos, gen);
+      const revisionLocal=await aplicarResultadoOcrCon(id, datos, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
       // Se dice explícitamente si el monto quedó CONFIRMADO por la
       // aritmética del documento: sirve para dirigir la revisión al dato que
@@ -3995,8 +4051,8 @@ async function analizarComprobante(id, file, statusEl) {
       } else {
         textoBase = `✔ Datos leídos del PDF de la factura.${montoOk} Revísalos antes de enviar.`;
       }
-      statusEl.textContent = textoBase;
-      statusEl.className = "ocr-status show ok";
+      statusEl.textContent = textoBase+" "+(revisionLocal?.mensaje || "");
+      statusEl.className = "ocr-status show " + (revisionLocal?.estado === "completo" ? "ok" : "err");
 
       // Acá está el ahorro: la IA se llama SOLO si después de lo local y de
       // contabilidad todavía quedaron huecos (o el monto no lo confirmó la
@@ -4020,15 +4076,14 @@ async function analizarComprobante(id, file, statusEl) {
     if (!esGeneracionVigenteOcr(id, gen)) return;
     const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
     registrarOrigenOcr(id, "ia", datosIA);
-    await aplicarResultadoOcrCon(id, datosIA, gen);
+    const revision = await aplicarResultadoOcrCon(id, datosIA, gen);
+    if(ia.previaId)dispararAgenteYEsperar(id,ia.previaId,gen,(data,g)=>aplicarResultadoOcrCon(id,data,g),statusEl);
     if (!esGeneracionVigenteOcr(id, gen)) return;
 
-    statusEl.textContent = contableIA.desdeContabilidad
-      ? `✔ Datos completados con IA. Categoría sugerida: "${contableIA.categoria}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalos antes de enviar.`
-      : "✔ Datos completados con IA. Revísalos antes de enviar.";
-    statusEl.className = "ocr-status show ok";
+    statusEl.textContent = revision?.mensaje || "Revisa los campos pendientes.";
+    statusEl.className = "ocr-status show " + (revision?.estado === "completo" ? "ok" : "err");
   } catch (err) {
-    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
+    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {ocrBloqueado.add(id);statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
 
@@ -4153,11 +4208,12 @@ async function mostrarHistorialProveedor(id, nombreProveedor) {
 // Par de aplicarResultadoOcrCon, para "Boleta" (Gasto directo) -- ver el
 // comentario de aquella.
 async function aplicarResultadoOcrSin(id, data, gen) {
-  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}return;}
+  if (!esGeneracionVigenteOcr(id, gen)) return {estado:"obsoleto"};
+  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}ocrBloqueado.add(id);return {estado:"requiere_separacion",mensaje:data.aviso_documento};}
   if (!esGeneracionVigenteOcr(id, gen)) return;
   mostrarVerificacionOcr(id, data);
   data = protegerEdicionOcr(id, data);
-  if (data.monto_discrepante) {for(const sufijo of ["monto","monto2"]) {const campo=document.getElementById(id+"-"+sufijo);if(campo && !camposEditadosOcr.has(id+"-"+sufijo))campo.value="";}}
+  aplicarConflictosOcr(id,data);
   ocrExitoso.set(id, true);
   if (data.nombre_proveedor) {
     document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
@@ -4187,11 +4243,14 @@ async function aplicarResultadoOcrSin(id, data, gen) {
     }
   }
   if (esGeneracionVigenteOcr(id, gen)) { recalcTotal(); chequearDuplicadoHistorico(id); }
+  return estadoLecturaFormulario(id,true,data);
 }
 
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
-  const gen = nuevaGeneracionOcr(id);
-  limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-cuenta`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
+  const esReintento=ocrArchivoActual.get(id)===file;
+  const gen = nuevaGeneracionOcr(id,esReintento);
+  ocrArchivoActual.set(id,file);
+  if(!esReintento)limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-cuenta`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
@@ -4205,7 +4264,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
       if (!esGeneracionVigenteOcr(id, gen)) return;
       const { datos } = fusionarLecturas(datosLocales, null, contable);
       registrarOrigenOcr(id, "local", datos);
-      await aplicarResultadoOcrSin(id, datos, gen);
+      const revisionLocal=await aplicarResultadoOcrSin(id, datos, gen);
       if (!esGeneracionVigenteOcr(id, gen)) return;
 
       // Si el PDF resultó ser una factura/boleta de honorarios, lo más
@@ -4216,8 +4275,8 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
       const textoBase = esDocumentoTributario
         ? `✔ Datos leídos del PDF. Ojo: parece ser un(a) ${datos.tipo_documento}, que normalmente va en la pestaña "Documento electrónico". Revísalo antes de enviar.`
         : "✔ Datos leídos del PDF. Revísalos antes de enviar.";
-      statusEl.textContent = textoBase;
-      statusEl.className = "ocr-status show ok";
+      statusEl.textContent = textoBase+" "+(revisionLocal?.mensaje || "");
+      statusEl.className = "ocr-status show " + (revisionLocal?.estado === "completo" ? "ok" : "err");
 
       // Se pide a la IA solo lo que ESTE formulario puede mostrar: pedirle
       // folio o tipo de documento acá sería gastar cuota en campos que no
@@ -4235,13 +4294,14 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
     if (!esGeneracionVigenteOcr(id, gen)) return;
     const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
     registrarOrigenOcr(id, "ia", datosIA);
-    await aplicarResultadoOcrSin(id, datosIA, gen);
+    const revision = await aplicarResultadoOcrSin(id, datosIA, gen);
+    if(ia.previaId)dispararAgenteYEsperar(id,ia.previaId,gen,(data,g)=>aplicarResultadoOcrSin(id,data,g),statusEl);
     if (!esGeneracionVigenteOcr(id, gen)) return;
 
-    statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
-    statusEl.className = "ocr-status show ok";
+    statusEl.textContent = revision?.mensaje || "Revisa los campos pendientes.";
+    statusEl.className = "ocr-status show " + (revision?.estado === "completo" ? "ok" : "err");
   } catch (err) {
-    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
+    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {ocrBloqueado.add(id);statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
     if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
     // Mismo respaldo que en "Documento electrónico": una foto sin IA
@@ -4432,10 +4492,38 @@ async function comprimirImagenSiCorresponde(file) {
 // que tanto el OCR como submitRendicion() (que lee fotoInput.files[0] más
 // tarde) usen la misma versión liviana. DataTransfer es la única forma
 // estándar de reescribir la FileList de un input desde JS.
+function evaluarCalidadFoto(ancho,alto,contraste) {
+  const avisos=[];
+  if(Math.min(ancho,alto)<600) avisos.push("La resolución es baja: usa una foto más cercana, con el documento completo.");
+  if(contraste<12) avisos.push("La imagen tiene muy poco contraste: mejora la luz y comprueba que se lean los números.");
+  return avisos;
+}
+async function mostrarCalidadFoto(input,file) {
+  input.parentElement.querySelector(".calidad-foto")?.remove();
+  if(!file.type?.startsWith("image/")) return;
+  let bitmap;
+  try {
+    bitmap=await createImageBitmap(file);
+    const canvas=document.createElement("canvas"),escala=Math.min(1,256/Math.max(bitmap.width,bitmap.height));
+    canvas.width=Math.max(1,Math.round(bitmap.width*escala));canvas.height=Math.max(1,Math.round(bitmap.height*escala));
+    const contexto=canvas.getContext("2d");contexto.fillStyle="#fff";contexto.fillRect(0,0,canvas.width,canvas.height);contexto.drawImage(bitmap,0,0,canvas.width,canvas.height);
+    const rgba=contexto.getImageData(0,0,canvas.width,canvas.height).data;let suma=0,cuadrados=0;
+    for(let i=0;i<rgba.length;i+=4){const gris=0.299*rgba[i]+0.587*rgba[i+1]+0.114*rgba[i+2];suma+=gris;cuadrados+=gris*gris;}
+    const n=rgba.length/4,contraste=Math.sqrt(Math.max(0,cuadrados/n-(suma/n)**2));
+    const avisos=evaluarCalidadFoto(bitmap.width,bitmap.height,contraste);
+    if(input.files?.[0]!==file)return;
+    input.parentElement.querySelector(".calidad-foto")?.remove();
+    if(avisos.length)input.parentElement.appendChild(el("p",{class:"calidad-foto ocr-status show err"},avisos.join(" ")+" Evita sombras y reflejos; vuelve a adjuntar una foto mejor si el texto no es legible."));
+  } catch(error){console.warn("No se pudo revisar la calidad de la foto",error);}
+  finally {bitmap?.close();}
+}
+
 async function reemplazarConVersionComprimida(input) {
   const original = input.files && input.files[0];
   if (!original) return;
+  await mostrarCalidadFoto(input,original);
   const comprimido = await comprimirImagenSiCorresponde(original);
+  if (input.files?.[0] !== original) return;
   if (comprimido === original) return;
   const dt = new DataTransfer();
   dt.items.add(comprimido);
@@ -4536,7 +4624,7 @@ function compararMontoContable(item, movimientos) {
   return {estado:contable===rendido ? "coincide" : "diferente",contable,rendido,diferencia:rendido-contable};
 }
 
-async function verificarDocumentoItem(item, box, empresaRendicion) {
+async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicion = [item]) {
   box.className = "verify-box show";
   box.textContent = "Consultando...";
 
@@ -4567,7 +4655,8 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     if (error) throw error;
 
     const match = data && data[0];
-    const comparacionMonto = match ? compararMontoContable(item,data) : null;
+    const grupo = window.RindeCore.grupoDocumentoContable(item,itemsRendicion);
+    const comparacionMonto = match ? compararMontoContable({...item,monto:grupo.monto},data) : null;
     const cuenta = (match && match[MOVIMIENTOS_COLS.cuentaCod]) || CUENTA_POR_TIPO_DOC[item.tipo_documento];
     const nombreCuentaVerificada = (match && match[MOVIMIENTOS_COLS.cuentaNom]) || nombreCuenta(cuenta) || "Nombre no disponible";
     const comprobante = (match && match[MOVIMIENTOS_COLS.comprobante]) || null;
@@ -4580,6 +4669,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
       existe_en_contabilidad: !!match,
       cuenta_contable: cuenta,
       comprobante_contable_encontrado: comprobante,
+      verificacion_contable: {empresa_revisada:empresaRendicion || null,estado:comparacionMonto?.estado || "no_encontrado",monto_rendido:Number(item.monto),monto_documento_rendido:grupo.monto,miembros:grupo.miembros,monto_contable:comparacionMonto?.contable ?? null,diferencia:comparacionMonto?.diferencia ?? null,cuenta,nombre_cuenta:nombreCuentaVerificada,comprobante,rut_proveedor:item.rut_proveedor,tipo_documento:item.tipo_documento,nro_documento:item.nro_documento},
     });
     if (!res.ok) {
       box.className = "verify-box show err";
@@ -4588,10 +4678,11 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     }
     item.existe_en_contabilidad = !!match;
     item.cuenta_contable = cuenta;
+    item.verificacion_contable = res.data?.[0]?.verificacion_contable || null;
 
     box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" ? "ok" : "err");
     box.textContent = !match ? "✘ Todavía no aparece registrada en contabilidad. El monto no se pudo comprobar."
-      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · Monto coincide: " + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
+      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · " + (grupo.miembros.length>1 ? "Suma de "+grupo.miembros.length+" gastos coincide: " : "Monto coincide: ") + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
       : comparacionMonto.estado === "diferente" ? "⚠ Documento encontrado, pero el monto difiere. Rendido: " + fmtCLP(comparacionMonto.rendido) + ". Contabilidad: " + fmtCLP(comparacionMonto.contable) + ". Diferencia: " + fmtCLP(comparacionMonto.diferencia) + ". Si distribuiste la factura entre varios gastos, revisa la suma de esas partes."
       : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
       : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
@@ -4628,6 +4719,8 @@ async function submitRendicion() {
   const items = [];
   for (const [idx, card] of cards.entries()) {
     const id = card.id;
+    if (ocrBloqueado.has(id)) {toast(`El Ítem ${idx+1} requiere separar o cambiar el comprobante antes de enviar.`);return;}
+    if (conflictosSinConfirmar(id).length) {toast(`Confirma los campos contradictorios del Ítem ${idx+1} mirando el comprobante y escribiendo su valor.`);return;}
     const isCon = card.querySelector(`[data-tipo="ConDocumento"]`).classList.contains("active");
     if (isCon) {
       const monto = parseMoneyValue(document.getElementById(`${id}-monto`).value);
@@ -5035,11 +5128,9 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     // es negativo, la persona gastó más de lo que se le entregó -- ese
     // exceso se contabilizó como Rendiciones por Pagar (ver
     // calcularSplitFondo), no como parte de este fondo.
-    const { data: rendidas } = await db
-      .from("rendiciones")
-      .select("id, folio, monto_total, monto_aprobado, estado")
-      .eq("solicitud_fondo_id", s.id)
-      .order("created_at", { ascending: true });
+    let rendidas = [], errorConsumo = null;
+    try { rendidas = await consultarTodas(() => db.from("rendiciones").select("id, folio, monto_total, monto_aprobado, estado",{count:"exact"}).eq("solicitud_fondo_id",s.id).order("created_at").order("id")); }
+    catch (error) {errorConsumo=error; box.appendChild(el("p",{class:"ocr-status show err"},"No se pudo comprobar el consumo del fondo. Vuelve a abrir el detalle para reintentar."));}
     const aprobadas = (rendidas || []).filter((r) => r.estado === "Aprobado");
     const rendido = errorConsumo ? null : resumirConsumoFondo(rendidas,s.monto_solicitado).consumido;
     const saldo = rendido === null ? null : Number(s.monto_solicitado) - rendido;
@@ -5323,7 +5414,7 @@ async function openDetalle(id, pushHistory = true) {
           const verifyBox = el("div", { class: "verify-box show" }, "Consultando...");
           extraCell.innerHTML = "";
           extraCell.appendChild(verifyBox);
-          verificarDocumentoItem(it, verifyBox, r.empresa);
+          verificarDocumentoItem(it, verifyBox, r.empresa, items);
         },
       }, "Verificar"));
     }
@@ -5391,14 +5482,20 @@ async function openDetalle(id, pushHistory = true) {
     // colspan hace que algunos navegadores dejen de sumarle el ancho de las
     // columnas que abarca (ya nos mordió con el panel "Editar perfil" de
     // Usuarios, mismo patrón).
+    if (it.verificacion_contable) {
+      const v=it.verificacion_contable;
+      const caducada=v.empresa_revisada!==r.empresa || (v.miembros && JSON.stringify(v.miembros)!==JSON.stringify(window.RindeCore.grupoDocumentoContable(it,items).miembros));
+      tbody.appendChild(el("tr",{},[el("td",{colspan:String(columnas.length)},[el("div",{class:"verify-box show "+(v.estado==="coincide" && !caducada?"ok":"err")},"Verificación: "+(caducada?"caducada; cambió la distribución del documento":v.estado)+" · Monto revisado: "+fmtCLP(v.monto_rendido)+" · Cuenta "+(v.cuenta||"-")+" · "+(v.nombre_cuenta||"-")+" · "+(v.verificado_en?fmtDate(v.verificado_en):""))])]));
+    }
     if (it.ocr_reintento_estado === "pendiente") {
       tbody.appendChild(el("tr", {}, [
         el("td", { colspan: String(columnas.length) }, [
           el("div", { class: "ocr-status show" },
-            "🔄 La IA sigue intentando leer este comprobante en segundo plano (Gemini estuvo saturado al crear el ítem)."),
+            "La IA reintentará los campos pendientes de este comprobante. Tus datos guardados se conservan."),
         ]),
       ]));
-    } else if (it.ocr_reintento_estado === "listo" && it.ocr_reintento_resultado) {
+    }
+    if (it.ocr_reintento_resultado) {
       const s = it.ocr_reintento_resultado;
       const partes = [
         s.nombre_proveedor && `Proveedor: ${s.nombre_proveedor}`,
@@ -5408,8 +5505,8 @@ async function openDetalle(id, pushHistory = true) {
       ].filter(Boolean).join(" · ");
       tbody.appendChild(el("tr", {}, [
         el("td", { colspan: String(columnas.length) }, [
-          el("div", { class: "ocr-status show ok" },
-            `💡 La IA logró leer este comprobante en un reintento en segundo plano: ${partes || "sin datos nuevos"}. Revísalo y aplícalo a mano con "Editar" si corresponde.`),
+          el("div", { class: "ocr-status show " + (s.revision_estado === "completo" ? "ok" : "err") },
+            s.requiere_separacion ? s.aviso_documento : `Lectura ${s.revision_estado || "por revisar"}: ${partes || "sin datos nuevos"}. ${s.campos_pendientes?.length ? "Pendiente: "+s.campos_pendientes.join(", ")+". " : ""}Revisa la evidencia y aplica las correcciones con "Editar".`),
         ]),
       ]));
     } else if (it.ocr_reintento_estado === "agotado") {
@@ -6067,6 +6164,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
     fecha, "", "", "",
   ]);
 
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && !split) throw new Error("Falta comprobar la distribución del fondo; no se generó el CSV.");
   if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && split) {
     if (split.dentroDelFondo > 0) rows.push(filaContrapartida(CUENTA_CONTRAPARTIDA.FondoPorRendir.cuenta, split.dentroDelFondo));
     if (split.excedente > 0) rows.push(filaContrapartida(CUENTA_CONTRAPARTIDA.Reembolso.cuenta, split.excedente));
@@ -6086,32 +6184,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
 // historial de rendiciones Aprobadas de la(s) solicitud(es) involucradas,
 // no solo sobre las que se están procesando en este momento.
 async function calcularSplitFondo(rendicionesFondo) {
-  const splitPorId = new Map();
-  const solicitudIds = [...new Set((rendicionesFondo || []).map((r) => r.solicitud_fondo_id).filter(Boolean))];
-  if (!solicitudIds.length) return splitPorId;
-
-  const { data: solicitudes } = await db.from("solicitudes_fondos").select("id, folio, monto_solicitado").in("id", solicitudIds);
-  const solicitudPorId = new Map((solicitudes || []).map((s) => [s.id, s]));
-
-  const { data: historial } = await db
-    .from("rendiciones")
-    .select("id, solicitud_fondo_id, monto_total")
-    .in("solicitud_fondo_id", solicitudIds)
-    .eq("estado", "Aprobado")
-    .order("fecha_aprobacion", { ascending: true });
-
-  const consumido = new Map();
-  (historial || []).forEach((r) => {
-    const solicitud = solicitudPorId.get(r.solicitud_fondo_id);
-    if (!solicitud) return;
-    const antes = consumido.get(r.solicitud_fondo_id) || 0;
-    const saldoAntes = Math.max(0, Number(solicitud.monto_solicitado) - antes);
-    const dentroDelFondo = Math.min(Number(r.monto_total), saldoAntes);
-    const excedente = Math.max(0, Number(r.monto_total) - saldoAntes);
-    splitPorId.set(r.id, { dentroDelFondo, excedente, fondoFolio: solicitud.folio });
-    consumido.set(r.solicitud_fondo_id, antes + Number(r.monto_total));
-  });
-  return splitPorId;
+  return window.RindeData.distribuirFondosCsv(db,rendicionesFondo);
 }
 
 function construirCSV(rendicion, items, split = null) {
@@ -6360,13 +6433,7 @@ async function generarComprobantesPorRango(desde, hasta) {
   statusEl.className = "ocr-status show";
   statusEl.textContent = "Generando comprobantes...";
   try {
-    const { data: rendiciones, error: errR } = await db
-      .from("rendiciones")
-      .select("*")
-      .eq("estado", "Aprobado")
-      .gte("fecha_aprobacion", `${desde}T00:00:00`)
-      .lte("fecha_aprobacion", `${hasta}T23:59:59`);
-    if (errR) throw errR;
+    const rendiciones = await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).eq("estado","Aprobado").gte("fecha_aprobacion",`${desde}T00:00:00`).lte("fecha_aprobacion",`${hasta}T23:59:59`).order("fecha_aprobacion").order("id"));
 
     if (!rendiciones || !rendiciones.length) {
       statusEl.textContent = "No hay rendiciones aprobadas en ese rango de fechas.";
@@ -6375,11 +6442,8 @@ async function generarComprobantesPorRango(desde, hasta) {
     }
 
     const ids = rendiciones.map((r) => r.id);
-    const { data: items, error: errI } = await db
-      .from("rendicion_items")
-      .select("*")
-      .in("rendicion_id", ids);
-    if (errI) throw errI;
+    const items=[];
+    for(let inicio=0;inicio<ids.length;inicio+=100) items.push(...await consultarTodas(() => db.from("rendicion_items").select("*",{count:"exact"}).in("rendicion_id",ids.slice(inicio,inicio+100)).order("id")));
 
     // Igual que en el comprobante individual: usamos el RUT/nombre ACTUAL
     // del perfil de cada empleado, no el que haya quedado guardado en la
@@ -6449,30 +6513,13 @@ async function generarComprobantesPorRango(desde, hasta) {
 async function exportarExcel() {
   toast("Generando Excel...");
   try {
-    const { data: rendiciones, error: errR } = await db
-      .from("rendiciones")
-      .select("*, solicitudes_fondos(folio)")
-      .order("folio", { ascending: true });
-    if (errR) throw errR;
+    const rendiciones=await consultarTodas(() => db.from("rendiciones").select("*, solicitudes_fondos(folio)",{count:"exact"}).order("folio").order("id"));
 
-    const { data: items, error: errI } = await db
-      .from("rendicion_items")
-      .select("*, rendiciones(folio, empleado_nombre, rut_empleado, empresa)")
-      .order("rendicion_id");
-    if (errI) throw errI;
+    const items=await consultarTodas(() => db.from("rendicion_items").select("*, rendiciones(folio, empleado_nombre, rut_empleado, empresa)",{count:"exact"}).order("rendicion_id").order("id"));
 
-    const { data: solicitudes, error: errS } = await db
-      .from("solicitudes_fondos")
-      .select("*")
-      .order("folio", { ascending: true });
-    if (errS) throw errS;
+    const solicitudes=await consultarTodas(() => db.from("solicitudes_fondos").select("*",{count:"exact"}).order("folio").order("id"));
 
-    const { data: rendicionesFondoAprobadas } = await db
-      .from("rendiciones")
-      .select("solicitud_fondo_id, monto_total")
-      .eq("tipo_rendicion", "FondoPorRendir")
-      .eq("estado", "Aprobado")
-      .not("solicitud_fondo_id", "is", null);
+    const rendicionesFondoAprobadas = rendiciones.filter(r => r.tipo_rendicion === "FondoPorRendir" && r.estado === "Aprobado" && r.solicitud_fondo_id);
     const rendidoPorSolicitud = {};
     (rendicionesFondoAprobadas || []).forEach((r) => {
       rendidoPorSolicitud[r.solicitud_fondo_id] = (rendidoPorSolicitud[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0);

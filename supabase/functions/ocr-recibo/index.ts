@@ -47,123 +47,8 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-
-  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
-  let userId: string | null = null;
-  // Declarados afuera del try porque el catch los necesita para encolar el
-  // comprobante en ocr_previos si la lectura en vivo falla -- ver más abajo.
-  let imageBase64: string | undefined;
-  let mimeType: string | undefined;
-  // datosParciales también vive acá afuera: el catch lo necesita para
-  // guardarlo junto al comprobante encolado en ocr_previos.
-  let camposFaltantes: string[] | null = null;
-  let datosParciales: Record<string, unknown> | null = null;
-  try {
-    const user = await requireUser(req);
-    userId = user.id;
-
-    ({ imageBase64, mimeType, camposFaltantes, datosParciales } = await req.json());
-
-    // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
-    // llamar esta función en loop sin ningún tope, consumiendo la cuota
-    // paga de Gemini sin control. Un intento fallido (ej. Gemini caído)
-    // cuenta igual que uno exitoso contra este tope -- es decir, durante una
-    // caída real de Gemini, cada reintento de la persona le come cupo por
-    // algo que no es su culpa. 60/hora (subido de 40) deja margen real para
-    // reintentar unas cuantas veces durante un incidente sin llegar a
-    // trabarse, sin dejar de ser un tope muy por encima de lo que alguien
-    // carga a mano en una rendición real.
-    // OJO con este número: cada "ocr_call" puede gastar hasta MAX_CANDIDATOS
-    // solicitudes de Gemini (ver gemini-ocr.ts), y la cuota gratuita es de
-    // ~20 por modelo AL DÍA. Con el 60 que había acá, un solo usuario podía
-    // consumir 120 solicitudes en una hora -- más que la cuota diaria
-    // completa. El tope está denominado en llamadas, no en solicitudes, así
-    // que hay que dividirlo por el abanico de candidatos.
-    if (typeof imageBase64 !== "string") throw new Error("Falta la imagen (imageBase64).");
-    if (!imageBase64) throw new Error("Falta la imagen (imageBase64).");
-    // ~15MB de archivo original equivalen a ~20M caracteres en base64
-    // (overhead ~33%). Sin este tope, un PDF/foto gigante se manda entero a
-    // Gemini y puede colgar la función o fallar con un error de red opaco
-    // en vez de un mensaje claro.
-    if (imageBase64.length > 20_000_000) {
-      throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
-    }
-
-    const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
-    const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
-    const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
-    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",2).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
-    if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
-    if (anterior?.resultado) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
-
-    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
-    if (llamadasRecientes >= 25) {
-      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
-    }
-    await logEvent(admin, "ocr_call", { usuarioId: userId });
-
-
-    // ACÁ está el ahorro de cuota. El navegador lee el PDF localmente con
-    // pdf.js antes de llamar acá, y cuando esa lectura sale completa manda
-    // "camposFaltantes" vacío. Gastar una solicitud de Gemini para volver a
-    // leer un documento que ya se leyó entero es exactamente lo que dejó la
-    // app sin OCR un día completo: la cuota gratuita es de ~20 solicitudes
-    // POR MODELO AL DÍA. Si no falta nada, se devuelve lo que ya se sabía y
-    // no se llama a Gemini en absoluto.
-    //
-    // La lista vacía y la ausencia del campo NO son lo mismo: un cliente
-    // viejo (o el agente en segundo plano) no manda "camposFaltantes", y ahí
-    // hay que leer todo como siempre. Solo un array presente Y vacío
-    // significa "no falta nada".
-    if (Array.isArray(camposFaltantes) && camposFaltantes.length === 0) {
-      await logEvent(admin, "ocr_sin_llamada", { usuarioId: userId });
-      return new Response(JSON.stringify(datosParciales || {}), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    const resultado = await leerComprobante(admin, imageBase64, mimeType, undefined, {
-      camposFaltantes,
-      datosParciales,
-    });
-
-    // No es un fallo (la función igual responde 200), pero si Gemini no
-    // sacó ningún dato útil del comprobante, se loguea para tener
-    // visibilidad -- indistinguible si no, de "el comprobante realmente no
-    // traía nada legible" versus "el modelo está degradando en silencio".
-    if (!tieneDatosUtiles(resultado)) {
-      await logEvent(admin, "ocr_vacio", { usuarioId: userId });
-    }
-
-    if (tieneDatosUtiles(resultado)) {
-      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:2,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
-      if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);
-    }
-    return new Response(JSON.stringify(resultado), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
-  } catch (err) {
-    const mensaje = String(err instanceof Error ? err.message : err);
-    const esRechazoEsperable = /No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje);
-    // No registramos los rechazos esperables (sesión inválida, límite de
-    // frecuencia) como "fallo" -- son parte del funcionamiento normal, no
-    // algo que un admin necesite revisar en el registro de eventos.
-    if (!esRechazoEsperable) {
-      await logEvent(admin, "ocr_fail", { usuarioId: userId, detalle: mensaje });
-    }
-
-    // El agente en segundo plano "toma el rol" apenas falla la lectura en
-    // vivo, no recién cuando se envía la rendición (ver
-    // migracion_ocr_previo.sql) -- se sube el comprobante a Storage y se
-    // encola en ocr_previos ACÁ MISMO, antes de responderle al frontend, así
-    // ocr-reintento-pendientes ya tiene algo real que reintentar desde el
-    // primer fallo. Best-effort: si esto falla (ej. Storage caído también),
-    // no debe tapar el mensaje de error original de Gemini con uno de
-    // Storage -- se loguea aparte y se responde igual sin previaId.
-    let previaId: string | null = null;
-    if (!esRechazoEsperable && userId && typeof imageBase64 === "string" && imageBase64.length <= 20_000_000) {
+async function encolarLecturaPendiente(admin: ReturnType<typeof createClient>, userId: string, imageBase64: string, mimeType: string | undefined, datosParciales: Record<string, unknown> | null): Promise<string | null> {
+  let previaId: string | null = null;
       try {
         const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
         const parciales = datosParciales && Object.keys(datosParciales).length ? datosParciales : null;
@@ -231,6 +116,133 @@ Deno.serve(async (req: Request) => {
         const detalle = (errEncolar as { message?: string })?.message || String(errEncolar);
         console.error("No se pudo encolar el comprobante en ocr_previos:", detalle);
       }
+  return previaId;
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+
+  const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+  let userId: string | null = null;
+  // Declarados afuera del try porque el catch los necesita para encolar el
+  // comprobante en ocr_previos si la lectura en vivo falla -- ver más abajo.
+  let imageBase64: string | undefined;
+  let mimeType: string | undefined;
+  // datosParciales también vive acá afuera: el catch lo necesita para
+  // guardarlo junto al comprobante encolado en ocr_previos.
+  let camposFaltantes: string[] | null = null;
+  let datosParciales: Record<string, unknown> | null = null;
+  try {
+    const user = await requireUser(req);
+    userId = user.id;
+
+    ({ imageBase64, mimeType, camposFaltantes, datosParciales } = await req.json());
+
+    // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
+    // llamar esta función en loop sin ningún tope, consumiendo la cuota
+    // paga de Gemini sin control. Un intento fallido (ej. Gemini caído)
+    // cuenta igual que uno exitoso contra este tope -- es decir, durante una
+    // caída real de Gemini, cada reintento de la persona le come cupo por
+    // algo que no es su culpa. 60/hora (subido de 40) deja margen real para
+    // reintentar unas cuantas veces durante un incidente sin llegar a
+    // trabarse, sin dejar de ser un tope muy por encima de lo que alguien
+    // carga a mano en una rendición real.
+    // OJO con este número: cada "ocr_call" puede gastar hasta MAX_CANDIDATOS
+    // solicitudes de Gemini (ver gemini-ocr.ts), y la cuota gratuita es de
+    // ~20 por modelo AL DÍA. Con el 60 que había acá, un solo usuario podía
+    // consumir 120 solicitudes en una hora -- más que la cuota diaria
+    // completa. El tope está denominado en llamadas, no en solicitudes, así
+    // que hay que dividirlo por el abanico de candidatos.
+    if (typeof imageBase64 !== "string") throw new Error("Falta la imagen (imageBase64).");
+    if (!imageBase64) throw new Error("Falta la imagen (imageBase64).");
+    // ~15MB de archivo original equivalen a ~20M caracteres en base64
+    // (overhead ~33%). Sin este tope, un PDF/foto gigante se manda entero a
+    // Gemini y puede colgar la función o fallar con un error de red opaco
+    // en vez de un mensaje claro.
+    if (imageBase64.length > 20_000_000) {
+      throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
+    }
+
+    const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
+    const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
+    const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
+    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",3).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
+    if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
+    if (anterior?.resultado && (anterior.resultado.revision_estado === "completo" || anterior.resultado.requiere_separacion)) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
+
+    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
+    if (llamadasRecientes >= 25) {
+      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
+    }
+    await logEvent(admin, "ocr_call", { usuarioId: userId });
+
+
+    // ACÁ está el ahorro de cuota. El navegador lee el PDF localmente con
+    // pdf.js antes de llamar acá, y cuando esa lectura sale completa manda
+    // "camposFaltantes" vacío. Gastar una solicitud de Gemini para volver a
+    // leer un documento que ya se leyó entero es exactamente lo que dejó la
+    // app sin OCR un día completo: la cuota gratuita es de ~20 solicitudes
+    // POR MODELO AL DÍA. Si no falta nada, se devuelve lo que ya se sabía y
+    // no se llama a Gemini en absoluto.
+    //
+    // La lista vacía y la ausencia del campo NO son lo mismo: un cliente
+    // viejo (o el agente en segundo plano) no manda "camposFaltantes", y ahí
+    // hay que leer todo como siempre. Solo un array presente Y vacío
+    // significa "no falta nada".
+    if (Array.isArray(camposFaltantes) && camposFaltantes.length === 0) {
+      await logEvent(admin, "ocr_sin_llamada", { usuarioId: userId });
+      return new Response(JSON.stringify(datosParciales || {}), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const resultado = await leerComprobante(admin, imageBase64, mimeType, undefined, {
+      camposFaltantes,
+      datosParciales,
+    });
+
+    // No es un fallo (la función igual responde 200), pero si Gemini no
+    // sacó ningún dato útil del comprobante, se loguea para tener
+    // visibilidad -- indistinguible si no, de "el comprobante realmente no
+    // traía nada legible" versus "el modelo está degradando en silencio".
+    if (!tieneDatosUtiles(resultado)) {
+      await logEvent(admin, "ocr_vacio", { usuarioId: userId });
+    }
+
+    await logEvent(admin,"ocr_resultado",{usuarioId:userId,metadata:{estado:(resultado as any).revision_estado,campos_pendientes:(resultado as any).campos_pendientes || []}});
+    if ((resultado as any).revision_estado === "completo" || resultado.requiere_separacion) {
+      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:3,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
+      if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);
+    }
+    let previaId: string | null = null;
+    if ((resultado as any).revision_estado === "parcial" && !resultado.requiere_separacion) {
+      const parciales={...(datosParciales || {}),...Object.fromEntries(Object.entries(resultado).filter(([,valor])=>valor !== null && valor !== undefined && valor !== ""))};
+      previaId=await encolarLecturaPendiente(admin,userId,imageBase64,mimeType,parciales);
+    }
+    return new Response(JSON.stringify({...resultado,previaId}), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    const mensaje = String(err instanceof Error ? err.message : err);
+    const esRechazoEsperable = /No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje);
+    // No registramos los rechazos esperables (sesión inválida, límite de
+    // frecuencia) como "fallo" -- son parte del funcionamiento normal, no
+    // algo que un admin necesite revisar en el registro de eventos.
+    if (!esRechazoEsperable) {
+      await logEvent(admin, "ocr_fail", { usuarioId: userId, detalle: mensaje });
+    }
+
+    // El agente en segundo plano "toma el rol" apenas falla la lectura en
+    // vivo, no recién cuando se envía la rendición (ver
+    // migracion_ocr_previo.sql) -- se sube el comprobante a Storage y se
+    // encola en ocr_previos ACÁ MISMO, antes de responderle al frontend, así
+    // ocr-reintento-pendientes ya tiene algo real que reintentar desde el
+    // primer fallo. Best-effort: si esto falla (ej. Storage caído también),
+    // no debe tapar el mensaje de error original de Gemini con uno de
+    // Storage -- se loguea aparte y se responde igual sin previaId.
+    let previaId: string | null = null;
+    if (!esRechazoEsperable && userId && typeof imageBase64 === "string" && imageBase64.length <= 20_000_000) {
+      previaId=await encolarLecturaPendiente(admin,userId,imageBase64,mimeType,datosParciales);
     }
 
     return new Response(JSON.stringify({ error: mensaje, previaId }), {

@@ -115,7 +115,14 @@
     return resumen;
   }
 
-  const RindeCore = { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, resumenRendicion };
+  function grupoDocumentoContable(item, items) {
+    const clave=claveDocumento(item);
+    const candidatos=clave ? items.filter(i => i.estado!=="Rechazado" && claveDocumento(i)===clave) : [item];
+    const grupo=candidatos.length ? candidatos : [item];
+    return {monto:grupo.reduce((sum,i)=>sum+Number(i.monto||0),0),miembros:grupo.map(i=>({id:i.id,monto:Number(i.monto||0),estado:i.estado})).sort((a,b)=>String(a.id).localeCompare(String(b.id)))};
+  }
+
+  const RindeCore = { grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

@@ -41,7 +41,7 @@ export async function logEvent(
 export async function contarEventosRecientes(
   admin: AdminClient,
   tipo: string,
-  opts: { usuarioId?: string | null; rendicionId?: string | null },
+  opts: { usuarioId?: string | null; rendicionId?: string | null; solicitudId?: string | null },
   minutos: number,
 ): Promise<number> {
   const desde = new Date(Date.now() - minutos * 60_000).toISOString();
