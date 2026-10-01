@@ -4569,6 +4569,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     const match = data && data[0];
     const comparacionMonto = match ? compararMontoContable(item,data) : null;
     const cuenta = (match && match[MOVIMIENTOS_COLS.cuentaCod]) || CUENTA_POR_TIPO_DOC[item.tipo_documento];
+    const nombreCuentaVerificada = (match && match[MOVIMIENTOS_COLS.cuentaNom]) || nombreCuenta(cuenta) || "Nombre no disponible";
     const comprobante = (match && match[MOVIMIENTOS_COLS.comprobante]) || null;
 
     // Escribir primero, mostrar el resultado recién si de verdad quedó
@@ -4590,7 +4591,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
 
     box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" ? "ok" : "err");
     box.textContent = !match ? "✘ Todavía no aparece registrada en contabilidad. El monto no se pudo comprobar."
-      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · Monto coincide: " + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta
+      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · Monto coincide: " + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
       : comparacionMonto.estado === "diferente" ? "⚠ Documento encontrado, pero el monto difiere. Rendido: " + fmtCLP(comparacionMonto.rendido) + ". Contabilidad: " + fmtCLP(comparacionMonto.contable) + ". Diferencia: " + fmtCLP(comparacionMonto.diferencia) + ". Si distribuiste la factura entre varios gastos, revisa la suma de esas partes."
       : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
       : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
