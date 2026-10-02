@@ -166,7 +166,7 @@ Deno.serve(async (req: Request) => {
     const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
     const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
     const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
-    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",3).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
+    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",4).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
     if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
     if (anterior?.resultado && (anterior.resultado.revision_estado === "completo" || anterior.resultado.requiere_separacion)) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
 
@@ -211,7 +211,7 @@ Deno.serve(async (req: Request) => {
 
     await logEvent(admin,"ocr_resultado",{usuarioId:userId,metadata:{estado:(resultado as any).revision_estado,campos_pendientes:(resultado as any).campos_pendientes || []}});
     if ((resultado as any).revision_estado === "completo" || resultado.requiere_separacion) {
-      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:3,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
+      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:4,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
       if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);
     }
     let previaId: string | null = null;

@@ -1,5 +1,6 @@
 import { revisarCompletitud } from "./estado-lectura.ts";
 import { revisarEstructuraDocumento } from "./analisis-documento.ts";
+import { habilitado, consultarGroq } from "./respaldo-nube.ts";
 import { verificarCampos } from "./verificacion-ocr.ts";
 // Lógica compartida para leer un comprobante con Gemini: arma el prompt,
 // prueba una cadena de modelos candidatos con reintentos, y valida/limpia
@@ -233,7 +234,7 @@ participantes, propósito comercial o motivo del gasto. Categoría es una sugere
 Incluye "evidencias": un objeto con las claves nombre_proveedor, rut_proveedor,
 tipo_documento, nro_documento, fecha y monto. Cada una contiene {"texto": la
 transcripción LITERAL que respalda el valor o null, "ubicacion": ubicación
-descriptiva en la imagen, por ejemplo "encabezado superior izquierdo", o null}.
+descriptiva en la imagen, por ejemplo "encabezado superior izquierdo", o null, "caja": [y_min, x_min, y_max, x_max] en coordenadas normalizadas de 0 a 1000 o null. Ubica el texto literal del campo en la imagen completa; no inventes coordenadas si no puedes localizarlo.}
 Revisa cada campo antes de responder: identifica EMISOR y receptor por separado;
 no confundas folio con RUT, operación o número de terminal; diferencia fecha de
 emisión de vencimiento; diferencia total final de neto, IVA, vuelto y propina.
@@ -490,6 +491,7 @@ export function normalizarMonto(valor: unknown): number | null {
 }
 
 export interface ResultadoOcr {
+  proveedor_lectura?: "gemini" | "groq";
   analisis_documento?: Record<string, unknown>;
   requiere_separacion?: boolean;
   aviso_documento?: string;
@@ -519,7 +521,7 @@ export interface ResultadoOcr {
 // opcional: sin él, simplemente no hay estadística ni reordenamiento (cae
 // al orden base) -- así este módulo también se puede usar/testear sin una
 // conexión real a la base si algún día hiciera falta.
-export async function leerComprobante(
+async function leerConGemini(
   admin: AdminClient | null,
   imageBase64: string,
   mimeType: string,
@@ -665,4 +667,22 @@ export function interpretarRespuestaOcr(data: any): ResultadoOcr {
 export function tieneDatosUtiles(resultado: ResultadoOcr): boolean {
   if (resultado.requiere_separacion) return true;
   return ["nombre_proveedor", "rut_proveedor", "monto", "nro_documento"].some((campo) => (resultado as Record<string, unknown>)[campo]);
+}
+
+export async function leerComprobante(admin:AdminClient|null,imageBase64:string,mimeType:string,presupuesto:PresupuestoTiempo=PRESUPUESTO_EN_VIVO,enfoque?:{camposFaltantes?:string[]|null;datosParciales?:Record<string,unknown>|null}):Promise<ResultadoOcr>{
+  const config=Object.fromEntries(['GROQ_OCR_ENABLED','GROQ_OCR_CONSENT','GROQ_PLAN','GROQ_API_KEY'].map(k=>[k,Deno.env.get(k)]));
+  const permitido=habilitado(config)&&['image/jpeg','image/png','image/webp'].includes(mimeType);
+  const inicio=Date.now();
+  try{
+    const limite=permitido?{porLlamadaMs:Math.min(presupuesto.porLlamadaMs,presupuesto.totalMs>30000?40000:18000),totalMs:presupuesto.totalMs>30000?Math.min(60000,presupuesto.totalMs-25000):18000}:presupuesto;
+    const resultado=await leerConGemini(admin,imageBase64,mimeType,limite,enfoque);
+    return {...resultado,proveedor_lectura:'gemini'} as ResultadoOcr;
+  }catch(error){
+    if(!permitido)throw error;
+    const restante=presupuesto.totalMs-(Date.now()-inicio);
+    if(restante<2000)throw error;
+    const bruto=await consultarGroq(imageBase64,mimeType,armarPrompt(enfoque?.camposFaltantes,enfoque?.datosParciales),config,restante);
+    const resultado=interpretarRespuestaOcr(bruto);
+    return {...resultado,proveedor_lectura:'groq'} as ResultadoOcr;
+  }
 }

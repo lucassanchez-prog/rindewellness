@@ -875,3 +875,24 @@ button {
 
 /* Un estado oculto no debe mostrarse por las reglas visuales del OCR. */
 #dashboard-carga-status[hidden]{display:none!important}
+.revision-comprobante { margin-top:18px; border:1px solid var(--line); border-radius:14px; padding:16px; }
+.revision-cabecera, .revision-controles { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.revision-cuerpo { display:grid; grid-template-columns:minmax(0,1.2fr) minmax(220px,1fr); gap:18px; margin-top:16px; }
+.revision-controles { justify-content:flex-start; margin-bottom:12px; }
+.revision-controles .btn, .revision-cabecera .btn { font-size:12px; min-height:36px; padding:7px 10px; }
+.revision-visor { min-width:0; }
+.revision-imagen { position:relative; line-height:0; width:100%; background:#fff; border-radius:8px; overflow:hidden; }
+.revision-imagen img { display:block; width:100%; height:auto; }
+.revision-caja { position:absolute; border:3px solid #159c91; background:#20b8a421; pointer-events:none; box-sizing:border-box; }
+.revision-nota, .revision-evidencia { font-size:12px; line-height:1.5; color:var(--ink-soft); overflow-wrap:anywhere; }
+.revision-campos { min-width:0; }
+.revision-fragmento { margin-top:12px; font-size:12px; }
+.revision-fragmento canvas { display:block; max-width:100%; max-height:160px; background:#fff; margin-top:8px; border:1px solid var(--line); object-fit:contain; }
+.revision-campo { margin-bottom:10px; border:1px solid var(--line); border-radius:10px; padding:12px; }
+.revision-campo.seleccionado { border-color:#20b8a4; box-shadow:0 0 0 1px #20b8a4; }
+.revision-seleccionar { display:grid; grid-template-columns:1fr auto; gap:6px; width:100%; text-align:left; background:none; border:0; color:inherit; font:inherit; cursor:pointer; padding:0; }
+.revision-seleccionar:focus-visible { outline:2px solid #20b8a4; outline-offset:4px; }
+.revision-valor { overflow-wrap:anywhere; font-weight:600; grid-column:1/-1; }
+.revision-estado { font-size:11px; color:var(--ink-soft); grid-row:1; grid-column:2; }
+.revision-campo [hidden], .revision-comprobante [hidden] { display:none !important; }
+@media(max-width:760px) { .revision-cuerpo { grid-template-columns:1fr; } .revision-comprobante { padding:12px; } }

@@ -35,7 +35,9 @@ export function verificarCampos(datos: Record<string, any>): Record<string, any>
       else if (datos.monto_verificado && datos.monto) { motivo = "El total en cifras coincide con el total transcrito en palabras."; estado = "consistente"; }
     }
     if (estado === "ilegible") motivo = "No se obtuvo una lectura utilizable.";
-    resultado[campo] = { estado, texto, ubicacion, motivo };
+    const candidato=fuente?.caja;
+    const caja=Array.isArray(candidato)&&candidato.length===4&&candidato.every((n:any)=>typeof n==='number'&&Number.isFinite(n)&&n>=0&&n<=1000)&&candidato[2]>candidato[0]&&candidato[3]>candidato[1]?candidato:null;
+    resultado[campo] = { estado, texto, ubicacion, motivo, caja };
   }
   return resultado;
 }

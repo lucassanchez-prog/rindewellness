@@ -2108,6 +2108,8 @@ function openNuevaRendicion(pushHistory = true) {
   //    segundo plano nunca lo toma, sin ninguna señal visible.
   ocrGeneracion.clear();
   ocrExitoso.clear();
+  for (const revision of revisionesComprobante.values()) revision.limpiar();
+  revisionesComprobante.clear();
   ocrArchivoActual.clear();
   ocrBloqueado.clear();
   ocrConflictos.clear();
@@ -2522,6 +2524,7 @@ function cargarTesseract() {
 const LADO_MAXIMO_OCR = 2000;
 async function prepararImagenParaOcr(file, ampliar = false) {
   try {
+    file = await prepararComprobanteIa(file);
     const bitmap = await createImageBitmap(file);
     // Aumentar comprobantes pequeños ayuda al escáner a separar los caracteres.
     const escala = Math.min(ampliar ? 3 : 1, LADO_MAXIMO_OCR / Math.max(bitmap.width, bitmap.height));
@@ -3306,6 +3309,7 @@ function fusionarLecturas(local, ia, contable) {
   if (L.verificacion_campos || I.verificacion_campos) datos.verificacion_campos={...(L.verificacion_campos || {}),...(I.verificacion_campos || {})};
   if (I.verificacion_campos) aporteIA.verificacion_campos=I.verificacion_campos;
   if (I.analisis_documento) datos.analisis_documento = I.analisis_documento;
+  if (I.proveedor_lectura) datos.proveedor_lectura = I.proveedor_lectura;
   return { datos, aporteIA, avisos };
 }
 
@@ -3574,8 +3578,8 @@ async function prepararArchivoParaLectura(input, status, analizar) {
   nuevaGeneracionOcr(input.id.replace(/-foto2?$/, ""));
   try {
     if (original.type !== "application/pdf") {
-      await reemplazarConVersionComprimida(input);
-      if (vigente() && input.files?.[0]) await analizar(input.files[0]);
+      // La copia optimizada solo se usa para leer. El adjunto guardado conserva la foto original.
+      if (vigente()) await analizar(original);
       return;
     }
     status.className = "ocr-status show"; status.textContent = "Revisando las páginas del PDF…";
@@ -3672,7 +3676,34 @@ async function leerPdfLocal(file) {
 // siendo una sola solicitud a Gemini), pero sí lo que se le pide. Si el
 // servidor todavía no los soporta simplemente los ignora y responde como
 // siempre, así que mandarlos es inofensivo.
+const fotosPreparadas = new WeakMap();
+const opcionesFotos = new WeakMap();
+async function prepararComprobanteIa(file) {
+  if (!fotosPreparadas.has(file)) fotosPreparadas.set(file, (async () => {
+    let imagen = file;
+    if (file.type === "application/pdf") {
+      const pdfjs = await cargarPdfJs();
+      const pdf = await pdfjs.getDocument({data:await file.arrayBuffer()}).promise;
+      try {
+        if (pdf.numPages !== 1) return file;
+        const pagina = await pdf.getPage(1),base = pagina.getViewport({scale:1});
+        const viewport = pagina.getViewport({scale:Math.min(3,2000/Math.max(base.width,base.height))});
+        const canvas = document.createElement("canvas");canvas.width = Math.ceil(viewport.width);canvas.height = Math.ceil(viewport.height);
+        await pagina.render({canvasContext:canvas.getContext("2d"),viewport}).promise;
+        const blob = await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
+        if (!blob) throw new Error("No se pudo preparar la página del comprobante.");
+        imagen = new File([blob],"pagina-comprobante.png",{type:"image/png"});
+      } finally {await pdf.destroy();}
+    }
+    if (!imagen.type.startsWith("image/")) return imagen;
+    const resultado = await window.RindeFoto.preparar(imagen,{recortar:file.type!=="application/pdf",...opcionesFotos.get(file)});
+    return resultado.file;
+  })().catch(error=>{fotosPreparadas.delete(file);throw error;}));
+  return fotosPreparadas.get(file);
+}
 async function llamarOcrRecibo(file, camposFaltantes, datosParciales) {
+  // Ambos proveedores ven la misma copia; la cola de nube recibe también esa imagen.
+  file = await prepararComprobanteIa(file);
   const imageBase64 = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
@@ -3743,29 +3774,30 @@ function protegerEdicionOcr(id, data) {
 }
 function mostrarVerificacionOcr(id, data) {
   const card = document.getElementById(id);
-  if (!card || !data.verificacion_campos) return;
-  card.querySelector(".ocr-verificacion")?.remove();
-  const panel = document.createElement("details"); panel.className = "ocr-verificacion";
-  const titulo = document.createElement("summary"); titulo.textContent = "Revisión del agente: datos y evidencia"; panel.appendChild(titulo);
-  const etiquetas = {nombre_proveedor:"Proveedor",rut_proveedor:"RUT",tipo_documento:"Documento",nro_documento:"Folio",fecha:"Fecha",monto:"Monto"};
-  for (const [campo,revision] of Object.entries(data.verificacion_campos)) {
-    if (!etiquetas[campo] || !revision || typeof revision !== "object") continue;
-    const fila = document.createElement("p");
-    const manual = SUFIJOS_OCR[campo]?.some(s => camposEditadosOcr.has(id+"-"+s));
-    const estado = manual ? "Corregido por ti" : ({coincidente_lecturas:"Coincide en dos lecturas",consistente:"Coincide en cifras y palabras",por_confirmar:"Por confirmar",ilegible:"Ilegible"}[revision.estado] || "Por confirmar");
-    fila.textContent = etiquetas[campo]+": "+estado+". "+(manual ? "Se conservó tu edición." : String(revision.motivo || ""));
-    if (revision.texto) fila.textContent += ' Lectura: «'+String(revision.texto).slice(0,300)+'».';
-    if (revision.ubicacion) fila.textContent += " Ubicación: "+String(revision.ubicacion).slice(0,120)+".";
-    panel.appendChild(fila);
-  }
-  card.appendChild(panel);
+  const file = ocrArchivoActual.get(id);
+  if (!card || !file) return;
+  revisionesComprobante.get(id)?.limpiar();
+  const campo = nombre => SUFIJOS_OCR[nombre]?.map(s=>document.getElementById(id+"-"+s)).find(n=>n&&n.offsetParent!==null);
+  const revisiones = Object.fromEntries(Object.keys(SUFIJOS_OCR).filter(c=>c!=="descripcion"&&c!=="categoria_sugerida").map(c=>[c,data.verificacion_campos?.[c]||{estado:"ilegible",motivo:"Revisa este campo en el adjunto."}]));
+  revisionesComprobante.set(id,window.RindeRevision.montar({contenedor:card,datos:{...data,verificacion_campos:revisiones},original:file,fuente:()=>prepararComprobanteIa(file),campo,manual:nombre=>SUFIJOS_OCR[nombre]?.some(s=>camposEditadosOcr.has(id+"-"+s)),ajustar:async opcion=>{
+    if (ocrArchivoActual.get(id)!==file) return;
+    const opciones = {...opcionesFotos.get(file)};
+    if(opcion==="giro")opciones.giro=(opciones.giro||0)+1;
+    if(opcion==="contraste")opciones.contraste=!opciones.contraste;
+    if(opcion==="completo")opciones.recortar=false;
+    opcionesFotos.set(file,opciones);fotosPreparadas.delete(file);
+    const estado = card.querySelector(".ocr-status");
+    if(document.getElementById(id+"-monto2")?.offsetParent!==null)await analizarComprobanteGastoDirecto(id,file,estado);
+    else await analizarComprobante(id,file,estado);
+  }}));
 }
 
+const revisionesComprobante = new Map();
 const ocrGeneracion = new Map();
 const ocrArchivoActual = new Map();
 function nuevaGeneracionOcr(id, conservarEdiciones = false) {
   if (!conservarEdiciones) for (const campo of camposEditadosOcr) if (campo.startsWith(id+"-")) camposEditadosOcr.delete(campo);
-  document.getElementById(id)?.querySelector(".ocr-verificacion")?.remove();
+  revisionesComprobante.get(id)?.limpiar();revisionesComprobante.delete(id);
   const gen = (ocrGeneracion.get(id) || 0) + 1;
   ocrGeneracion.set(id, gen);
   if(!conservarEdiciones){ocrBloqueado.delete(id);ocrConflictos.delete(id);}
@@ -4043,6 +4075,7 @@ async function analizarComprobante(id, file, statusEl) {
   const esReintento=ocrArchivoActual.get(id)===file;
   const gen = nuevaGeneracionOcr(id,esReintento);
   ocrArchivoActual.set(id,file);
+  mostrarVerificacionOcr(id,{});
   if(!esReintento)limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`, `${id}-tipodoc`, `${id}-categoriacon`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
@@ -4311,6 +4344,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
   const esReintento=ocrArchivoActual.get(id)===file;
   const gen = nuevaGeneracionOcr(id,esReintento);
   ocrArchivoActual.set(id,file);
+  mostrarVerificacionOcr(id,{});
   if(!esReintento)limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-cuenta`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
   statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
