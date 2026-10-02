@@ -40,6 +40,42 @@ async function distribuirFondosCsv(db, rendicionesFondo) {
 }
 
 
-const api={consultarTodas,distribuirFondosCsv};
+// Un fallo de subida corta el envío completo. Las subidas que sí finalizaron
+// se reutilizan al reintentar el mismo borrador, sin reemplazar archivos.
+async function prepararAdjuntos(db, items, usuarioId, envioId, cache, esperar) {
+  const preparados=[];
+  for (const [idx,item] of items.entries()) {
+    const {_fotoInput,...datos}=item;
+    const file=_fotoInput?.files?.[0];
+    if(!file) throw new Error(`Falta el comprobante del Ítem ${idx+1}.`);
+    let path=cache.get(file);
+    if(!path) {
+      const nombre=file.name.replace(/[^a-zA-Z0-9.\-_]/g,"_");
+      path=`${usuarioId}/${envioId}-${idx}-${crypto.randomUUID()}-${nombre}`;
+      const subida=db.storage.from("comprobantes").upload(path,file);
+      const {error}=await esperar(subida,45000,`Se agotó el tiempo subiendo el comprobante del Ítem ${idx+1}. Tu formulario se conserva.`);
+      if(error) throw new Error(`No se pudo subir el comprobante del Ítem ${idx+1}. Tu formulario se conserva. ${error.message||"Reintenta."}`);
+      cache.set(file,path);
+    }
+    preparados.push({...datos,adjunto_url:path});
+  }
+  return preparados;
+}
+
+async function guardarRendicionCompleta(db,cabecera,items) {
+  const {data,error}=await db.rpc("crear_rendicion_completa",{p_cabecera:cabecera,p_items:items});
+  if(error) throw error;
+  if(!data?.rendicion || data.rendicion.id!==cabecera.id || !Array.isArray(data.items) || !data.items.length
+    || (!data.reutilizada && data.items.length!==items.length))
+    throw new Error("No se pudo confirmar el envío completo. Reintenta desde este formulario; se usará el mismo identificador.");
+  return data;
+}
+
+function abrirPdfSeguro(pdfjs,datos) {
+  // Mitigación oficial de GHSA-wgrm-67xf-hhpq para documentos externos.
+  return pdfjs.getDocument({data:datos,isEvalSupported:false});
+}
+
+const api={consultarTodas,distribuirFondosCsv,prepararAdjuntos,guardarRendicionCompleta,abrirPdfSeguro};
 if(typeof module!=="undefined" && module.exports)module.exports=api;else root.RindeData=api;
 })(typeof window!=="undefined"?window:globalThis);

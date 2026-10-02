@@ -36,7 +36,7 @@ Cuando Gemini falla, el navegador puede usar Tesseract para fotos y PDF escanead
 
 El bot aplica el mismo circuito de proveedores, discrepancias, campos editados y alertas de duplicados. Cada campo recuperado queda marcado para comparar con el original. Montos contradictorios quedan vacíos. Emisión tiene prioridad sobre vencimiento cuando está rotulada. Un PDF multipágina requiere seleccionar/separar el comprobante antes de leerlo.
 
-Este respaldo corre mientras el navegador está abierto. El trabajador de Supabase sigue usando Gemini: no se ha configurado un segundo modelo de lenguaje ni facturación. Tesseract requiere descargar su motor e idioma la primera vez y no comprende documentos como un modelo visual.
+Tesseract corre mientras el navegador está abierto y requiere descargar su motor e idioma la primera vez. El trabajador de Supabase dispone también de Groq visual como respaldo independiente de Gemini, activado con consentimiento de la empresa y limitado al plan gratuito. Ambos proveedores pasan por las mismas comprobaciones de campos y evidencia; se respetan las esperas por cuota. No se ha activado facturación. Tesseract reconoce texto y no comprende documentos como un modelo visual.
 
 ## Exportables
 
@@ -44,5 +44,17 @@ El Excel contiene resumen conciliado por estados, detalle con cuenta y nombre, m
 
 El PDF conserva el diseño aprobado, incorpora el índice de adjuntos, todas las páginas de los PDF e imágenes originales y evita repetir un archivo compartido entre ítems. Advierte por gastos sin adjunto y archivos no disponibles. El CSV contable rechaza diferencias entre gastos aprobados y contrapartida; el reporte general pagina todos los registros y escapa comas, comillas y saltos de línea. Los textos del CSV general se neutralizan para evitar que Excel los interprete como fórmulas.
 
-Validación ampliada: 57 pruebas automatizadas y ESLint. PDF generado con el código real de la aplicación y fotografías históricas, renderizado para comprobar su presencia. Excel generado, reabierto y sus hojas inspeccionadas; no se modificaron gastos reales durante estas pruebas.
+Validación ampliada: pruebas automatizadas y ESLint en cada cambio. PDF generado con el código real de la aplicación y fotografías históricas, renderizado para comprobar su presencia. Excel generado, reabierto y sus hojas inspeccionadas; no se modificaron gastos reales durante estas pruebas.
+
+## Envío completo y seguridad — auditoría del 2 de octubre
+
+`crear_rendicion_completa` guarda la cabecera y todos los gastos en una transacción con permisos del usuario. Un archivo que no se sube cancela el envío y conserva el formulario. Los archivos subidos correctamente se reutilizan al reintentar. Cada borrador conserva su UUID para reconocer un envío ya recibido aunque se haya perdido la respuesta; los reintentos no vuelven a notificar al aprobador.
+
+La identidad proviene del perfil del servidor y los totales de los gastos guardados. El RPC no permite enviar aprobaciones ni acreditar verificación con una bandera del navegador. La fecha seleccionada se guarda en `fecha_rendicion`; los registros anteriores conservan su fecha de creación. Los exportables distinguen fecha de rendición y fecha de envío. Los indicadores y filtros históricos siguen midiendo la fecha de envío.
+
+Usuarios desactivados y cuentas sin perfil no acceden a datos financieros ni generan nuevos enlaces de comprobantes. Los aprobadores delegados vigentes pueden abrir los adjuntos que revisan. Las políticas evalúan identidad y rol una vez por consulta, y los eventos operativos solo se registran desde el servidor. Los enlaces firmados emitidos antes de desactivar una cuenta mantienen su validez hasta expirar.
+
+El lector de PDF desactiva la evaluación dinámica siguiendo la mitigación oficial de Mozilla para GHSA-wgrm-67xf-hhpq. Se retiró la biblioteca XLSX antigua que ya no se utilizaba y se fijó el cliente Supabase a 2.117.2. El cambio de categoría o clasificación de una boleta conserva RUT, tipo, folio y fecha del comprobante.
+
+`supabase/tests/envio-permisos.sql` comprueba guardado atómico, reintentos, identidad, totales y acceso con el rol real `authenticated`. Debe ejecutarse en una transacción con ROLLBACK; solo crea datos sintéticos y no llama a servicios externos. Como cualquier prueba de INSERT con secuencias PostgreSQL, puede dejar huecos en folios aunque se reviertan las filas.
 

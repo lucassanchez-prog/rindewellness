@@ -14,6 +14,9 @@ let dbContabilidad = null; // proyecto de contabilidad (SOLO LECTURA)
 let currentUser = null;
 let currentProfile = null;
 let itemSeq = 0;
+let envioRendicionId = null;
+let enviandoRendicion = false;
+const adjuntosBorrador = new Map();
 // null = sin restricción (ve todas las cuentas de gasto directo);
 // Set(...) = solo puede usar esas cuentas. La define el admin en "Usuarios".
 let cuentasPermitidas = null;
@@ -529,7 +532,15 @@ function wireRecuperarClave() {
 async function onLoggedIn(user) {
   currentUser = user;
   let { data: profile, error: selError } = await db.from("profiles").select("*").eq("id", user.id).maybeSingle();
-  if (selError) console.error("Error leyendo perfil:", selError);
+  if(currentUser?.id!==user.id) return;
+  if (selError) {
+    console.error("Error leyendo perfil:",selError);
+    currentProfile = null;
+    document.getElementById("app-shell").style.display = "none";
+    show("view-login");
+    toast("No se pudo comprobar tu perfil. Reintenta el ingreso.");
+    return;
+  }
   if (!profile) {
     // Si el registro original quedó bloqueado por RLS (sesión aún no
     // confirmada), acá está la segunda oportunidad: usamos el nombre/RUT
@@ -542,6 +553,7 @@ async function onLoggedIn(user) {
       .select()
       .maybeSingle();
     if (insError) { console.error("Error creando perfil:", insError); toast("No se pudo crear tu perfil: " + insError.message); }
+    if(currentUser?.id!==user.id) return;
     profile = created;
   }
   // Desactivada en vez de eliminada (ver "Desactivar" en Usuarios): no se
@@ -556,6 +568,7 @@ async function onLoggedIn(user) {
     if (errBox) errBox.textContent = "Tu cuenta fue desactivada. Contacta a un administrador.";
     return;
   }
+  if(!profile){currentProfile=null;document.getElementById("app-shell").style.display="none";show("view-login");return;}
   currentProfile = profile;
 
   document.getElementById("user-name").textContent = `${profile?.nombre || user.email} · ${profile?.rol || "empleado"}`;
@@ -579,7 +592,18 @@ async function onLoggedIn(user) {
   document.getElementById("btn-comprobante-rango").style.display =
     esAprobadorEfectivo(profile) ? "inline-block" : "none";
 
-  await cargarCuentasPermitidas();
+  try {
+    await cargarCuentasPermitidas();
+  } catch(err) {
+    if(currentUser?.id!==user.id) return;
+    currentProfile=null;
+    document.getElementById("app-shell").style.display="none";
+    show("view-login");
+    toast("No se pudieron comprobar tus cuentas permitidas. Reintenta el ingreso.");
+    console.error("Error cargando permisos:",err);
+    return;
+  }
+  if(currentUser?.id!==user.id) return;
 
   // Si venías de un F5 (recarga) en "Nueva rendición", el detalle de una
   // rendición o "Usuarios", te dejamos en esa misma pantalla en vez de
@@ -598,14 +622,17 @@ async function onLoggedIn(user) {
 // individuales (perfil_cuentas) + las de su plantilla asignada, si tiene una
 // (ver migracion_plantillas_perfil.sql) -- una no reemplaza a la otra.
 async function cargarCuentasPermitidas() {
+  const usuarioId=currentUser.id;
+  cuentasPermitidas=new Set();
   const consultas = [db.from("perfil_cuentas").select("cuenta_cod").eq("profile_id", currentUser.id)];
   if (currentProfile?.plantilla_id) {
     consultas.push(db.from("plantilla_cuentas").select("cuenta_cod").eq("plantilla_id", currentProfile.plantilla_id));
   }
   const resultados = await Promise.all(consultas);
+  if(currentUser?.id!==usuarioId) return;
   const codigos = new Set();
   resultados.forEach(({ data, error }) => {
-    if (error) { console.error("Error cargando cuentas permitidas:", error); return; }
+    if (error) throw error;
     (data || []).forEach((d) => codigos.add(d.cuenta_cod));
   });
   cuentasPermitidas = codigos.size ? codigos : null;
@@ -858,7 +885,7 @@ function renderList(container, rows, showEmpleado) {
     celdas.push(
       el("td", {}, r.empresa || "-"),
       el("td", { class: "wrap" }, r.comentario || "-"),
-      el("td", { class: "center" }, fmtDate(r.created_at)),
+      el("td", { class: "center" }, fmtDate(r.fecha_rendicion || r.created_at)),
       el("td", { class: "center" }, r.tipo_rendicion),
       el("td", { class: "monto" }, fmtCLP(r.monto_rendido ?? r.monto_total)),
       el("td", { class: "monto" }, fmtCLP(r.monto_aprobado ?? (r.estado === "Aprobado" ? r.monto_total : 0))),
@@ -2088,7 +2115,10 @@ function actualizarCentroCostoRendicion() {
 }
 
 function openNuevaRendicion(pushHistory = true) {
-  document.getElementById("nr-fecha").value = new Date().toISOString().slice(0, 10);
+  if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
+  envioRendicionId = crypto.randomUUID();
+  adjuntosBorrador.clear();
+  document.getElementById("nr-fecha").value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
   document.getElementById("nr-tipo").value = "Reembolso";
   document.getElementById("nr-fondo-wrap").style.display = "none";
   document.getElementById("nr-comentario").value = "";
@@ -3584,7 +3614,7 @@ async function prepararArchivoParaLectura(input, status, analizar) {
     }
     status.className = "ocr-status show"; status.textContent = "Revisando las páginas del PDF…";
     const pdfjs = await cargarPdfJs();
-    const pdf = await pdfjs.getDocument({data:await original.arrayBuffer()}).promise;
+    const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await original.arrayBuffer()).promise;
     if (!vigente()) {await pdf.destroy(); return;}
     if (pdf.numPages === 1) {input.dataset.paginaPendiente="false";await pdf.destroy(); await analizar(original); return;}
     const panel = el("div", {class:"selector-pagina-ocr"});
@@ -3648,7 +3678,7 @@ async function leerPdfLocal(file) {
   if ((file.type || "") !== "application/pdf") return null;
   try {
     const pdfjs = await cargarPdfJs();
-    const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+    const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
     let texto = "";
     if (pdf.numPages !== 1) {await pdf.destroy(); return null;}
     // Tope de páginas: una factura tiene 1-2; leer un PDF enorme entero solo
@@ -3683,7 +3713,7 @@ async function prepararComprobanteIa(file) {
     let imagen = file;
     if (file.type === "application/pdf") {
       const pdfjs = await cargarPdfJs();
-      const pdf = await pdfjs.getDocument({data:await file.arrayBuffer()}).promise;
+      const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
       try {
         if (pdf.numPages !== 1) return file;
         const pagina = await pdf.getPage(1),base = pagina.getViewport({scale:1});
@@ -4191,7 +4221,7 @@ async function leerEscaneadoLocal(file){
   let pdf;
   try{
     const pdfjs=await cargarPdfJs();
-    pdf=await pdfjs.getDocument({data:await file.arrayBuffer()}).promise;
+    pdf=await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
     if(pdf.numPages!==1)return null;
     const pagina=await pdf.getPage(1),base=pagina.getViewport({scale:1});
     const escala=Math.min(2.5,LADO_MAXIMO_OCR/Math.max(base.width,base.height));
@@ -4801,11 +4831,13 @@ function recalcTotal() {
 }
 
 async function submitRendicion() {
+  if(enviandoRendicion) return;
   if (document.querySelector('#items-container input[data-pagina-pendiente="true"]')) {toast("Selecciona y confirma el comprobante de cada PDF antes de enviar la rendición.");return;}
   const cards = Array.from(document.querySelectorAll(".item-card"));
   if (!cards.length) { toast("Agrega al menos un ítem."); return; }
 
   const fecha = document.getElementById("nr-fecha").value;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast("Selecciona la fecha de la rendición.");return;}
   const tipoRendicion = document.getElementById("nr-tipo").value;
   const comentario = document.getElementById("nr-comentario").value.trim();
   const empresaRendicion = document.getElementById("nr-empresa").value;
@@ -4939,6 +4971,7 @@ async function submitRendicion() {
   }
 
   const btn = document.getElementById("btn-guardar-rendicion");
+  enviandoRendicion = true;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Guardando...';
 
@@ -4952,124 +4985,17 @@ async function submitRendicion() {
       if (error) throw new Error("No se pudo comprobar documentos duplicados. Vuelve a intentar antes de enviar.");
       if (data?.length && !confirm("El documento " + item.nro_documento + " ya aparece en la rendición N° " + data[0].folio + ". ¿Confirmas que corresponde enviarlo nuevamente?")) return;
     }
-    // Subimos los comprobantes ANTES de crear la rendición -- así, si todos
-    // fallan (red, un nombre de archivo raro, etc.), nunca se llega a
-    // insertar la cabecera y no se quema un folio en el intento. Antes se
-    // creaba la cabecera primero: cada reintento fallido dejaba una
-    // rendición fantasma en $0 Y el número de folio se perdía para siempre
-    // (una secuencia autoincremental de Postgres no reutiliza los números
-    // de filas borradas).
-    const rendicionId = crypto.randomUUID();
-    const itemsConAdjunto = [];
-    const erroresItems = [];
-    for (const [idx, item] of items.entries()) {
-      const file = item._fotoInput?.files?.[0];
-      delete item._fotoInput;
-      let adjuntoUrl = null;
-      if (file) {
-        // Un nombre de archivo con "°", tildes u otros caracteres fuera de
-        // ASCII rompe la ruta del storage y la subida falla -- ej. "Factura
-        // N°9893.pdf". Se sanea antes de armar la ruta, la persona nunca ve
-        // este nombre (solo se usa como parte interna del path).
-        const nombreSeguro = file.name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
-        // "idx" (además de Date.now()) evita que dos ítems con el mismo
-        // nombre de archivo (ej. dos fotos "foto.jpg" del celular) puedan
-        // llegar a compartir la misma ruta si alguna vez coincidiera el
-        // milisegundo -- upload() no sobreescribe en silencio (falla con
-        // 409), pero total es gratis evitarlo del todo.
-        const path = `${currentUser.id}/${rendicionId}-${idx}-${Date.now()}-${nombreSeguro}`;
-        // Timeout propio (no solo el de conTimeout) para que un archivo
-        // colgado no aborte tratar de subir el resto de los ítems -- se
-        // captura acá mismo, no se deja propagar al try/catch general de
-        // toda la función, que si no habría cortado en seco el envío
-        // completo en vez de seguir con los ítems que sí van bien.
-        let upErr = null;
-        try {
-          const resp = await conTimeout(
-            db.storage.from("comprobantes").upload(path, file),
-            45000,
-            "Se agotó el tiempo de espera subiendo el archivo (conexión muy lenta o caída)."
-          );
-          upErr = resp.error;
-        } catch (timeoutErr) {
-          upErr = timeoutErr;
-        }
-        if (upErr) {
-          console.error("Error subiendo comprobante:", upErr);
-          erroresItems.push(`Ítem ${idx + 1}: no se pudo subir el comprobante (${upErr.message}).`);
-          continue;
-        }
-        adjuntoUrl = path;
-      }
-      itemsConAdjunto.push({ item, idx, adjunto_url: adjuntoUrl });
-    }
-
-    if (!itemsConAdjunto.length) {
-      toast(`No se pudo subir ningún comprobante, así que no se creó la rendición. ${erroresItems.join(" · ")}`);
-      return;
-    }
-
-    const { data: rendicion, error: errR } = await db
-      .from("rendiciones")
-      .insert({
-        id: rendicionId,
-        empleado_id: currentUser.id,
-        empleado_nombre: currentProfile?.nombre || currentUser.email,
-        rut_empleado: currentProfile?.rut || null,
-        tipo_rendicion: tipoRendicion,
-        empresa: empresaRendicion,
-        monto_total: itemsConAdjunto.reduce((s, x) => s + x.item.monto, 0),
-        estado: "Pendiente",
-        comentario,
-        solicitud_fondo_id: solicitudFondoId,
-      })
-      .select()
-      .single();
-    if (errR) throw errR;
-
-    // Se recalcula el total según lo que REALMENTE queda guardado -- si el
-    // insert del ítem en sí falla (más raro que la subida, ej. una
-    // restricción de la base), ese ítem se descarta y el monto_total no
-    // debe incluirlo.
-    let montoRealGuardado = 0;
-    let itemsGuardados = 0;
-    for (const { item, idx, adjunto_url } of itemsConAdjunto) {
-      const { error: itemErr } = await db.from("rendicion_items").insert({ ...item, rendicion_id: rendicion.id, adjunto_url });
-      if (itemErr) {
-        console.error("Error guardando ítem:", itemErr);
-        erroresItems.push(`Ítem ${idx + 1}: no se pudo guardar (${itemErr.message}).`);
-        continue;
-      }
-      montoRealGuardado += item.monto;
-      itemsGuardados++;
-    }
-
-    if (!itemsGuardados) {
-      // El o los comprobantes sí se subieron, pero el insert del ítem en sí
-      // falló para todos -- igual limpiamos la cabecera para no dejar el
-      // folio con una rendición vacía. .select() para confirmar que el
-      // borrado realmente afectó la fila (requiere la policy
-      // "rendiciones_delete_propia_vacia") y no decirle a la persona que se
-      // borró cuando en realidad quedó ahí, bloqueada en silencio por RLS
-      // -- el mismo caso que ya nos mordió con aprobarItem antes de que
-      // existiera updateChecked().
-      const { data: borrada } = await db.from("rendiciones").delete().eq("id", rendicion.id).select();
-      const mensajeBase = `No se pudo guardar ningún ítem. ${erroresItems.join(" · ")}`;
-      toast(borrada && borrada.length
-        ? `${mensajeBase} La rendición no quedó creada.`
-        : `${mensajeBase} La rendición quedó guardada vacía -- avisa a un admin para que la revise.`);
-      return;
-    }
-
-    if (montoRealGuardado !== rendicion.monto_total) {
-      await db.from("rendiciones").update({ monto_total: montoRealGuardado }).eq("id", rendicion.id);
-    }
-
-    if (erroresItems.length) {
-      toast(`Se guardaron ${itemsGuardados} de ${items.length} ítems. Revisa la rendición y vuelve a cargar los que fallaron:\n${erroresItems.join(" · ")}`);
-    }
-
-    notificarAsync("notificar-aprobador", { rendicion_id: rendicion.id }, "No se pudo notificar al aprobador:");
+    const usuarioEnvio = currentUser.id;
+    const rendicionId = envioRendicionId || (envioRendicionId = crypto.randomUUID());
+    const preparados = await window.RindeData.prepararAdjuntos(db,items,usuarioEnvio,rendicionId,adjuntosBorrador,conTimeout);
+    if(currentUser?.id!==usuarioEnvio) throw new Error("La sesión cambió durante el envío. Ingresa nuevamente.");
+    const resultado = await conTimeout(window.RindeData.guardarRendicionCompleta(db,{
+      id:rendicionId,tipo_rendicion:tipoRendicion,empresa:empresaRendicion,
+      comentario,solicitud_fondo_id:solicitudFondoId,fecha_rendicion:fecha,
+    },preparados),45000,"No se pudo confirmar el envío. Tu formulario se conserva; reintenta para comprobar si ya fue recibido.");
+    if(currentUser?.id!==usuarioEnvio) return;
+    const rendicion = resultado.rendicion;
+    if(!resultado.reutilizada) notificarAsync("notificar-aprobador", { rendicion_id: rendicion.id }, "No se pudo notificar al aprobador:");
 
     // Si algún ítem quedó con el comprobante sin leer, no hace falta
     // esperar hasta 5 minutos al próximo tick del cron (ver
@@ -5081,12 +5007,14 @@ async function submitRendicion() {
       notificarAsync("ocr-reintento-pendientes", {}, "No se pudo disparar el reintento inmediato de OCR:");
     }
 
-    toast("Rendición enviada a aprobación.");
+    toast(resultado.reutilizada ? "El envío anterior ya fue recibido. No se creó otra rendición." : "Rendición enviada completa a aprobación.");
+    adjuntosBorrador.clear();
     replaceView("view-dashboard");
     loadDashboard();
   } catch (err) {
     toast(mensajeErrorAmigable(err));
   } finally {
+    enviandoRendicion = false;
     btn.disabled = false;
     btn.textContent = "Enviar a aprobación";
   }
@@ -5397,7 +5325,7 @@ async function openDetalle(id, pushHistory = true) {
   box.appendChild(el("div", { class: "detail-header" }, [
     el("div", {}, [
       el("h2", { style: "margin:0 0 4px" }, `N° ${r.folio ?? "-"} · ${r.comentario || `${r.empresa || "Sin empresa"} / ${r.tipo_rendicion}`}`),
-      el("p", { style: "margin:0;color:var(--ink-soft);font-size:0.88rem" }, `${r.empleado_nombre} · ${fmtDate(r.created_at)}`),
+      el("p", { style: "margin:0;color:var(--ink-soft);font-size:0.88rem" }, `${r.empleado_nombre} · ${fmtDate(r.fecha_rendicion || r.created_at)}`),
     ]),
     el("span", { class: "pill " + r.estado, style: "font-size:0.8rem" }, r.estado),
   ]));
@@ -6158,12 +6086,8 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov2`).value.trim();
           cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`).value;
           cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
-          // Sale de "Documento electrónico": estos campos ya no aplican y no
-          // deben quedar reflejando un tipo de documento que ya no es este ítem.
-          cambios.rut_proveedor = null;
-          cambios.tipo_documento = null;
-          cambios.nro_documento = null;
-          cambios.fecha_vencimiento = null;
+          // RUT, folio y fecha siguen identificando el comprobante original.
+          // Cambiar categoría o tratamiento contable no elimina esa evidencia.
           cambios.existe_en_contabilidad = null;
           cambios.comprobante_contable_encontrado = null;
         }
@@ -6214,7 +6138,7 @@ function csvRow(fields) {
 // de lo que se le había entregado, el excedente aparte contra "Rendiciones
 // por Pagar" -- como si esa parte fuera un reembolso normal de bolsillo.
 function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null) {
-  const fecha = fmtDateSlash(rendicion.created_at) || rendicion.created_at;
+  const fecha = fmtDateSlash(rendicion.fecha_rendicion || rendicion.created_at) || rendicion.created_at;
   const fondoFolio = split?.fondoFolio ?? rendicion.solicitudes_fondos?.folio;
   const referenciaFondo = rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondoFolio != null ? " · FONDO S-" + fondoFolio : "";
   const glosa = (`RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}` + referenciaFondo).replace(/\s+/g, " ").trim();
@@ -6371,7 +6295,7 @@ async function* iterarImagenesAdjunto(path) {
   const resp=await fetch(signed.signedUrl);if(!resp.ok)throw new Error("No se pudo descargar el adjunto");
   const blob=await resp.blob();
   if(blob.type === "application/pdf" || path.toLowerCase().endsWith(".pdf")){
-    const pdfjs=await cargarPdfJs();const pdf=await pdfjs.getDocument({data:await blob.arrayBuffer()}).promise;
+    const pdfjs=await cargarPdfJs();const pdf=await window.RindeData.abrirPdfSeguro(pdfjs,await blob.arrayBuffer()).promise;
     try{
       for(let n=1;n<=pdf.numPages;n++){
         const page=await pdf.getPage(n);const viewport=page.getViewport({scale:1});
@@ -6420,7 +6344,7 @@ async function generarInformePDF(rendicion, items) {
     };
     linea(rendicion.empleado_nombre,true);
     linea("RUT: " + (rendicion.rut_empleado || "-") + " · " + (rendicion.empresa || "-"));
-    linea("Fecha: " + fmtDate(rendicion.created_at) + " · " + (rendicion.tipo_rendicion === "FondoPorRendir" ? "Fondo por rendir" : "Reembolso") + " · Estado: " + rendicion.estado);
+    linea("Fecha: " + fmtDate(rendicion.fecha_rendicion || rendicion.created_at) + " · " + (rendicion.tipo_rendicion === "FondoPorRendir" ? "Fondo por rendir" : "Reembolso") + " · Estado: " + rendicion.estado);
     if(rendicion.comentario)linea("Motivo: " + rendicion.comentario);
     if(rendicion.estado === "Aprobado")linea("Aprobado por " + (rendicion.aprobador_nombre || "-") + " · " + fmtDate(rendicion.fecha_aprobacion));
     if(rendicion.estado === "Rechazado")linea("Rechazado por " + (rendicion.aprobador_nombre || "-") + ". " + (rendicion.motivo_rechazo || "Sin motivo registrado"));
