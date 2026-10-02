@@ -896,3 +896,4 @@ button {
 .revision-estado { font-size:11px; color:var(--ink-soft); grid-row:1; grid-column:2; }
 .revision-campo [hidden], .revision-comprobante [hidden] { display:none !important; }
 @media(max-width:760px) { .revision-cuerpo { grid-template-columns:1fr; } .revision-comprobante { padding:12px; } }
+@media(max-width:640px) { .stat-row .stat-card:last-child { grid-column:1/-1; } .stat-card .value { overflow-wrap:anywhere; } }
