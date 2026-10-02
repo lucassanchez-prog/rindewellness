@@ -26,8 +26,16 @@ test('respaldo requiere clave, plan gratuito, activación y consentimiento; no t
 test('Groq devuelve el mismo formato verificable y su error no revela respuesta ni clave',async()=>{
  const {consultarGroq}=await modulo('respaldo-nube'),{demoraTransitoriaOcr}=await modulo('reintentos-ocr');const config={GROQ_API_KEY:'clave-prueba',GROQ_PLAN:'free',GROQ_OCR_ENABLED:'true',GROQ_OCR_CONSENT:'true'};let peticion;
  const r=await consultarGroq('YWJj','image/jpeg','solo datos',config,1000,async(url,opciones)=>{peticion={url,...opciones};return new Response(JSON.stringify({choices:[{message:{content:'{"monto":12300}'}}]}));});
- assert.equal(JSON.parse(r.candidates[0].content.parts[0].text).monto,12300);assert.equal(peticion.url,'https://api.groq.com/openai/v1/chat/completions');assert.equal(JSON.parse(peticion.body).messages[0].content[1].image_url.url,'data:image/jpeg;base64,YWJj');
+ assert.equal(JSON.parse(r.candidates[0].content.parts[0].text).monto,12300);assert.equal(peticion.url,'https://api.groq.com/openai/v1/chat/completions');assert.equal(JSON.parse(peticion.body).messages[0].content[1].image_url.url,'data:image/jpeg;base64,YWJj');assert(JSON.parse(peticion.body).max_completion_tokens<=2048);
  for(const [status,demora] of [[429,3600000],[503,900000],[401,null]]){let error;try{await consultarGroq('abc','image/png','p',config,1000,async()=>new Response('clave-prueba secreto',{status}));}catch(e){error=e;}assert(error);assert(!error.message.includes('clave-prueba'));assert.equal(demoraTransitoriaOcr(error),demora);}
+});
+test('Groq respeta la espera temporal indicada por el proveedor sin revelar su respuesta',async()=>{
+ const {consultarGroq}=await modulo('respaldo-nube'),{demoraTransitoriaOcr}=await modulo('reintentos-ocr');
+ const config={GROQ_API_KEY:'clave-prueba',GROQ_PLAN:'free',GROQ_OCR_ENABLED:'true',GROQ_OCR_CONSENT:'true'};
+ for(const [valor,esperado] of [['60',60000],['0',30000],['999999',86400000],['secreto-invalido',3600000]]){
+  let error;try{await consultarGroq('abc','image/png','p',config,1000,async()=>new Response('datos privados',{status:429,headers:{'retry-after':valor}}));}catch(e){error=e;}
+  assert(error);assert.equal(demoraTransitoriaOcr(error),esperado);assert(!error.message.includes('datos privados'));assert(!error.message.includes('secreto-invalido'));
+ }
 });
 test('evidencia rechaza coordenadas fuera de la página y un RUT inválido',async()=>{
  const {verificarCampos}=await modulo('verificacion-ocr');const datos={rut_proveedor:'12.345.678-0',monto:500,evidencias:{rut_proveedor:{caja:[0,0,1001,50]},monto:{texto:'$500',caja:[500,20,600,500]}}};const r=verificarCampos(datos);assert.equal(datos.rut_proveedor,null);assert.equal(r.rut_proveedor.caja,null);assert.deepEqual(r.monto.caja,[500,20,600,500]);assert.equal(r.monto.estado,'por_confirmar');
