@@ -666,7 +666,8 @@ export function interpretarRespuestaOcr(data: any): ResultadoOcr {
 // deberían tratarlo como éxito silencioso.
 export function tieneDatosUtiles(resultado: ResultadoOcr): boolean {
   if (resultado.requiere_separacion) return true;
-  return ["nombre_proveedor", "rut_proveedor", "monto", "nro_documento"].some((campo) => (resultado as Record<string, unknown>)[campo]);
+  return ["nombre_proveedor", "rut_proveedor", "tipo_documento", "monto", "nro_documento", "fecha", "descripcion", "categoria_sugerida"].some((campo) => (resultado as Record<string, unknown>)[campo])
+    || resultado.monto_discrepante === true;
 }
 
 export async function leerComprobante(admin:AdminClient|null,imageBase64:string,mimeType:string,presupuesto:PresupuestoTiempo=PRESUPUESTO_EN_VIVO,enfoque?:{camposFaltantes?:string[]|null;datosParciales?:Record<string,unknown>|null}):Promise<ResultadoOcr>{

@@ -4,9 +4,11 @@ export function revisarCompletitud(resultado: Record<string, unknown>, conocidos
   const valores={...conocidos,...Object.fromEntries(Object.entries(resultado).filter(([,v]) => v !== null && v !== undefined && v !== ""))};
   const campos=["nombre_proveedor","fecha","monto"];
   if (/factura|honorario/i.test(String(valores.tipo_documento || "")) || conocidos.tipo_item === "ConDocumento") campos.push("rut_proveedor","tipo_documento","nro_documento");
-  const pendientes=campos.filter(c => c === "monto" ? !(Number(valores[c])>0) || !!resultado.monto_discrepante : !String(valores[c] ?? "").trim());
+  const discrepantes = Array.isArray(resultado.campos_discrepantes) ? resultado.campos_discrepantes : [];
+  const pendientes=campos.filter(c => discrepantes.includes(c) || (c === "monto" ? !(Number(valores[c])>0) || !!resultado.monto_discrepante : !String(valores[c] ?? "").trim()));
+  for (const c of ["rut_proveedor","nro_documento","fecha","monto"]) if (discrepantes.includes(c) && !pendientes.includes(c)) pendientes.push(c);
   const revisiones=resultado.verificacion_campos as Record<string, {estado?:string;motivo?:string}> | undefined;
-  for(const c of campos) if (revisiones?.[c]?.estado === "por_confirmar" && /discrepan|contradict|no coincide/i.test(revisiones[c]?.motivo || "") && !pendientes.includes(c)) pendientes.push(c);
+  for(const c of campos) if (revisiones?.[c]?.estado === "por_confirmar" && /discrepan|contradict|no coincide|difiere/i.test(revisiones[c]?.motivo || "") && !pendientes.includes(c)) pendientes.push(c);
   return {...resultado,revision_estado:pendientes.length ? "parcial" : "completo",campos_pendientes:pendientes};
 }
 

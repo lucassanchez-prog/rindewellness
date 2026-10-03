@@ -1,4 +1,5 @@
 import { revisarCompletitud, estadoTrasIntento } from "../_shared/estado-lectura.ts";
+import { fusionarIntentosOcr } from "../_shared/fusion-lectura.ts";
 import { demoraTransitoriaOcr } from "../_shared/reintentos-ocr.ts";
 // Edge Function: ocr-reintento-pendientes
 // El "agente" que vive en Supabase que reintenta, en segundo plano, los
@@ -177,17 +178,6 @@ function camposFaltantesDe(parciales: Record<string, unknown> | null): string[] 
   return CAMPOS_OCR.filter((c) => parciales[c] === null || parciales[c] === undefined || parciales[c] === "");
 }
 
-// El RUT, el tipo, el folio, la fecha y el monto de la lectura local le ganan
-// a los de Gemini, y no por desconfianza en el modelo: salen del TEXTO del
-// documento, mientras que los del modelo salen de interpretar una imagen. Que
-// el reintento de segundo plano "corrija" un folio que ya estaba bien leído
-// sería un retroceso silencioso, y nadie lo estaría mirando cuando pasa.
-function fusionarConParciales(_parciales: Record<string, unknown> | null, resultado: Record<string, unknown>): Record<string, unknown> {
-  // La UI ya conserva sus valores locales y las ediciones de la persona.
-  // El resultado del agente mantiene únicamente lo respaldado por su lectura.
-  return resultado;
-}
-
 async function procesarPendiente(
   admin: ReturnType<typeof createClient>,
   tabla: string,
@@ -238,15 +228,18 @@ async function procesarPendiente(
     if(errorActual || !actual) throw errorActual || new Error("La reserva OCR dejó de estar vigente.");
     const previo=(tabla === "ocr_previos" ? actual.resultado : actual.ocr_reintento_resultado) || {};
     const guardados=tabla === "ocr_previos" ? (actual.datos_parciales || datosParciales || {}) : {...actual,fecha:actual.fecha_vencimiento};
-    const conocidos={...previo,...Object.fromEntries(Object.entries(guardados).filter(([,v])=>v !== null && v !== undefined && v !== ""))};
-    const faltantes = camposFaltantesDe(conocidos);
+    const conocidos=Object.fromEntries([...CAMPOS_OCR,"tipo_item"].map(c=>[c,guardados[c] ?? previo[c]]).filter(([,v])=>v !== null && v !== undefined && v !== ""));
+    const pendientes = revisarCompletitud(previo,conocidos).campos_pendientes as string[];
+    const faltantes = [...new Set([...camposFaltantesDe(conocidos),...pendientes])];
+    // No presentar un campo contradictorio como antecedente al próximo lector.
+    for (const campo of pendientes) delete conocidos[campo];
     const resultado = await leerComprobante(admin, base64, mimeType, PRESUPUESTO_SEGUNDO_PLANO, {
       camposFaltantes: faltantes,
       datosParciales: conocidos,
     });
 
     if (!tieneDatosUtiles(resultado)) throw new Error("No se obtuvo ningún campo legible del comprobante.");
-    const revision=revisarCompletitud({...previo,...fusionarConParciales(datosParciales, resultado),monto_discrepante:!!resultado.monto_discrepante},conocidos);
+    const revision=revisarCompletitud(fusionarIntentosOcr(previo,resultado),conocidos);
     const siguiente=estadoTrasIntento(revision,intentosPrevios+1,MAX_INTENTOS);
     await guardar({
       ocr_lease_hasta:siguiente === "pendiente" ? new Date(Date.now()+5*60*1000).toISOString() : null,

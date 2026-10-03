@@ -6,6 +6,8 @@ La lectura distingue resultados completos, parciales, contradictorios y document
 
 Las lecturas parciales se encolan también antes de enviar una rendición. El agente conserva los campos legibles, consulta los pendientes y respeta el máximo de dos intentos y las pausas por cuota o saturación. Sus resultados se guardan como sugerencias; no aprueba gastos ni modifica los montos guardados.
 
+Los reintentos fusionan cada campo con su evidencia: una respuesta vacía no borra una lectura anterior. Si dos intentos discrepan en RUT, folio, fecha o monto, el campo queda pendiente y se omite como antecedente del siguiente lector. Una contradicción previa no desaparece por un intento incompleto; requiere confirmación humana o dos nuevas lecturas coincidentes. Recuperar solo fecha o descripción también cuenta como avance. Estas reglas no agregan llamadas ni aumentan el máximo de reintentos.
+
 La comprobación local de fotos advierte sobre baja resolución y poco contraste. Es una heurística: no garantiza legibilidad ni detecta todos los casos de desenfoque o recorte.
 
 ## Fondos y contabilidad
