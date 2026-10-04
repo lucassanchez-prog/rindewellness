@@ -1,14 +1,15 @@
 <!doctype html>
-<html lang="es">
+<html lang="es" data-theme="dark">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="theme-color" content="#046bd2" />
+<meta name="theme-color" content="#10191f" />
 <title>RindeWellness</title>
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="assets/logo-gw.png" />
 <link rel="apple-touch-icon" href="assets/logo-gw.png" />
-<link rel="stylesheet" href="styles.css?v=11" />
+<link rel="stylesheet" href="styles.css?v=12" />
+<link rel="stylesheet" href="portal-ui.css?v=92" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -152,7 +153,7 @@
   <!-- APP SHELL (topbar + views) -->
   <div id="app-shell" style="display:none">
     <div class="topbar">
-      <div class="brand"><img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" /> RindeWellness</div>
+      <a class="brand" id="portal-brand" href="#inicio"><img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" /> RindeWellness</a>
       <div class="user">
         <span id="user-name"></span>
         <button class="btn btn-ghost" id="btn-admin-usuarios" style="display:none">Usuarios</button>
@@ -161,7 +162,11 @@
       </div>
     </div>
 
-    <div class="app-shell">
+    <div class="portal-shell">
+    <button type="button" id="portal-menu-toggle" class="portal-menu-toggle" aria-expanded="false" aria-controls="portal-nav">Menú · Inicio</button>
+    <nav class="portal-nav" id="portal-nav" aria-label="Módulos principales"></nav>
+    <main class="app-shell">
+      <section id="view-inicio" class="view"><div class="hero-row"><div><h1>Tu espacio de trabajo</h1><p>Lo pendiente, los fondos y tus últimos movimientos.</p></div><div class="portal-export-actions"><a class="btn btn-secondary" href="#nueva-solicitud" data-portal-route="nueva-solicitud">Solicitar fondos</a><a class="btn btn-primary" href="#nueva" data-portal-route="nueva">+ Nueva rendición</a></div></div><div id="portal-home-content"><p role="status">Cargando tus rendiciones…</p></div></section>
 
       <!-- DASHBOARD -->
       <div id="view-dashboard" class="view">
@@ -198,7 +203,7 @@
         </div>
 
         <p id="dashboard-carga-status" class="ocr-status show" role="status" aria-live="polite" hidden></p>
-        <div class="stat-row" id="stat-row"></div>
+        <div class="stat-row" id="stat-row"></div><div id="portal-fund-stats" class="portal-metrics"></div>
 
         <div class="filter-bar" id="filter-bar">
           <div class="field">
@@ -384,7 +389,7 @@
             </div>
           </div>
         </div>
-        <div id="reportes-contenido"></div>
+        <div id="portal-report-summary" class="portal-metrics"></div><div id="reportes-contenido"></div>
       </div>
 
       <!-- ADMINISTRACION DE PLANTILLAS DE PERFIL -->
@@ -397,6 +402,7 @@
         <div class="card-list" id="list-plantillas"></div>
       </div>
 
+    </main>
     </div>
   </div>
 
@@ -408,13 +414,14 @@
        app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
        2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
        el navegador seguía sirviendo la versión anterior. -->
-  <script src="pure.js?v=91"></script>
-  <script src="data-access.js?v=91"></script>
-  <script src="reportes-exportacion.js?v=91"></script>
-  <script src="lector-local.js?v=91"></script>
-  <script src="foto-comprobante.js?v=91"></script>
-  <script src="revision-comprobante.js?v=91"></script>
-  <script src="app.js?v=91"></script>
+  <script src="pure.js?v=92"></script>
+  <script src="data-access.js?v=92"></script>
+  <script src="reportes-exportacion.js?v=92"></script>
+  <script src="lector-local.js?v=92"></script>
+  <script src="foto-comprobante.js?v=92"></script>
+  <script src="revision-comprobante.js?v=92"></script>
+  <script src="portal-ui.js?v=92"></script>
+  <script src="app.js?v=92"></script>
 </body>
 </html>
 

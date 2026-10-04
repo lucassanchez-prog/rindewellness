@@ -5,7 +5,7 @@
   "description": "RindeWellness: interfaz, reglas de rendiciones y validación automática.",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "lint": "eslint app.js pure.js data-access.js reportes-exportacion.js lector-local.js foto-comprobante.js revision-comprobante.js sw.js"
+    "lint": "eslint app.js pure.js data-access.js reportes-exportacion.js lector-local.js foto-comprobante.js revision-comprobante.js portal-ui.js sw.js"
   },
   "devDependencies": {
     "eslint": "10.11.0"

@@ -33,10 +33,10 @@ test('abrir fondo aprobado presenta consumo y saldo sin ReferenceError',async()=
  const fondo={id:'f',folio:2,estado:'Aprobado',empleado_id:'u',monto_solicitado:100};
  const q={select:()=>q,eq:()=>q,maybeSingle:async()=>({data:fondo,error:null})};
  const nodo=(tag,attrs,children)=>({tag,attrs,children,nodes:[],appendChild(n){this.nodes.push(n);},setAttribute(){}});
- const c=ctx({db:{from:()=>q},document:{getElementById:()=>box},currentProfile:{},currentUser:{id:'u'},esAprobadorEfectivo:()=>false,fmtCLP:String,fmtDate:String,el:nodo,filaClickable:(_,c)=>nodo('tr',{},c),consultarTodas:async()=>[{id:'r',folio:1,estado:'Pendiente',monto_total:80,monto_aprobado:0}],pushView(){},replaceView(){},show(){},pushState(){},history:{pushState(){}},toast(){},renderRoute(){}});
+ const c=ctx({window:{RindeUI:{metric:(label,value,help)=>nodo("div",{},[label,value,help])}},db:{from:()=>q},document:{getElementById:()=>box},currentProfile:{},currentUser:{id:'u'},esAprobadorEfectivo:()=>false,fmtCLP:String,fmtDate:String,el:nodo,filaClickable:(_,c)=>nodo('tr',{},c),consultarTodas:async()=>[{id:'r',folio:1,estado:'Pendiente',monto_total:80,monto_aprobado:0}],pushView(){},replaceView(){},show(){},pushState(){},history:{pushState(){}},toast(){},renderRoute(){}});
  vm.runInContext(tramo('function resumirConsumoFondo(','async function cargarConsumoFondos('),c);
  vm.runInContext(tramo('async function openDetalleSolicitud(','async function '),c);
- await c.openDetalleSolicitud('f',false);const texto=JSON.stringify(box.nodes);assert.match(texto,/consumido/);assert.match(texto,/80/);assert.match(texto,/20/);
+ await c.openDetalleSolicitud('f',false);const texto=JSON.stringify(box.nodes);assert.match(texto,/Consumo aprobado/);assert.match(texto,/En revisión/);assert.match(texto,/80/);assert.match(texto,/20/);
 });
 test('una respuesta del agente que requiere separación conserva el error',async()=>{
  const estado={textContent:'',className:''};let sondeo;
@@ -83,4 +83,23 @@ test('folios y fechas contradictorios no se conservan por preferencia del lector
  const r=c.fusionarLecturas({nro_documento:'123',fecha:'2026-09-30'},{nro_documento:'124',fecha:'2026-10-01'},{});
  assert.equal(r.datos.nro_documento,null);assert.equal(r.aporteIA.fecha,null);assert(r.aporteIA.campos_discrepantes.includes('nro_documento'));
  const normalizado=c.fusionarLecturas({nro_documento:'00123'},{nro_documento:'123'},{});assert.equal(normalizado.datos.nro_documento,'00123');
+});
+
+test('navegar por fondos conserva su destino al volver y no reinicia la vista actual',()=>{
+ let rendered;const location={hash:'#inicio'},history={state:null,pushState(state,unused,hash){this.state=state;location.hash=hash;}};
+ const c=ctx({location,history,renderRoute:state=>{rendered=state;},window:{scrollTo(){}}});
+ vm.runInContext(tramo('function navegarPortal(','function configurarSeccionDashboard('),c);
+ c.navegarPortal('fondos');assert.equal(rendered.viewId,'view-dashboard');assert.equal(rendered.params.section,'fondos');assert.equal(history.state.portalDepth,1);
+ const previous=rendered;c.navegarPortal('fondos');assert.equal(rendered,previous);assert.equal(history.state.portalDepth,1);
+ c.navegarPortal('nueva');assert.equal(history.state.viewId,'view-nueva');assert.equal(history.state.portalDepth,2);
+});
+
+test('el selector de fondo reserva pendientes y no convierte un fallo de saldo en cero',async()=>{
+ const select={disabled:false,children:[],replaceChildren(...children){this.children=children;}};
+ let failure=false,call=0;
+ const c=ctx({currentUser:{id:'u'},document:{getElementById:id=>id==='nr-fondo'?select:{value:'Empresa'}},window:{RindeUI:{updateFormSummary(){}}},el:(tag,attrs,text)=>({tag,attrs,text}),fmtCLP:String,consultarTodas:async()=>{call++;if(call===1)return [{id:'f',folio:2,monto_solicitado:350000}];if(failure)throw Error('fallo');return [{solicitud_fondo_id:'f',estado:'Pendiente',monto_total:105131,monto_aprobado:40131},{solicitud_fondo_id:'f',estado:'Rechazado',monto_total:20000}];},console:{error(){}}});
+ vm.runInContext(tramo('function resumirConsumoFondo(','async function cargarConsumoFondos('),c);
+ vm.runInContext(tramo('let cargaSolicitudesDisponibles =','// El Centro de Costo'),c);
+ await c.cargarSolicitudesDisponibles();assert.match(select.children[0].text,/Disponible 244869/);assert.match(select.children[0].text,/En revisión 65000/);
+ failure=true;call=0;await c.cargarSolicitudesDisponibles();assert.equal(select.children[0].attrs.value,'');assert.match(select.children[0].text,/No se pudo comprobar/);assert.equal(select.disabled,false);
 });
