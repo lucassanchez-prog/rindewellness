@@ -54,3 +54,6 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .portal-shell select{max-width:100%;min-height:44px;background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:9px 12px;font:inherit}.portal-shell h1,.portal-shell h2,.portal-shell h3,.portal-shell td{overflow-wrap:anywhere}
 
 .portal-receipt-zoom{display:flex;align-items:center;gap:8px;margin:0 0 16px}.portal-receipt-zoom small{flex:1;color:var(--ink-soft);font-size:12px}.portal-receipt-zoom span{font-size:12px;min-width:40px;text-align:center}.portal-receipt-zoom .btn{min-width:44px;min-height:44px;font-size:18px;padding:5px}
+
+.btn{text-decoration:none}
+@media(min-width:901px){.portal-nav{position:sticky;top:0;height:100vh;align-self:start;overflow-y:auto}}

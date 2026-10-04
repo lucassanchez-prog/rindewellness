@@ -183,6 +183,7 @@ function estadoDesdeHash() {
 function pushView(viewId, params = {}) {
   show(viewId);
   history.pushState({ viewId, params, portalDepth:(history.state?.portalDepth||0)+1 }, "", "#" + hashDeVista(viewId, params));
+  window.scrollTo({top:0,behavior:"auto"});
 }
 function replaceView(viewId, params = {}) {
   show(viewId);
