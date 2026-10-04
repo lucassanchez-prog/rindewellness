@@ -20,9 +20,16 @@
     const nav = document.getElementById('portal-nav');
     const menu=document.getElementById('portal-menu-toggle');
     menu.addEventListener('click',()=>{const open=nav.classList.toggle('is-open');menu.setAttribute('aria-expanded',String(open));});
-    const routes = [['inicio','Inicio'],['dashboard','Rendiciones'],['fondos','Fondos'],['reportes','Reportes'],['admin','Usuarios'],['plantillas','Plantillas']];
+    const routes = [['inicio','Inicio'],['dashboard','Rendiciones'],['fondos','Fondos'],['reportes','Reportes'],['admin','Usuarios y plantillas']];
     for (const [route, label] of routes) nav.append(node('a',{href:'#'+route,'data-route':route,onclick:e=>{e.preventDefault();navigate(route);}},label));
     nav.append(node('p',{},'Crear y revisar'),link('Solicitar fondos','nueva-solicitud'),link('Nueva rendición','nueva'));
+    for (const [id, selected] of [['view-admin','admin'],['view-plantillas','plantillas']]) {
+      const tabs=node('nav',{class:'portal-admin-tabs','aria-label':'Gestión de usuarios y plantillas'},[]);
+      for(const [route,label] of [['admin','Usuarios'],['plantillas','Plantillas']]) {
+        const tab=link(label,route);if(route===selected){tab.classList.add('active');tab.setAttribute('aria-current','page');}tabs.append(tab);
+      }
+      document.getElementById(id).querySelector('.hero-row').after(tabs);
+    }
     document.getElementById('portal-brand').onclick = e => {e.preventDefault();navigate('inicio');};
     createFormLayouts();
   }
@@ -35,7 +42,7 @@
     if (destroyPreview && view !== 'view-detalle') {destroyPreview();destroyPreview=null;}
     const route = view==='view-dashboard' ? (section==='fondos'?'fondos':'dashboard') : view.replace('view-','');
     for (const a of document.querySelectorAll('#portal-nav a')) {
-      const active=a.getAttribute('href')==='#'+route || (route==='detalle' && a.dataset.route==='dashboard') || (route==='detalle-solicitud' && a.dataset.route==='fondos');
+      const active=a.getAttribute('href')==='#'+route || (route==='plantillas' && a.dataset.route==='admin') || (route==='detalle' && a.dataset.route==='dashboard') || (route==='detalle-solicitud' && a.dataset.route==='fondos');
       a.classList.toggle('active',active);
       if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');
     }

@@ -57,3 +57,4 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 
 .btn{text-decoration:none}
 @media(min-width:901px){.portal-nav{position:sticky;top:0;height:100vh;align-self:start;overflow-y:auto}}
+ .portal-admin-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 24px}.portal-admin-tabs .active{background:var(--success-bg);color:var(--success);border-color:var(--teal)}

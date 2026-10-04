@@ -6338,6 +6338,7 @@ async function generarInformePDF(rendicion, items) {
     linea("Corte del informe: "+corteInforme);
     const cantidadAdjuntos=(items || []).filter(it=>it.adjunto_url).length;
     linea("Respaldos: "+cantidadAdjuntos+" de "+resumen.total+" gastos con archivo adjunto."+(cantidadAdjuntos<resumen.total?" Hay gastos sin adjunto.":""));
+    if(resumen.rechazados)linea("Los gastos rechazados se conservan en este informe y no forman parte del monto aprobado ni del consumo del fondo.");
     if(rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id){
       const {data:fondo,error:errorFondo}=await db.from("solicitudes_fondos").select("id,folio,monto_solicitado").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
       if(!errorFondo && fondo){
@@ -6347,7 +6348,7 @@ async function generarInformePDF(rendicion, items) {
         doc.setFillColor(237,245,241);doc.roundedRect(margen,y,util,39,3,3,"F");
         doc.setFont("helvetica","bold");doc.setFontSize(9);doc.setTextColor(...verde);
         doc.text("FONDO S-"+fondo.folio+" · Monto del fondo: "+fmtCLP(fondo.monto_solicitado),margen+5,y+9);
-        doc.setTextColor(...tinta);doc.text(saldo?"Consumido total: "+fmtCLP(saldo.consumido)+" · Saldo: "+fmtCLP(saldo.saldo):"Consumo y saldo no disponibles",margen+5,y+18);
+        doc.setTextColor(...tinta);doc.text(saldo?"Consumido total: "+fmtCLP(saldo.consumido)+" · "+(saldo.saldo<0?"Exceso: "+fmtCLP(-saldo.saldo):"Disponible: "+fmtCLP(saldo.saldo)):"Consumo y saldo no disponibles",margen+5,y+18);
         doc.setFont("helvetica","normal");doc.setFontSize(8);
         if(saldo)doc.text("Aprobado: "+fmtCLP(saldo.aprobado)+" · Por revisar: "+fmtCLP(saldo.porRevisar),margen+5,y+25);
         doc.setFontSize(6.5);doc.text("Consumo: aprobados y pendientes de todas las rendiciones del fondo; excluye rechazados.",margen+5,y+33);y+=47;
@@ -6378,6 +6379,8 @@ async function generarInformePDF(rendicion, items) {
     const itemsConAdjunto = (items || [])
       .map((it, indiceOriginal) => ({ it, indiceOriginal }))
       .filter(({ it }) => it.adjunto_url);
+    const itemsSinAdjunto=(items || []).map((it,i)=>({it,i})).filter(({it})=>!it.adjunto_url);
+    if(itemsSinAdjunto.length){doc.addPage();doc.setFont('helvetica','bold');doc.setFontSize(16);doc.setTextColor(...tinta);doc.text('Gastos sin comprobante adjunto',margen,23);doc.setFont('helvetica','normal');doc.setFontSize(9);doc.text('Este informe contiene gastos sin respaldo documental adjunto.',margen,32);doc.autoTable({startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[['Gasto','Proveedor / descripción','Monto CLP','Estado']],body:itemsSinAdjunto.map(({it,i})=>[i+1,[it.nombre_proveedor,it.descripcion].filter(Boolean).join('\n')||'-',fmtCLP(it.monto),it.estado||'Pendiente']),styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:'right'},3:{cellWidth:35}}});}
     let adjuntosFallidos=0;
     const adjuntosPorRuta=new Map();
     for(const dato of itemsConAdjunto){if(!adjuntosPorRuta.has(dato.it.adjunto_url))adjuntosPorRuta.set(dato.it.adjunto_url,[]);adjuntosPorRuta.get(dato.it.adjunto_url).push(dato);}
@@ -6548,6 +6551,6 @@ async function exportarExcel() {
     const buffer=await libro.xlsx.writeBuffer();
     const blob=new Blob([buffer],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
     const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='rendiciones_'+corte.toISOString().slice(0,10)+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);
-    toast('Excel descargado: resumen, detalle y fondos.');
+    toast('Excel descargado: informe ejecutivo, resumen, detalle y fondos.');
   }catch(err){console.error('Error exportando a Excel:',err);toast('No se pudo generar el Excel: '+(err.message||''));}
 }

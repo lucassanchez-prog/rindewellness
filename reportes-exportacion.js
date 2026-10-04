@@ -26,6 +26,29 @@
   }
   function crearLibro(ExcelJS,datos,corte=new Date()){
     const wb=new ExcelJS.Workbook();wb.creator='RindeWellness';wb.created=corte;wb.modified=corte;wb.calcProperties.fullCalcOnLoad=true;
+    const ejecutivo=wb.addWorksheet('Informe ejecutivo',{views:[{showGridLines:false}],pageSetup:{orientation:'landscape',paperSize:9,fitToPage:true,fitToWidth:1,fitToHeight:0,printTitlesRow:'1:4'}});
+    ejecutivo.columns=[{width:38},{width:18},{width:22},{width:22},{width:22},{width:22}];
+    ejecutivo.mergeCells('A1:F1');ejecutivo.getCell('A1').value='RindeWellness · Informe ejecutivo';ejecutivo.getCell('A1').font={name:'Calibri',size:22,bold:true,color:{argb:'FF167F76'}};ejecutivo.getRow(1).height=40;
+    ejecutivo.mergeCells('A2:F2');ejecutivo.getCell('A2').value='Corte: '+new Intl.DateTimeFormat('es-CL',{timeZone:'America/Santiago',dateStyle:'medium',timeStyle:'short'}).format(corte)+' · Montos en pesos chilenos (CLP)';
+    ejecutivo.mergeCells('A3:F3');ejecutivo.getCell('A3').value='Alcance: todas las rendiciones y solicitudes accesibles para quien exporta. Los filtros de pantalla no se aplican a este archivo.';ejecutivo.getCell('A3').alignment={wrapText:true};ejecutivo.getRow(3).height=30;
+    function titulo(fila,texto){ejecutivo.mergeCells(fila,1,fila,6);const c=ejecutivo.getCell(fila,1);c.value=texto;c.fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF167F76'}};c.font={name:'Calibri',bold:true,color:{argb:'FFFFFFFF'},size:12};ejecutivo.getRow(fila).height=28;}
+    titulo(5,'Resultado de la revisión');
+    const claves=['rendido','aprobado','rechazado','pendiente'];
+    ['Monto rendido','Monto aprobado','Monto rechazado','Monto pendiente'].forEach((label,i)=>{const fila=6+i;ejecutivo.getCell(fila,1).value=label;ejecutivo.getCell(fila,3).value=datos.totales[claves[i]];ejecutivo.getCell(fila,3).numFmt='"$"#,##0';ejecutivo.getCell(fila,3).font={name:'Calibri',size:16,bold:true,color:{argb:i===2?'FFC35D4A':'FF213642'}};ejecutivo.getRow(fila).height=29;});
+    ejecutivo.getCell('A11').value='Rendiciones';ejecutivo.getCell('C11').value=datos.resumen.length;
+    ejecutivo.getCell('A12').value='Gastos';ejecutivo.getCell('C12').value=datos.detalle.length;
+    const adjuntos=datos.detalle.filter(it=>it['Comprobante Adjunto']==='Sí').length;
+    ejecutivo.getCell('A13').value='Gastos con comprobante';ejecutivo.getCell('C13').value=adjuntos;ejecutivo.getCell('D13').value=datos.detalle.length?adjuntos/datos.detalle.length:0;ejecutivo.getCell('D13').numFmt='0%';
+    ejecutivo.getCell('A14').value='Gastos sin comprobante';ejecutivo.getCell('C14').value=datos.detalle.length-adjuntos;
+    titulo(16,'Resumen por empresa');
+    ejecutivo.getRow(17).values=['Empresa','Rendiciones','Rendido','Aprobado','Rechazado','Pendiente'];
+    const empresas=new Map();for(const r of datos.resumen){const empresa=r.Empresa||'Sin empresa';if(!empresas.has(empresa))empresas.set(empresa,[empresa,0,0,0,0,0]);const fila=empresas.get(empresa);fila[1]++;['Monto rendido','Monto aprobado','Monto rechazado','Monto pendiente'].forEach((k,i)=>fila[i+2]+=Number(r[k]||0));}
+    let fila=18;for(const valores of empresas.values()){ejecutivo.getRow(fila).values=valores;for(let c=3;c<=6;c++)ejecutivo.getCell(fila,c).numFmt='"$"#,##0';fila++;}
+    if(!empresas.size){ejecutivo.getCell(fila++,1).value='Sin rendiciones para exportar.';}
+    titulo(fila+1,'Cómo interpretar este informe');
+    ['Rendido = aprobado + rechazado + pendiente. La aprobación parcial se calcula por gasto.','Los rechazados conservan su monto y motivo en el detalle, pero no consumen el fondo.','El consumo del fondo incluye aprobados y pendientes; el exceso se informa por separado.','La presencia de un adjunto indica que existe una referencia. Su disponibilidad se comprueba al generar el PDF.','El PDF individual incorpora las imágenes y todas las páginas de los comprobantes adjuntos.'].forEach((texto,i)=>{const n=fila+2+i;ejecutivo.mergeCells(n,1,n,6);ejecutivo.getCell(n,1).value=texto;ejecutivo.getCell(n,1).alignment={wrapText:true,vertical:'middle'};ejecutivo.getRow(n).height=30;});
+    ejecutivo.eachRow(row=>row.eachCell(cell=>{if(!cell.font)cell.font={name:'Calibri',size:11,color:{argb:'FF213642'}};cell.alignment={...cell.alignment,vertical:'middle',wrapText:true};}));
+    ejecutivo.headerFooter.oddFooter='RindeWellness · CLP &R Página &P de &N';
     function hoja(nombre,filas,cabeceras,nota){
       const ws=wb.addWorksheet(nombre,{views:[{state:'frozen',ySplit:5}],pageSetup:{orientation:'landscape',paperSize:9,fitToPage:true,fitToWidth:1,fitToHeight:0,printTitlesRow:'1:5'}});
       const keys=filas.length?Object.keys(filas[0]):cabeceras;
