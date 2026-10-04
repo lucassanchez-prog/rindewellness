@@ -894,12 +894,14 @@ function renderList(container, rows, showEmpleado) {
   container.replaceChildren();
   if(!rows.length){container.appendChild(el("div",{class:"empty-state"},"No hay rendiciones para estos filtros."));return;}
   const cols=["Folio",showEmpleado?"Empleado / Empresa":"Empresa","Motivo / Fecha","Rendido","Aprobado","Estado"];
-  const table=el("table",{class:"items-table portal-list-table"},[el("thead",{},el("tr",{},cols.map(c=>el("th",{},c))))]);
+  const table=el("table",{class:"items-table portal-list-table portal-rendiciones-table","aria-label":"Rendiciones"},[
+    el("colgroup",{},[8,23,27,15,15,12].map(width=>el("col",{style:"width:"+width+"%"}))),
+    el("thead",{},el("tr",{},cols.map((c,i)=>el("th",{scope:"col",class:i===3||i===4?"right":i===5?"center":""},c))))]);
   const tbody=el("tbody");
   rows.forEach(r=>{
     const cells=[el("td",{},"Nº "+(r.folio??"—")),el("td",{},[el("strong",{},showEmpleado?(r.empleado_nombre||"—"):(r.empresa||"—")),el("small",{},showEmpleado?(r.empresa||"—"):"")]),
       el("td",{},[el("span",{},r.comentario||"Sin comentario"),el("small",{},(r.tipo_rendicion==="FondoPorRendir"?"Fondo por rendir":"Reembolso")+" · "+fmtDate(r.fecha_rendicion||r.created_at))]),
-      el("td",{class:"monto"},fmtCLP(r.monto_rendido??r.monto_total)),el("td",{class:"monto portal-approved"},fmtCLP(r.monto_aprobado??(r.estado==="Aprobado"?r.monto_total:0))),el("td",{},el("span",{class:"pill "+r.estado},r.estado))];
+      el("td",{class:"monto"},fmtCLP(r.monto_rendido??r.monto_total)),el("td",{class:"monto portal-approved"},fmtCLP(r.monto_aprobado??(r.estado==="Aprobado"?r.monto_total:0))),el("td",{class:"center portal-status"},el("span",{class:"pill "+r.estado},r.estado))];
     cells.forEach((c,i)=>c.setAttribute("data-label",cols[i]));tbody.appendChild(filaClickable(()=>openDetalle(r.id),cells));
   });table.append(tbody);container.appendChild(el("div",{class:"table-scroll"},table));
 }
@@ -908,14 +910,16 @@ function renderListSolicitudes(container, rows, showEmpleado) {
   container.replaceChildren();
   if(!rows.length){container.appendChild(el("div",{class:"empty-state"},"No hay solicitudes de fondos para estos filtros."));return;}
   const cols=[showEmpleado?"Folio / Empleado":"Folio","Motivo / Empresa","Solicitado","Consumo aprobado","En revisión","Saldo / Exceso","Estado"];
-  const table=el("table",{class:"items-table portal-list-table fondos-tabla"},el("thead",{},el("tr",{},cols.map(c=>el("th",{},c)))));
+  const table=el("table",{class:"items-table portal-list-table fondos-tabla","aria-label":"Solicitudes de fondos"},[
+    el("colgroup",{},[16,24,12,14,11,13,10].map(width=>el("col",{style:"width:"+width+"%"}))),
+    el("thead",{},el("tr",{},cols.map((c,i)=>el("th",{scope:"col",class:i>=2&&i<=5?"right":i===6?"center":""},c))))]);
   const tbody=el("tbody");
   rows.forEach(s=>{
     const available=dashboardData.consumoFondos.get(s.id),c=available?resumirConsumoFondo(available,s.monto_solicitado):null,approved=s.estado==="Aprobado";
     const amount=v=>!approved?"—":c?fmtCLP(v):"No disponible";
     const cells=[el("td",{},[el("strong",{},"S-"+(s.folio??"—")),el("small",{},showEmpleado?(s.empleado_nombre||"—"):"")]),
       el("td",{},[el("span",{},s.motivo||"Sin motivo"),el("small",{},s.empresa||"—"),el("small",{},(s.centro_costo||"—")+" · "+fmtDate(s.created_at))]),el("td",{class:"monto"},fmtCLP(s.monto_solicitado)),el("td",{class:"monto portal-approved"},amount(c?.aprobado)),el("td",{class:"monto"},amount(c?.porRevisar)),
-      el("td",{class:"monto "+(c?.saldo<0?"portal-negative":"")},[amount(Math.abs(c?.saldo||0)),el("small",{},approved&&c?(c.saldo<0?"Exceso":"Disponible para rendir"):"")]),el("td",{},el("span",{class:"pill "+s.estado},s.estado))];
+      el("td",{class:"monto "+(c?.saldo<0?"portal-negative":"")},[amount(Math.abs(c?.saldo||0)),el("small",{},approved&&c?(c.saldo<0?"Exceso":"Disponible para rendir"):"")]),el("td",{class:"center portal-status"},el("span",{class:"pill "+s.estado},s.estado))];
     cells.forEach((cell,i)=>cell.setAttribute("data-label",cols[i]));tbody.appendChild(filaClickable(()=>openDetalleSolicitud(s.id),cells));
   });table.append(tbody);container.append(el("div",{class:"table-scroll"},table),el("p",{class:"portal-muted"},"El saldo descuenta gastos aprobados y pendientes de revisión. Los rechazados quedan excluidos."));
 }
@@ -6332,7 +6336,7 @@ async function generarInformePDF(rendicion, items) {
       const x=margen+i*(anchoMetrica+3);doc.setFillColor(243,247,248);doc.roundedRect(x,y,anchoMetrica,29,3,3,"F");
       doc.setFont("helvetica","bold");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(titulo,x+4,y+7);
       const importe=fmtCLP(monto);doc.setFontSize(importe.length>12?11:14);doc.setTextColor(...color);doc.text(importe,x+4,y+17);
-      doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(cantidad+" gastos",x+4,y+24);
+      doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(cantidad+(cantidad===1?" gasto":" gastos"),x+4,y+24);
     });
     y+=38;
     linea("Corte del informe: "+corteInforme);

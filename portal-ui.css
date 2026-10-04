@@ -58,3 +58,32 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .btn{text-decoration:none}
 @media(min-width:901px){.portal-nav{position:sticky;top:0;height:100vh;align-self:start;overflow-y:auto}}
  .portal-admin-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 24px}.portal-admin-tabs .active{background:var(--success-bg);color:var(--success);border-color:var(--teal)}
+
+/* Un mismo eje para encabezados e importes; el espacio privilegia persona y motivo. */
+.items-table th.right{text-align:right}.items-table th.center{text-align:center}
+.portal-list-table th,.portal-list-table td{vertical-align:middle;padding:15px 14px}
+.portal-list-table th{font-size:12px;font-weight:600}
+.portal-list-table td{font-size:14px;line-height:1.45}
+.portal-list-table td small{font-size:12px;line-height:1.45;font-weight:400;margin-top:5px;white-space:normal}
+.portal-list-table td.monto{font-size:15px;font-weight:650;letter-spacing:-.2px}
+.portal-list-table td:first-child{font-weight:600}
+.portal-list-table .portal-status .pill{display:inline-flex;align-items:center;justify-content:center;min-width:78px;white-space:nowrap;border-radius:6px;padding:6px 9px}
+.portal-list-table tbody tr.row-clickable:focus-visible{outline:2px solid var(--teal);outline-offset:-3px}
+.portal-list-table tbody tr.row-clickable:hover td{background:color-mix(in srgb,var(--teal) 6%,var(--card))}
+:root[data-theme="light"] .portal-approved{color:#087448}
+:root[data-theme="light"] .portal-list-table .pill.Aprobado{color:#087448;background:#e6f5ee}
+@media(min-width:701px){.portal-rendiciones-table{min-width:800px}.portal-list-table td:first-child{white-space:nowrap}.portal-list-table th:last-child,.portal-list-table td:last-child{padding-left:8px;padding-right:8px}}
+@media(max-width:700px){
+ .portal-list-table,.portal-list-table.fondos-tabla{min-width:0;border:0;background:transparent;overflow:visible}
+ .portal-list-table colgroup{display:none}
+ .portal-list-table tbody tr.row-clickable:not(.acciones-row):not(.item-extra-row){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}
+ .portal-list-table tbody td{padding:9px 0;border:0;min-width:0;grid-column:1/-1}
+ .portal-list-table td[data-label]::before{text-transform:none;letter-spacing:0;font-size:11px;font-weight:400;margin-bottom:5px}
+ .portal-list-table td.monto{grid-column:span 1;text-align:left;white-space:normal;overflow-wrap:anywhere;font-size:17px}
+ .portal-rendiciones-table td:first-child{grid-row:1;grid-column:1;font-size:15px}
+ .portal-rendiciones-table td.portal-status{grid-row:1;grid-column:2;text-align:right}
+ .portal-rendiciones-table td:first-child::before,.portal-rendiciones-table td.portal-status::before{display:none}
+ .portal-rendiciones-table td:nth-child(2){font-size:16px}
+ .portal-rendiciones-table td:nth-child(4),.portal-rendiciones-table td:nth-child(5){border-top:1px solid var(--line);margin-top:7px;padding-top:14px}
+ .portal-list-table td small{font-size:12px}
+}
