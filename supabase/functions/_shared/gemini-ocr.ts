@@ -552,7 +552,8 @@ async function leerConGemini(
 
   const data = await llamarGeminiConCandidatos(admin, body, presupuesto);
 
-  const primero = interpretarRespuestaOcr(data);
+  const conocidos = { tipo_item: enfoque?.tipoItem ?? null };
+  const primero = interpretarRespuestaOcr(data, conocidos);
   const campos = ["rut_proveedor", "nro_documento", "fecha", "monto"];
   // Segunda lectura independiente únicamente en segundo plano y dentro del
   // presupuesto existente. La primera respuesta nunca se muestra al segundo lector.
@@ -563,7 +564,7 @@ async function leerConGemini(
         ...body,
         contents: [{parts:[{text: PROMPT + "\nREVISIÓN: vuelve a leer los campos RUT del emisor, folio, fecha de emisión y TOTAL FINAL. Examina las etiquetas y no confundas emisor/receptor ni neto/IVA/total. Transcribe evidencia para cada campo."}, {inline_data:{mime_type:mimeType || "image/jpeg",data:imageBase64}}]}],
       }, {porLlamadaMs:Math.min(presupuesto.porLlamadaMs,restante),totalMs:restante});
-      const otro = interpretarRespuestaOcr(segunda);
+      const otro = interpretarRespuestaOcr(segunda, conocidos);
       for (const campo of campos) {
         const primeroValor = (primero as any)[campo], segundoValor = (otro as any)[campo];
         if (!primeroValor && segundoValor && (campo !== "monto" || !(primero as any).monto_discrepante)) {
@@ -576,7 +577,14 @@ async function leerConGemini(
         const revision = (primero.verificacion_campos as any)[campo];
         if (normalizar(primeroValor) !== normalizar(segundoValor)) {
           (primero as any)[campo] = null;
-          if (campo === "monto") {primero.monto_verificado = false;primero.monto_discrepante = true;}
+          // monto_origen se limpia junto con el monto, igual que hace
+          // interpretarRespuestaOcr ante cifras/palabras que no coinciden. Si
+          // no, el monto queda en null pero la procedencia sigue diciendo
+          // "palabras+digitos", y tanto fusionarIntentosOcr como la política
+          // de relleno del navegador leen esa procedencia como evidencia
+          // fuerte: un monto que dos lecturas nunca acordaron podía terminar
+          // presentándose como confirmado.
+          if (campo === "monto") {primero.monto_verificado = false;primero.monto_discrepante = true;primero.monto_origen = null;}
           revision.estado = "por_confirmar";
           revision.motivo = "Dos lecturas discrepan: " + String(primeroValor) + " / " + String(segundoValor) + ". Confirma este campo en el comprobante.";
         } else {
@@ -588,10 +596,17 @@ async function leerConGemini(
       console.error("La segunda revisión OCR no estuvo disponible; se conserva la primera lectura:",error instanceof Error ? error.message : String(error));
     }
   }
-  return revisarCompletitud(primero as unknown as Record<string, unknown>) as unknown as ResultadoOcr;
+  return revisarCompletitud(primero as unknown as Record<string, unknown>, conocidos) as unknown as ResultadoOcr;
 }
 
-export function interpretarRespuestaOcr(data: any): ResultadoOcr {
+// "conocidos" lleva lo que el llamador sabe del ítem y el modelo no puede
+// deducir -- en particular tipo_item. Sin eso, revisarCompletitud solo podía
+// exigir RUT, tipo y folio cuando el PROPIO modelo había reconocido el
+// documento como factura: en una foto donde el encabezado sale ilegible el
+// tipo vuelve null, la lectura se marcaba "completo" con solo proveedor,
+// fecha y monto, y se guardaba en caché 30 días sin encolarse para reintento.
+// Un documento tributario quedaba dado por leído sin RUT ni folio.
+export function interpretarRespuestaOcr(data: any, conocidos: Record<string, unknown> = {}): ResultadoOcr {
   const text = (data?.candidates?.[0]?.content?.parts || []).filter((p: any) => !p.thought && typeof p.text === "string").map((p: any) => p.text).join("");
   if (!text) {
     const finishReason = data?.candidates?.[0]?.finishReason;
@@ -658,7 +673,7 @@ export function interpretarRespuestaOcr(data: any): ResultadoOcr {
 
   revisarEstructuraDocumento(parsed);
   parsed.verificacion_campos = verificarCampos(parsed);
-  return revisarCompletitud(parsed) as unknown as ResultadoOcr;
+  return revisarCompletitud(parsed, conocidos) as unknown as ResultadoOcr;
 }
 
 // "200 OK con {} o casi vacío" es un resultado válido para Gemini pero
@@ -670,7 +685,7 @@ export function tieneDatosUtiles(resultado: ResultadoOcr): boolean {
     || resultado.monto_discrepante === true;
 }
 
-export async function leerComprobante(admin:AdminClient|null,imageBase64:string,mimeType:string,presupuesto:PresupuestoTiempo=PRESUPUESTO_EN_VIVO,enfoque?:{camposFaltantes?:string[]|null;datosParciales?:Record<string,unknown>|null}):Promise<ResultadoOcr>{
+export async function leerComprobante(admin:AdminClient|null,imageBase64:string,mimeType:string,presupuesto:PresupuestoTiempo=PRESUPUESTO_EN_VIVO,enfoque?:{camposFaltantes?:string[]|null;datosParciales?:Record<string,unknown>|null;tipoItem?:string|null}):Promise<ResultadoOcr>{
   const config=Object.fromEntries(['GROQ_OCR_ENABLED','GROQ_OCR_CONSENT','GROQ_PLAN','GROQ_API_KEY'].map(k=>[k,Deno.env.get(k)]));
   const permitido=habilitado(config)&&['image/jpeg','image/png','image/webp'].includes(mimeType);
   const inicio=Date.now();
@@ -683,7 +698,7 @@ export async function leerComprobante(admin:AdminClient|null,imageBase64:string,
     const restante=presupuesto.totalMs-(Date.now()-inicio);
     if(restante<2000)throw error;
     const bruto=await consultarGroq(imageBase64,mimeType,armarPrompt(enfoque?.camposFaltantes,enfoque?.datosParciales),config,restante);
-    const resultado=interpretarRespuestaOcr(bruto);
+    const resultado=interpretarRespuestaOcr(bruto,{tipo_item:enfoque?.tipoItem ?? null});
     return {...resultado,proveedor_lectura:'groq'} as ResultadoOcr;
   }
 }

@@ -132,11 +132,12 @@ Deno.serve(async (req: Request) => {
   // guardarlo junto al comprobante encolado en ocr_previos.
   let camposFaltantes: string[] | null = null;
   let datosParciales: Record<string, unknown> | null = null;
+  let tipoItem: string | null = null;
   try {
     const user = await requireUser(req);
     userId = user.id;
 
-    ({ imageBase64, mimeType, camposFaltantes, datosParciales } = await req.json());
+    ({ imageBase64, mimeType, camposFaltantes, datosParciales, tipoItem } = await req.json());
 
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
@@ -163,18 +164,25 @@ Deno.serve(async (req: Request) => {
       throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
     }
 
+    // El tope por hora va ANTES de consultar la caché. Al revés, una caché
+    // acertada respondía sin pasar por el contador y sin registrar nada: se
+    // podía repetir la misma petición en bucle, cada una decodificando hasta
+    // 15MB de base64 y calculando su SHA-256 dentro de una función con
+    // memoria acotada, sin que quedara rastro en system_events de que el
+    // endpoint estaba siendo golpeado. No gastaba cuota de Gemini, pero el
+    // tope no está solo para eso.
+    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
+    if (llamadasRecientes >= 25) {
+      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
+    }
+    await logEvent(admin, "ocr_call", { usuarioId: userId });
+
     const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
     const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
     const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
     const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",4).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
     if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
     if (anterior?.resultado && (anterior.resultado.revision_estado === "completo" || anterior.resultado.requiere_separacion)) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
-
-    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
-    if (llamadasRecientes >= 25) {
-      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
-    }
-    await logEvent(admin, "ocr_call", { usuarioId: userId });
 
 
     // ACÁ está el ahorro de cuota. El navegador lee el PDF localmente con
@@ -199,6 +207,10 @@ Deno.serve(async (req: Request) => {
     const resultado = await leerComprobante(admin, imageBase64, mimeType, undefined, {
       camposFaltantes,
       datosParciales,
+      // "ConDocumento" o "SinDocumento". El modelo no puede deducirlo del
+      // papel, y de eso depende si se exigen RUT, tipo y folio para dar la
+      // lectura por completa.
+      tipoItem: typeof tipoItem === "string" ? tipoItem : null,
     });
 
     // No es un fallo (la función igual responde 200), pero si Gemini no

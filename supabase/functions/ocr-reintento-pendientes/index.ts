@@ -236,6 +236,10 @@ async function procesarPendiente(
     const resultado = await leerComprobante(admin, base64, mimeType, PRESUPUESTO_SEGUNDO_PLANO, {
       camposFaltantes: faltantes,
       datosParciales: conocidos,
+      // Acá sí se sabe de qué pestaña viene el ítem, así que el lector puede
+      // exigir RUT, tipo y folio aunque el encabezado del papel salga
+      // ilegible y el modelo no reconozca el documento como factura.
+      tipoItem: typeof conocidos.tipo_item === "string" ? conocidos.tipo_item : null,
     });
 
     if (!tieneDatosUtiles(resultado)) throw new Error("No se obtuvo ningún campo legible del comprobante.");

@@ -3337,7 +3337,7 @@ function fusionarLecturas(local, ia, contable) {
 // el botón de reintento -- lo local ya sirve para enviar la rendición.
 async function completarConIA({ id, file, gen, statusEl, local, contable, datos, campos, aplicar, textoBase }) {
   try {
-    const ia = await llamarOcrRecibo(file, camposAPedirOcr(datos, campos), datosParcialesOcr(datos));
+    const ia = await llamarOcrRecibo(file, camposAPedirOcr(datos, campos), datosParcialesOcr(datos), campos === CAMPOS_OCR_CON ? "ConDocumento" : "SinDocumento");
     // Re-chequeo OBLIGATORIO después de CADA await, y con "return": mientras
     // la IA respondía, la persona pudo adjuntar otro comprobante. Si esto
     // sigue de largo, deja el ítem con datos de dos documentos distintos.
@@ -3718,7 +3718,7 @@ async function prepararComprobanteIa(file) {
   })().catch(error=>{fotosPreparadas.delete(file);throw error;}));
   return fotosPreparadas.get(file);
 }
-async function llamarOcrRecibo(file, camposFaltantes, datosParciales) {
+async function llamarOcrRecibo(file, camposFaltantes, datosParciales, tipoItem) {
   // Ambos proveedores ven la misma copia; la cola de nube recibe también esa imagen.
   file = await prepararComprobanteIa(file);
   const imageBase64 = await new Promise((resolve, reject) => {
@@ -3731,6 +3731,11 @@ async function llamarOcrRecibo(file, camposFaltantes, datosParciales) {
   const body = { imageBase64, mimeType: file.type || "image/jpeg" };
   if (camposFaltantes && camposFaltantes.length) body.camposFaltantes = camposFaltantes;
   if (datosParciales && Object.keys(datosParciales).length) body.datosParciales = datosParciales;
+  // De qu� pesta�a viene el �tem. El modelo no puede deducirlo del papel, y
+  // de eso depende si para dar la lectura por completa se exigen RUT, tipo y
+  // folio: sin esto, una factura fotografiada con el encabezado ilegible se
+  // daba por le�da con solo proveedor, fecha y monto.
+  if (tipoItem) body.tipoItem = tipoItem;
 
   const { data, error } = await conTimeout(
     db.functions.invoke("ocr-recibo", { body }),
@@ -4162,7 +4167,7 @@ async function analizarComprobante(id, file, statusEl) {
     // fuente. Igual pasa por la MISMA fusión, para que exista un solo camino
     // por el que los datos llegan a los campos -- antes eran dos, y lo que se
     // arreglaba en uno seguía roto en el otro.
-    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_CON, {});
+    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_CON, {}, "ConDocumento");
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
     const contableIA = await resolverDatosContables(ia?.rut_proveedor, ia?.nombre_proveedor);
     if (!esGeneracionVigenteOcr(id, gen)) return;
@@ -4400,7 +4405,7 @@ async function analizarComprobanteGastoDirecto(id, file, statusEl) {
       return;
     }
 
-    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_SIN, {});
+    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_SIN, {}, "SinDocumento");
     if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
     const contableIA = await resolverDatosContables(ia?.rut_proveedor, ia?.nombre_proveedor);
     if (!esGeneracionVigenteOcr(id, gen)) return;
@@ -5501,7 +5506,15 @@ async function openDetalle(id, pushHistory = true) {
     if (it.verificacion_contable) {
       const v=it.verificacion_contable;
       const caducada=v.empresa_revisada!==r.empresa || (v.miembros && JSON.stringify(v.miembros)!==JSON.stringify(window.RindeCore.grupoDocumentoContable(it,items).miembros));
-      tbody.appendChild(el("tr",{},[el("td",{colspan:String(columnas.length)},[el("div",{class:"verify-box show "+(v.estado==="coincide" && !caducada?"ok":"err")},"Verificación: "+(caducada?"caducada; cambió la distribución del documento":v.estado)+" · Monto revisado: "+fmtCLP(v.monto_rendido)+" · Cuenta "+(v.cuenta||"-")+" · "+(v.nombre_cuenta||"-")+" · "+(v.verificado_en?fmtDate(v.verificado_en):""))])]));
+      tbody.appendChild(el("tr",{},[el("td",{colspan:String(columnas.length)},[el("div",{class:"verify-box show "+(v.estado==="coincide" && !caducada?"ok":"err")},// Se muestra el monto que de VERDAD se comparó contra contabilidad, que
+// cuando el documento está repartido entre varios gastos es la suma del
+// grupo (monto_documento_rendido), no el del ítem suelto. Mostrar
+// monto_rendido hacía que una verificación correcta pareciera hecha contra
+// el número equivocado: una factura de $13.980 dividida en dos ítems de
+// $6.990 se comparaba bien por $13.980 y la caja decía "coincide · Monto
+// revisado: $6.990". Cuando hay varias partes se dice cuántas, para que el
+// total no parezca un error de otro tipo.
+"Verificación: "+(caducada?"caducada; cambió la distribución del documento":v.estado)+" · Monto revisado: "+fmtCLP(v.monto_documento_rendido ?? v.monto_rendido)+((v.miembros?.length>1)?" (suma de "+v.miembros.length+" gastos de este documento)":"")+" · Cuenta "+(v.cuenta||"-")+" · "+(v.nombre_cuenta||"-")+" · "+(v.verificado_en?fmtDate(v.verificado_en):""))])]));
     }
     if (it.ocr_reintento_estado === "pendiente") {
       tbody.appendChild(el("tr", {}, [
