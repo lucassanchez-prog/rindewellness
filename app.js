@@ -322,12 +322,26 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+function mostrarErrorInicio(mensaje) {
+  document.getElementById("inicio-sesion-status").textContent=mensaje;
+  document.getElementById("btn-reintentar-inicio").hidden=false;
+}
+
+async function restaurarSesionInicial() {
+  const {data,error}=await db.auth.getSession();
+  if(error)throw error;
+  if(document.getElementById("view-nueva-clave").classList.contains("active"))return;
+  if(data?.session)await onLoggedIn(data.session.user);
+  else show("view-login");
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
+  document.getElementById("btn-reintentar-inicio").addEventListener("click",()=>location.reload());
+  const esperaInicio=setTimeout(()=>mostrarErrorInicio("La conexión está tardando más de lo esperado. Puedes esperar o reintentar."),15000);
+  try {
   wireTheme();
   if (!CFG.SUPABASE_URL || !CFG.SUPABASE_ANON_KEY) {
-    document.getElementById("login-error").textContent =
-      "Falta configurar Supabase en config.js (SUPABASE_URL / SUPABASE_ANON_KEY).";
-    return;
+    throw new Error("Configuración de conexión no disponible");
   }
   db = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
 
@@ -350,10 +364,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   // abajo, porque supabase-js reproduce ese evento apenas alguien se
   // suscribe. Si no lo interceptamos acá, el chequeo de sesión de abajo la
   // metería directo al dashboard en vez de dejarla definir su clave nueva.
-  let esRecuperacionClave = false;
   db.auth.onAuthStateChange((event, session) => {
     if (event === "PASSWORD_RECOVERY") {
-      esRecuperacionClave = true;
       show("view-nueva-clave");
     } else if (event === "SIGNED_OUT") {
       currentUser = null;
@@ -363,10 +375,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  const { data } = await db.auth.getSession();
-  if (data.session && !esRecuperacionClave) {
-    await onLoggedIn(data.session.user);
-  }
+  await restaurarSesionInicial();
+  } catch(error) {
+    console.error("No se pudo iniciar RindeWellness:",error);
+    mostrarErrorInicio("No pudimos cargar tu espacio. Comprueba tu conexión y vuelve a intentar.");
+  } finally {clearTimeout(esperaInicio);}
 });
 
 // ------------------------------------------------------------
