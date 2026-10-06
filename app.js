@@ -4761,15 +4761,37 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
     // (ej. "Factura Electrónica #115277"), así que anclamos el folio al
     // final del texto, justo después de un "#", para no confundir folios
     // que son substring de otros (ej. "277" no debe matchear "#115277").
-    let query = dbContabilidad
-      .from("movimientos")
-      .select("*",{count:"exact"})
-      .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor)
-      .ilike(MOVIMIENTOS_COLS.folioDoc, `%#${item.nro_documento}`);
-    if (empresaRendicion) query = query.ilike(MOVIMIENTOS_COLS.empresa, empresaRendicion);
-    const { data, error, count } = await query.limit(500);
+    const consultar = (empresa) => {
+      let q = dbContabilidad
+        .from("movimientos")
+        .select("*",{count:"exact"})
+        .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor)
+        .ilike(MOVIMIENTOS_COLS.folioDoc, `%#${item.nro_documento}`);
+      if (empresa) q = q.ilike(MOVIMIENTOS_COLS.empresa, empresa);
+      return q.limit(500);
+    };
+    let { data, error, count } = await consultar(empresaRendicion);
     if (count != null && count > (data || []).length) throw new Error("Resultado contable incompleto");
     if (error) throw error;
+
+    // Si con el filtro de empresa no aparece nada, se repite la consulta SIN
+    // ese filtro antes de dar el documento por no registrado. Las dos bases
+    // escriben el nombre de la empresa distinto -- en contabilidad esta misma
+    // factura está como "NEO SPA" y la rendición dice "Neo Gym Chile SpA" --
+    // así que el ilike exacto la descartaba y la app informaba "todavía no
+    // aparece registrada en contabilidad" sobre una factura que sí estaba,
+    // con el RUT y el folio correctos. RUT + folio ya identifican el
+    // documento; la empresa servía para no mezclar, y para eso alcanza con
+    // DECIR dónde está en vez de esconderla.
+    let empresaDistinta = null;
+    if (empresaRendicion && !(data || []).length) {
+      const reintento = await consultar(null);
+      if (!reintento.error && (reintento.data || []).length) {
+        if (reintento.count != null && reintento.count > reintento.data.length) throw new Error("Resultado contable incompleto");
+        data = reintento.data;
+        empresaDistinta = reintento.data[0][MOVIMIENTOS_COLS.empresa] || "(sin empresa)";
+      }
+    }
 
     const match = data && data[0];
     const grupo = window.RindeCore.grupoDocumentoContable(item,itemsRendicion);
@@ -4786,7 +4808,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
       existe_en_contabilidad: !!match,
       cuenta_contable: cuenta,
       comprobante_contable_encontrado: comprobante,
-      verificacion_contable: {empresa_revisada:empresaRendicion || null,estado:comparacionMonto?.estado || "no_encontrado",monto_rendido:Number(item.monto),monto_documento_rendido:grupo.monto,miembros:grupo.miembros,monto_contable:comparacionMonto?.contable ?? null,diferencia:comparacionMonto?.diferencia ?? null,cuenta,nombre_cuenta:nombreCuentaVerificada,comprobante,rut_proveedor:item.rut_proveedor,tipo_documento:item.tipo_documento,nro_documento:item.nro_documento},
+      verificacion_contable: {empresa_revisada:empresaRendicion || null,empresa_contable:empresaDistinta,estado:comparacionMonto?.estado || "no_encontrado",monto_rendido:Number(item.monto),monto_documento_rendido:grupo.monto,miembros:grupo.miembros,monto_contable:comparacionMonto?.contable ?? null,diferencia:comparacionMonto?.diferencia ?? null,cuenta,nombre_cuenta:nombreCuentaVerificada,comprobante,rut_proveedor:item.rut_proveedor,tipo_documento:item.tipo_documento,nro_documento:item.nro_documento},
     });
     if (!res.ok) {
       box.className = "verify-box show err";
@@ -4797,12 +4819,17 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
     item.cuenta_contable = cuenta;
     item.verificacion_contable = res.data?.[0]?.verificacion_contable || null;
 
-    box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" ? "ok" : "err");
+    // El aviso de empresa distinta se antepone al resultado en vez de
+    // reemplazarlo: el documento SÍ se encontró y su monto sí se comparó, así
+    // que esconder eso detrás de "no aparece registrada" era lo que hacía
+    // perder el tiempo buscando un problema de montos que no existía.
+    const avisoEmpresa = empresaDistinta ? `⚠ Registrada en contabilidad bajo la empresa "${empresaDistinta}", y esta rendición es de "${empresaRendicion}". Revisa cuál corresponde. ` : "";
+    box.className = "verify-box show " + (!match ? "no" : (empresaDistinta || comparacionMonto.estado !== "coincide") ? "err" : "ok");
     box.textContent = !match ? "✘ Todavía no aparece registrada en contabilidad. El monto no se pudo comprobar."
-      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · " + (grupo.miembros.length>1 ? "Suma de "+grupo.miembros.length+" gastos coincide: " : "Monto coincide: ") + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
+      : avisoEmpresa + (comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · " + (grupo.miembros.length>1 ? "Suma de "+grupo.miembros.length+" gastos coincide: " : "Monto coincide: ") + fmtCLP(comparacionMonto.contable) + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
       : comparacionMonto.estado === "diferente" ? "⚠ Documento encontrado, pero el monto difiere. Rendido: " + fmtCLP(comparacionMonto.rendido) + ". Contabilidad: " + fmtCLP(comparacionMonto.contable) + ". Diferencia: " + fmtCLP(comparacionMonto.diferencia) + ". Si distribuiste la factura entre varios gastos, revisa la suma de esas partes."
       : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
-      : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
+      : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.");
   } catch (err) {
     box.className = "verify-box show err";
     box.textContent = "No se pudo verificar el documento ni el monto. Intenta nuevamente o revisa el registro en contabilidad.";
