@@ -4734,9 +4734,26 @@ function compararMontoContable(item, movimientos) {
     const clave = m.comprobante || "fila:"+m.id;
     grupos.set(clave,(grupos.get(clave)||0)+Number(m.haber)-Number(m.debe));
   }
-  if (!grupos.size) return {estado:"sin_monto"};
-  if (grupos.size !== 1) return {estado:"ambiguo",cantidad:grupos.size};
-  const contable = Math.abs([...grupos.values()][0]);
+  // Solo cuentan los comprobantes que dejan saldo ACREEDOR, es decir los que
+  // registran la factura. Un asiento posterior que la cancela -- el pago, o
+  // la propia rendición -- deja saldo deudor y no dice nada sobre cuánto
+  // valía el documento.
+  //
+  // Antes se tomaban todos los comprobantes por igual y bastaba que hubiera
+  // dos para devolver "ambiguo". Eso no es un caso raro: es el estado normal
+  // de toda factura ya rendida. La #80559421 tiene el comprobante 859 con la
+  // factura (haber 13.980) y el 866 con "RENDICION N° 23" cancelándola (debe
+  // 13.980), así que la verificación fallaba justo en las que completaron el
+  // proceso. Descartando los deudores queda un único origen y el monto se
+  // puede confirmar.
+  //
+  // Se conserva la detección de ambigüedad donde sí importa: si DOS
+  // comprobantes distintos abonan el mismo documento, está contabilizado dos
+  // veces y eso hay que mirarlo a mano.
+  const acreedores = [...grupos.values()].filter((saldo) => saldo > 0);
+  if (!acreedores.length) return {estado:"sin_monto"};
+  if (acreedores.length !== 1) return {estado:"ambiguo",cantidad:acreedores.length};
+  const contable = acreedores[0];
   const rendido = Number(item.monto);
   if (!Number.isFinite(rendido) || !Number.isInteger(contable) || contable <= 0) return {estado:"sin_monto"};
   return {estado:contable===rendido ? "coincide" : "diferente",contable,rendido,diferencia:rendido-contable};
