@@ -128,7 +128,33 @@
     return {monto:grupo.reduce((sum,i)=>sum+Number(i.monto||0),0),miembros:grupo.map(i=>({id:i.id,monto:Number(i.monto||0),estado:i.estado})).sort((a,b)=>String(a.id).localeCompare(String(b.id)))};
   }
 
-  const RindeCore = { grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  // La entrega crea el activo por rendir: no registra gastos ni usa el saldo.
+  function comprobanteEntregaFondo(solicitud, opciones = {}) {
+    if (solicitud?.estado !== "Aprobado") throw new Error("Solo se puede preparar la entrega de un fondo aprobado.");
+    const monto = Number(solicitud.monto_solicitado);
+    if (!Number.isSafeInteger(monto) || monto <= 0) throw new Error("El monto del fondo debe ser un entero positivo en pesos.");
+    if (!Number.isSafeInteger(Number(solicitud.folio)) || Number(solicitud.folio) <= 0) throw new Error("El fondo no tiene un folio válido.");
+    if (!solicitud.empresa || !solicitud.empleado_nombre?.trim() || !validarRut(solicitud.rut_empleado || "")) throw new Error("Completa la empresa, el nombre y el RUT válido del empleado antes de exportar.");
+    const fecha = String(opciones.fecha || ""), parsed = new Date(fecha + "T12:00:00Z");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha) || !Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0,10) !== fecha) throw new Error("Indica una fecha de entrega válida.");
+    const hoy = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+    if (fecha > hoy) throw new Error("La fecha de entrega no puede estar en el futuro.");
+    const cuenta = String(opciones.cuentaBanco || "").trim(), banco = String(opciones.nombreBanco || "").trim();
+    if (!/^\d+(?:\.\d+){2,5}$/.test(cuenta) || cuenta === "1.01.11.05") throw new Error("Indica el código de la cuenta bancaria de salida en Kame, distinto de Fondo por Rendir.");
+    if (!banco || banco.length > 100) throw new Error("Indica el nombre de la cuenta bancaria (máximo 100 caracteres).");
+    if (opciones.entregaConfirmada !== true) throw new Error("Confirma la entrega del dinero y la revisión de duplicados antes de descargar.");
+    const referencia = String(opciones.referencia || "").replace(/\s+/g," ").trim();
+    if (referencia.length > 100) throw new Error("La referencia de transferencia admite hasta 100 caracteres.");
+    const glosa = (`ENTREGA FONDO S-${solicitud.folio} · ${solicitud.empleado_nombre} · ${solicitud.empresa}` + (referencia ? ` · REF ${referencia}` : "")).replace(/\s+/g," ").trim();
+    const fechaKame = fecha.split("-").reverse().join("/");
+    const filas = [
+      ["EGRESO","S",1,fechaKame,glosa,"1.01.11.05",monto,0,glosa,formatearRut(solicitud.rut_empleado),solicitud.empleado_nombre,"Otros",String(solicitud.folio),fechaKame,"","",""],
+      ["EGRESO","S",1,fechaKame,glosa,cuenta,0,monto,glosa,"","","","","","","",""],
+    ];
+    return {filas, monto, glosa, fecha, cuentaBanco:cuenta, nombreBanco:banco, fileName:`comprobante_entrega_fondo_S-${solicitud.folio}.csv`};
+  }
+
+  const RindeCore = { comprobanteEntregaFondo, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

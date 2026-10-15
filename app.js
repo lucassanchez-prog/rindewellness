@@ -5128,6 +5128,78 @@ async function submitSolicitud() {
   }
 }
 
+async function prepararComprobanteEntregaFondo(id, opciones) {
+  if (!esAprobadorEfectivo(currentProfile)) throw new Error("Solo administradores y aprobadores pueden preparar este comprobante.");
+  const {data:s,error} = await db.from("solicitudes_fondos").select("*").eq("id",id).maybeSingle();
+  if (error || !s) throw new Error("No se pudo actualizar el fondo. Intenta nuevamente.");
+  const {data:perfil,error:errorPerfil} = await db.from("profiles").select("nombre, rut").eq("id",s.empleado_id).maybeSingle();
+  if (errorPerfil) throw new Error("No se pudo comprobar el RUT del empleado. Intenta nuevamente.");
+  const fondo = {...s,empleado_nombre:perfil?.nombre || s.empleado_nombre,rut_empleado:perfil?.rut || s.rut_empleado};
+  const comprobante = window.RindeCore.comprobanteEntregaFondo(fondo,opciones);
+  return {...comprobante,empresa:s.empresa,content:[CSV_HEADER,...comprobante.filas.map(row=>row.map(campoCSVSeguro).join(";"))].join("\r\n")};
+}
+
+function panelContabilizarFondo(solicitud) {
+  const panel = el("section",{class:"fondo-kame-panel","aria-label":"Contabilización de entrega de fondo"});
+  const form = el("form",{class:"fondo-kame-form",id:`fondo-kame-${solicitud.id}`,hidden:""});
+  const abrir = el("button",{class:"btn btn-primary",type:"button","aria-expanded":"false","aria-controls":form.id},"Contabilizar en Kame");
+  const fecha=el("input",{type:"date",required:"",id:"fk-fecha"});
+  const cuenta=el("input",{type:"text",required:"",id:"fk-cuenta",placeholder:"Código de la cuenta en Kame",autocomplete:"off"});
+  const banco=el("input",{type:"text",required:"",id:"fk-banco",placeholder:"Nombre del banco o cuenta de salida",maxlength:"100"});
+  const referencia=el("input",{type:"text",id:"fk-referencia",placeholder:"Número de transferencia (opcional)",maxlength:"100"});
+  const confirmado=el("input",{type:"checkbox",required:"",id:"fk-confirmado"});
+  const campos=el("div",{class:"fondo-kame-fields"});
+  [["Fecha efectiva de entrega",fecha],["Cuenta bancaria de salida · código",cuenta],["Nombre de la cuenta bancaria",banco],["Referencia de la entrega",referencia]].forEach(([label,input])=>campos.appendChild(el("div",{class:"field"},[el("label",{for:input.id},label),input])));
+  const resultado=el("div",{class:"fondo-kame-preview","aria-live":"polite"});
+  const revisar=el("button",{class:"btn btn-secondary",type:"submit"},"Revisar comprobante");
+  const descargar=el("button",{class:"btn btn-primary",type:"button",disabled:""},"Descargar archivo para Kame");
+  const estado=el("p",{class:"portal-muted",role:"status"});
+  const opciones=()=>({fecha:fecha.value,cuentaBanco:cuenta.value,nombreBanco:banco.value,referencia:referencia.value,entregaConfirmada:confirmado.checked});
+  let previo=null,ocupado=false,revision=0;
+  form.addEventListener("input",()=>{revision++;previo=null;descargar.disabled=true;resultado.replaceChildren();estado.textContent="Revisa nuevamente el comprobante después de cambiar los datos.";});
+  abrir.addEventListener("click",()=>{form.hidden=!form.hidden;abrir.setAttribute("aria-expanded",String(!form.hidden));if(!form.hidden)fecha.focus();});
+  form.append(el("h3",{},`Entrega del fondo S-${solicitud.folio}`),el("p",{class:"portal-muted"},`Prepara un egreso por ${fmtCLP(solicitud.monto_solicitado)} para importar en ${solicitud.empresa}. Usa la cuenta bancaria de esa empresa desde la que se entregó el dinero.`),campos,
+    el("label",{class:"fondo-kame-confirmacion",for:confirmado.id},[confirmado,"La entrega ya se realizó y revisé que no esté contabilizada en Kame."]),
+    el("p",{class:"portal-muted"},"La aprobación del fondo no confirma su pago. Esta descarga no registra automáticamente el asiento en Kame ni modifica el saldo del fondo."),
+    el("div",{class:"fondo-kame-actions"},[revisar,descargar]),estado,resultado);
+  const mostrar=(c)=>{
+    const tabla=el("table",{class:"items-table"});
+    tabla.appendChild(el("thead",{},el("tr",{},["Cuenta contable","Debe","Haber"].map((t,i)=>el("th",{class:i?"right":""},t)))));
+    const cuerpo=el("tbody");
+    [["1.01.11.05 · Fondo por Rendir",c.monto,0],[`${c.cuentaBanco} · ${c.nombreBanco}`,0,c.monto],["Total",c.monto,c.monto]].forEach(row=>cuerpo.appendChild(el("tr",{},row.map((v,i)=>el("td",{class:i?"monto":""},i?fmtCLP(v):v)))));
+    tabla.appendChild(cuerpo);
+    resultado.replaceChildren(el("p",{},`Empresa: ${c.empresa} · Egreso · ${fmtDate(c.fecha)}`),el("p",{class:"portal-muted"},c.glosa),el("div",{class:"table-scroll"},tabla));
+  };
+  form.addEventListener("submit",async event=>{
+    event.preventDefault();if(ocupado)return;
+    ocupado=true;revisar.disabled=true;descargar.disabled=true;previo=null;
+    const revisionInicial=revision;
+    estado.textContent="Comprobando fondo y datos del empleado…";
+    try {
+      const c=await prepararComprobanteEntregaFondo(solicitud.id,opciones());
+      if(revision!==revisionInicial)return;
+      previo=c;mostrar(c);descargar.disabled=false;estado.textContent="El comprobante está cuadrado. Revisa la cuenta bancaria antes de descargar.";
+    }catch(error){estado.textContent=error.message;resultado.replaceChildren();}
+    finally{ocupado=false;revisar.disabled=false;}
+  });
+  descargar.addEventListener("click",async()=>{
+    if(ocupado||!previo)return;
+    ocupado=true;revisar.disabled=true;descargar.disabled=true;
+    const esperado=previo.content,revisionInicial=revision;
+    try {
+      const c=await prepararComprobanteEntregaFondo(solicitud.id,opciones());
+      if(revision!==revisionInicial)return;
+      if(c.content!==esperado){previo=null;mostrar(c);estado.textContent="Los datos del fondo cambiaron. Revisa nuevamente el comprobante antes de descargar.";return;}
+      const url=URL.createObjectURL(new Blob(["\uFEFF"+c.content],{type:"text/csv;charset=utf-8"}));
+      const link=el("a",{href:url,download:c.fileName});document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+      previo=null;confirmado.checked=false;
+      estado.textContent="Archivo descargado. Impórtalo una sola vez en Kame, en la empresa indicada. Descargarlo no confirma su contabilización.";
+    }catch(error){previo=null;estado.textContent=error.message;}
+    finally{ocupado=false;revisar.disabled=false;}
+  });
+  panel.append(abrir,form);return panel;
+}
+
 async function openDetalleSolicitud(id, pushHistory = true) {
   const box0 = document.getElementById("detalle-solicitud-card");
   box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
@@ -5172,6 +5244,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
   if (s.estado === "Aprobado") {
     box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:10px" },
       `Aprobado por ${s.aprobador_nombre || "-"} el ${fmtDate(s.fecha_aprobacion)}`));
+    if (esAprobadorViewer) box.appendChild(panelContabilizarFondo(s));
 
     // Saldo: cuánto de este fondo ya se rindió (rendiciones Aprobadas
     // vinculadas a esta solicitud) y cuánto queda disponible. Si el saldo
