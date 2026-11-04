@@ -2,7 +2,9 @@
 // Recibe la foto de un comprobante (factura/boleta) en base64, se la manda a
 // Google Gemini y devuelve los datos extraídos como JSON. La API key de
 // Gemini vive SOLO acá (variable de entorno del proyecto), nunca en el
-// frontend.
+// frontend. La lógica de "qué modelo de Gemini usar y cómo reintentar" vive
+// en _shared/gemini-ocr.ts (la comparte con ocr-reintento-pendientes, que
+// reintenta en segundo plano los comprobantes que fallaron acá).
 //
 // Exige una sesión válida: sin este chequeo, cualquiera con la anon key
 // pública (visible en config.js) podía llamar a esta función sin estar
@@ -13,6 +15,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
+import { leerComprobante, tieneDatosUtiles } from "../_shared/gemini-ocr.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -30,90 +33,128 @@ async function requireUser(req: Request) {
   // cuenta desactivada con una sesión todavía viva podía seguir consumiendo
   // la cuota paga de Gemini.
   const asUser = createClient(SUPABASE_URL, ANON_KEY, { global: { headers: { Authorization: authHeader } } });
-  const { data: profile } = await asUser.from("profiles").select("activo").eq("id", data.user.id).maybeSingle();
-  if (profile?.activo === false) throw new Error("Tu cuenta fue desactivada.");
+  const { data: profile, error: profileErr } = await asUser.from("profiles").select("activo").eq("id", data.user.id).maybeSingle();
+  // Antes esto descartaba el error de la consulta -- si la query fallaba por
+  // cualquier motivo, "profile" quedaba undefined y el chequeo de abajo
+  // dejaba pasar a una cuenta desactivada sin loguear nada. Falla cerrado.
+  if (profileErr) throw profileErr;
+  if (!profile || profile.activo === false) throw new Error("Tu cuenta fue desactivada.");
   return data.user;
 }
-
-const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
-// Configurable por si Google renombra/da de baja el alias del modelo --
-// antes estaba fijo en el código, así que un cambio de Google rompía el OCR
-// para todos por igual, sin forma de corregirlo sin un redeploy.
-const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-3.6-flash";
-// Los modelos "gemini-3.x" recién lanzados sufren picos de demanda de Google
-// que a veces duran minutos, no segundos (503 "high demand" sostenido, no
-// un error puntual) -- reintentar contra el mismo modelo saturado no sirve
-// de nada en ese caso. Si el modelo principal sigue sin responder tras sus
-// reintentos, se prueba una vez más contra otro modelo con menos demanda.
-// OJO: Google está retirando el acceso a modelos pre-3.x para API keys
-// nuevas ("gemini-2.5-flash" ya no está disponible para keys nuevas, según
-// el propio mensaje de error de la API) -- el respaldo debe ser otro modelo
-// de la familia 3.x, no uno anterior.
-const GEMINI_MODEL_FALLBACK = Deno.env.get("GEMINI_MODEL_FALLBACK") || "gemini-3.5-flash";
-const geminiUrl = (modelo: string) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${GEMINI_API_KEY}`;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Mismo listado de categorías de gasto directo que CATEGORIAS_GASTO en
-// app.js (sin la opción "Otro", que es solo para elegir cuenta a mano) --
-// se le pasa a Gemini para que elija la más parecida, en vez de inventar
-// una categoría que no existe en la app.
-const CATEGORIAS = [
-  "Gerenciamiento", "Arriendo Instalaciones", "Arriendo Instalaciones Variables", "Gastos Comunes",
-  "Telefonía e Internet", "Electricidad", "Gas", "Agua", "Servicios Informaticos", "Servicio de Seguridad",
-  "Implementos Gimnasio", "Servicios en Streaming", "Gasto Fee de Ventas y Marketing", "Patentes Comerciales",
-  "Fletes", "Combustibles", "Arriendo de Vehiculos", "Estacionamiento", "Seguros", "Materiales",
-  "Materiales de Aseo y Oficina", "Gastos Cafeteria", "Servicios Computacionales", "Donaciones",
-  "Gastos de Administración", "Mantenciones Generales", "Mantenciones Extraordinarias", "Gastos de Representacion",
-  "Prevencion de Riesgos", "Publicidad y Marketing", "Publicidad After Dmoov", "Publicidad en RRSS",
-  "Licencias SCD", "Fitmewise", "Informatica y Licencias", "Gastos RFA", "Asesoria Legal", "Asesoria Tributaria",
-  "Otras Asesorias", "Beneficios del Personal", "Traslados del Personal", "Viaticos del Personal",
-  "Capacitaciones al Personal", "Honorarios Profesionales", "Honorarios Sin Retención",
-];
+async function encolarLecturaPendiente(admin: ReturnType<typeof createClient>, userId: string, imageBase64: string, mimeType: string | undefined, datosParciales: Record<string, unknown> | null): Promise<string | null> {
+  let previaId: string | null = null;
+      try {
+        const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
+        const parciales = datosParciales && Object.keys(datosParciales).length ? datosParciales : null;
 
-const PROMPT = `Eres un asistente que extrae datos de comprobantes de compra chilenos
-(facturas electrónicas, boletas electrónicas o boletas de honorarios).
-Analiza la imagen adjunta y devuelve SOLO un JSON válido, sin texto adicional
-ni explicaciones, con exactamente esta forma:
-{
-  "nombre_proveedor": "razón social o nombre del proveedor/local" o null,
-  "rut_proveedor": "12.345.678-9" o null,
-  "tipo_documento": "Factura Electrónica" | "Factura Exenta Electrónica" | "Boleta de Honorario" | "Boleta Electrónica" | null,
-  "nro_documento": "string" o null,
-  "fecha": "YYYY-MM-DD" o null,
-  "monto": number o null,
-  "descripcion": "breve descripción del gasto, ej: Almuerzo equipo ventas" o null,
-  "categoria_sugerida": una de estas opciones EXACTAS: ${CATEGORIAS.map((c) => `"${c}"`).join(", ")} -- la que mejor calce con el gasto, o null si ninguna calza bien
+        // Huella del CONTENIDO del archivo, no del nombre ni de la hora. Sin
+        // esto, cada vez que alguien apretaba "Reintentar con IA" y volvía a
+        // fallar se insertaba una fila nueva, con OTRA copia del mismo
+        // archivo en Storage. El agente en segundo plano después reintentaba
+        // todas esas filas por separado -- misma factura, misma lectura,
+        // multiplicada por la cantidad de veces que la persona insistió. Con
+        // una cuota de ~20 solicitudes por modelo al día, un comprobante
+        // difícil se comía el cupo de toda la empresa él solo.
+        const hashBuffer = await crypto.subtle.digest("SHA-256", bytes);
+        const contenidoHash = Array.from(new Uint8Array(hashBuffer))
+          .map((b) => b.toString(16).padStart(2, "0")).join("");
+
+        const { data: yaEncolado, error: errBusca } = await admin
+          .from("ocr_previos")
+          .select("id, storage_path")
+          .eq("usuario_id", userId)
+          .eq("contenido_hash", contenidoHash)
+          .eq("estado", "pendiente")
+          .maybeSingle();
+        if (errBusca) throw errBusca;
+
+        // Se reutiliza la ruta de Storage de la fila que ya existe en vez de
+        // subir otra copia, y se sobreescribe (upsert) para no depender de
+        // que el objeto anterior siga ahí: la limpieza de huérfanos pudo
+        // haberlo borrado, y una fila apuntando a un archivo inexistente se
+        // agota sola sin haber reintentado nunca de verdad.
+        const path = yaEncolado?.storage_path || `${userId}/previo-${crypto.randomUUID()}`;
+        const { error: errUpload } = await admin.storage.from("comprobantes").upload(path, bytes, {
+          contentType: mimeType || "application/octet-stream",
+          upsert: true,
+        });
+        if (errUpload) throw errUpload;
+
+        if (yaEncolado) {
+          // Los intentos NO se reinician a propósito: si se reiniciaran,
+          // insistir a mano sería una forma de saltarse MAX_INTENTOS y el
+          // comprobante se reintentaría para siempre. Sí se actualizan los
+          // datos parciales, que pueden haber mejorado.
+          const { error: errUpdate } = await admin.from("ocr_previos")
+            .update({ datos_parciales: parciales })
+            .eq("id", yaEncolado.id);
+          if (errUpdate) throw errUpdate;
+          previaId = yaEncolado.id as string;
+        } else {
+          const { data: previa, error: errInsert } = await admin.from("ocr_previos").insert({
+            usuario_id: userId,
+            storage_path: path,
+            contenido_hash: contenidoHash,
+            // Lo que la lectura local ya había sacado del texto del PDF. El
+            // agente en segundo plano arranca de acá en vez de releer el
+            // documento entero (ver procesarPendiente).
+            datos_parciales: parciales,
+          }).select("id").single();
+          if (errInsert) throw errInsert;
+          previaId = previa.id as string;
+        }
+      } catch (errEncolar) {
+        // Los errores de PostgREST NO son instancias de Error: String(err)
+        // daría "[object Object]" y el log quedaría inservible, que es
+        // exactamente lo que nos dejó a ciegas durante el incidente de cuota.
+        const detalle = (errEncolar as { message?: string })?.message || String(errEncolar);
+        console.error("No se pudo encolar el comprobante en ocr_previos:", detalle);
+      }
+  return previaId;
 }
-Si no puedes leer un dato con certeza, usa null en ese campo. No inventes datos.
-El monto debe ser el total final del documento, sin puntos ni signos, solo el número.
-Para "categoria_sugerida", usa el texto EXACTO de una de las opciones de la lista (respetando tildes y mayúsculas), nunca inventes una categoría nueva.`;
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   let userId: string | null = null;
+  // Declarados afuera del try porque el catch los necesita para encolar el
+  // comprobante en ocr_previos si la lectura en vivo falla -- ver más abajo.
+  let imageBase64: string | undefined;
+  let mimeType: string | undefined;
+  // datosParciales también vive acá afuera: el catch lo necesita para
+  // guardarlo junto al comprobante encolado en ocr_previos.
+  let camposFaltantes: string[] | null = null;
+  let datosParciales: Record<string, unknown> | null = null;
+  let tipoItem: string | null = null;
   try {
     const user = await requireUser(req);
     userId = user.id;
-    if (!GEMINI_API_KEY) throw new Error("Falta configurar el secret GEMINI_API_KEY en el proyecto.");
+
+    ({ imageBase64, mimeType, camposFaltantes, datosParciales, tipoItem } = await req.json());
 
     // Límite de frecuencia liviano: sin esto, cualquier cuenta activa podía
     // llamar esta función en loop sin ningún tope, consumiendo la cuota
-    // paga de Gemini sin control. 40 comprobantes por hora es bastante más
-    // de lo que alguien carga a mano en una rendición real.
-    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
-    if (llamadasRecientes >= 40) {
-      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
-    }
-    await logEvent(admin, "ocr_call", { usuarioId: userId });
-
-    const { imageBase64, mimeType } = await req.json();
+    // paga de Gemini sin control. Un intento fallido (ej. Gemini caído)
+    // cuenta igual que uno exitoso contra este tope -- es decir, durante una
+    // caída real de Gemini, cada reintento de la persona le come cupo por
+    // algo que no es su culpa. 60/hora (subido de 40) deja margen real para
+    // reintentar unas cuantas veces durante un incidente sin llegar a
+    // trabarse, sin dejar de ser un tope muy por encima de lo que alguien
+    // carga a mano en una rendición real.
+    // OJO con este número: cada "ocr_call" puede gastar hasta MAX_CANDIDATOS
+    // solicitudes de Gemini (ver gemini-ocr.ts), y la cuota gratuita es de
+    // ~20 por modelo AL DÍA. Con el 60 que había acá, un solo usuario podía
+    // consumir 120 solicitudes en una hora -- más que la cuota diaria
+    // completa. El tope está denominado en llamadas, no en solicitudes, así
+    // que hay que dividirlo por el abanico de candidatos.
+    if (typeof imageBase64 !== "string") throw new Error("Falta la imagen (imageBase64).");
     if (!imageBase64) throw new Error("Falta la imagen (imageBase64).");
     // ~15MB de archivo original equivalen a ~20M caracteres en base64
     // (overhead ~33%). Sin este tope, un PDF/foto gigante se manda entero a
@@ -123,107 +164,100 @@ Deno.serve(async (req: Request) => {
       throw new Error("El comprobante es muy pesado (máx. ~15MB). Comprime la imagen o el PDF e inténtalo de nuevo.");
     }
 
-    const body = {
-      contents: [
-        {
-          parts: [
-            { text: PROMPT },
-            { inline_data: { mime_type: mimeType || "image/jpeg", data: imageBase64 } },
-          ],
-        },
-      ],
-      // maxOutputTokens explícito: sin esto, un PDF (que consume bastantes
-      // más tokens de "visión de documento" que una foto comprimida, sobre
-      // todo si tiene varias páginas) puede agotar el límite por defecto del
-      // modelo ANTES de terminar de escribir el JSON de salida. Cuando eso
-      // pasa, Gemini responde 200 OK con finishReason "MAX_TOKENS" y texto
-      // vacío -- no es un error, así que antes cursaba directo al mensaje
-      // genérico de "no se pudo leer" sin ninguna pista real de la causa.
-      generationConfig: { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192 },
-    };
+    // El tope por hora va ANTES de consultar la caché. Al revés, una caché
+    // acertada respondía sin pasar por el contador y sin registrar nada: se
+    // podía repetir la misma petición en bucle, cada una decodificando hasta
+    // 15MB de base64 y calculando su SHA-256 dentro de una función con
+    // memoria acotada, sin que quedara rastro en system_events de que el
+    // endpoint estaba siendo golpeado. No gastaba cuota de Gemini, pero el
+    // tope no está solo para eso.
+    const llamadasRecientes = await contarEventosRecientes(admin, "ocr_call", { usuarioId: userId }, 60);
+    if (llamadasRecientes >= 25) {
+      throw new Error("Demasiadas lecturas de comprobantes en la última hora. Espera unos minutos e inténtalo de nuevo.");
+    }
+    await logEvent(admin, "ocr_call", { usuarioId: userId });
 
-    // Gemini a veces devuelve "high demand" de forma transitoria (picos de uso),
-    // y la capa gratuita tiene un límite de solicitudes POR MINUTO ("quota
-    // exceeded") que se libera solo unos segundos después -- ambos casos se
-    // solucionan reintentando con espera, no son errores permanentes.
-    async function llamarGemini(modelo: string, intentosMax: number) {
-      let ultimoError: Error = new Error("Error consultando Gemini");
-      for (let intento = 1; intento <= intentosMax; intento++) {
-        const resp = await fetch(geminiUrl(modelo), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const respData = await resp.json();
-        if (resp.ok) return respData;
+    const bytesArchivo = Uint8Array.from(atob(imageBase64), c => c.charCodeAt(0));
+    const digest = await crypto.subtle.digest("SHA-256", bytesArchivo);
+    const hashLectura = Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,"0")).join("");
+    const {data: anterior,error: errorCache} = await admin.from("ocr_lecturas_cache").select("resultado").eq("usuario_id",userId).eq("contenido_hash",hashLectura).eq("version",4).gt("created_at",new Date(Date.now()-30*24*60*60*1000).toISOString()).maybeSingle();
+    if (errorCache) console.error("No se pudo consultar la caché OCR:",errorCache.message);
+    if (anterior?.resultado && (anterior.resultado.revision_estado === "completo" || anterior.resultado.requiere_separacion)) return new Response(JSON.stringify(anterior.resultado),{headers:{...corsHeaders,"Content-Type":"application/json"}});
 
-        const mensaje = respData?.error?.message || "Error consultando Gemini";
-        ultimoError = new Error(mensaje);
-        const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensaje);
-        if (!esTransitorio || intento === intentosMax) throw ultimoError;
-        // El error de cuota trae su propio "retry in Ns"; si no lo trae, usamos
-        // el backoff normal. Esperamos un poco más que lo pedido por margen.
-        const retrySugerido = /retry in ([\d.]+)s/i.exec(mensaje);
-        const espera = retrySugerido ? Math.min(Number(retrySugerido[1]) * 1000 + 1000, 4000) : 1200 * intento;
-        await new Promise((r) => setTimeout(r, espera));
-      }
-      throw ultimoError;
+
+    // ACÁ está el ahorro de cuota. El navegador lee el PDF localmente con
+    // pdf.js antes de llamar acá, y cuando esa lectura sale completa manda
+    // "camposFaltantes" vacío. Gastar una solicitud de Gemini para volver a
+    // leer un documento que ya se leyó entero es exactamente lo que dejó la
+    // app sin OCR un día completo: la cuota gratuita es de ~20 solicitudes
+    // POR MODELO AL DÍA. Si no falta nada, se devuelve lo que ya se sabía y
+    // no se llama a Gemini en absoluto.
+    //
+    // La lista vacía y la ausencia del campo NO son lo mismo: un cliente
+    // viejo (o el agente en segundo plano) no manda "camposFaltantes", y ahí
+    // hay que leer todo como siempre. Solo un array presente Y vacío
+    // significa "no falta nada".
+    if (Array.isArray(camposFaltantes) && camposFaltantes.length === 0) {
+      await logEvent(admin, "ocr_sin_llamada", { usuarioId: userId });
+      return new Response(JSON.stringify(datosParciales || {}), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    let data;
-    try {
-      data = await llamarGemini(GEMINI_MODEL, 2);
-    } catch (errPrimario) {
-      // Google a veces satura un modelo recién lanzado (gemini-3.x) por
-      // minutos, no segundos -- reintentar contra el mismo modelo no sirve
-      // en ese caso. Si el motivo fue sobrecarga/demanda (no otro error), se
-      // prueba una vez con un modelo GA más establecido antes de rendirse.
-      const mensajePrimario = String(errPrimario instanceof Error ? errPrimario.message : errPrimario);
-      const esTransitorio = /high demand|unavailable|overloaded|quota|rate.?limit/i.test(mensajePrimario);
-      if (esTransitorio && GEMINI_MODEL_FALLBACK && GEMINI_MODEL_FALLBACK !== GEMINI_MODEL) {
-        data = await llamarGemini(GEMINI_MODEL_FALLBACK, 2);
-      } else {
-        throw errPrimario;
-      }
+    const resultado = await leerComprobante(admin, imageBase64, mimeType, undefined, {
+      camposFaltantes,
+      datosParciales,
+      // "ConDocumento" o "SinDocumento". El modelo no puede deducirlo del
+      // papel, y de eso depende si se exigen RUT, tipo y folio para dar la
+      // lectura por completa.
+      tipoItem: typeof tipoItem === "string" ? tipoItem : null,
+    });
+
+    // No es un fallo (la función igual responde 200), pero si Gemini no
+    // sacó ningún dato útil del comprobante, se loguea para tener
+    // visibilidad -- indistinguible si no, de "el comprobante realmente no
+    // traía nada legible" versus "el modelo está degradando en silencio".
+    if (!tieneDatosUtiles(resultado)) {
+      await logEvent(admin, "ocr_vacio", { usuarioId: userId });
     }
 
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) {
-      // Gemini puede responder 200 OK sin "candidates", o con texto vacío,
-      // por más de un motivo -- antes esto se devolvía como "{}" silencioso
-      // y el formulario quedaba vacío sin ninguna pista de por qué. Un PDF
-      // (sobre todo escaneado o de varias páginas) consume bastantes más
-      // tokens de "visión de documento" que una foto comprimida, así que es
-      // más probable que llegue a MAX_TOKENS antes de terminar el JSON --
-      // eso también cuenta como "sin resultado", no es un error de la API.
-      const finishReason = data?.candidates?.[0]?.finishReason;
-      const motivo = data?.promptFeedback?.blockReason
-        || (finishReason === "MAX_TOKENS" ? "El comprobante es muy complejo para procesarlo completo (MAX_TOKENS)." : null)
-        || (finishReason ? `Gemini no devolvió resultado (finishReason: ${finishReason}).` : null)
-        || "Gemini no devolvió resultado para este comprobante.";
-      throw new Error(motivo);
+    await logEvent(admin,"ocr_resultado",{usuarioId:userId,metadata:{estado:(resultado as any).revision_estado,campos_pendientes:(resultado as any).campos_pendientes || []}});
+    if ((resultado as any).revision_estado === "completo" || resultado.requiere_separacion) {
+      const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:4,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
+      if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);
     }
-    const parsed = JSON.parse(text);
-
-    // El prompt le pide a Gemini un valor EXACTO de CATEGORIAS, pero un LLM
-    // puede no respetarlo -- si no calza con el catálogo cerrado que usa la
-    // app, se descarta en vez de guardar una categoría inexistente.
-    if (parsed.categoria_sugerida && !CATEGORIAS.includes(parsed.categoria_sugerida)) {
-      parsed.categoria_sugerida = null;
+    let previaId: string | null = null;
+    if ((resultado as any).revision_estado === "parcial" && !resultado.requiere_separacion) {
+      const parciales={...(datosParciales || {}),...Object.fromEntries(Object.entries(resultado).filter(([,valor])=>valor !== null && valor !== undefined && valor !== ""))};
+      previaId=await encolarLecturaPendiente(admin,userId,imageBase64,mimeType,parciales);
     }
-
-    return new Response(JSON.stringify(parsed), {
+    return new Response(JSON.stringify({...resultado,previaId}), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
     const mensaje = String(err instanceof Error ? err.message : err);
+    const esRechazoEsperable = /No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje);
     // No registramos los rechazos esperables (sesión inválida, límite de
     // frecuencia) como "fallo" -- son parte del funcionamiento normal, no
     // algo que un admin necesite revisar en el registro de eventos.
-    if (!/No autenticado|Sesión inválida|desactivada|Demasiadas lecturas/i.test(mensaje)) {
+    if (!esRechazoEsperable) {
       await logEvent(admin, "ocr_fail", { usuarioId: userId, detalle: mensaje });
     }
-    return new Response(JSON.stringify({ error: mensaje }), {
+
+    // El agente en segundo plano "toma el rol" apenas falla la lectura en
+    // vivo, no recién cuando se envía la rendición (ver
+    // migracion_ocr_previo.sql) -- se sube el comprobante a Storage y se
+    // encola en ocr_previos ACÁ MISMO, antes de responderle al frontend, así
+    // ocr-reintento-pendientes ya tiene algo real que reintentar desde el
+    // primer fallo. Best-effort: si esto falla (ej. Storage caído también),
+    // no debe tapar el mensaje de error original de Gemini con uno de
+    // Storage -- se loguea aparte y se responde igual sin previaId.
+    let previaId: string | null = null;
+    if (!esRechazoEsperable && userId && typeof imageBase64 === "string" && imageBase64.length <= 20_000_000) {
+      previaId=await encolarLecturaPendiente(admin,userId,imageBase64,mimeType,datosParciales);
+    }
+
+    return new Response(JSON.stringify({ error: mensaje, previaId }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

@@ -7,12 +7,13 @@
 // la base quedaba igual bloqueado por un chequeo de "profile.rol" literal.
 export interface PerfilConDelegacion {
   rol: string;
+  activo?: boolean | null;
   delegado_activo?: boolean | null;
   delegado_hasta?: string | null;
 }
 
 export function esAprobadorEfectivo(profile: PerfilConDelegacion | null | undefined): boolean {
-  if (!profile) return false;
+  if (!profile || profile.activo === false) return false;
   if (profile.rol === "aprobador" || profile.rol === "admin") return true;
   if (!profile.delegado_activo) return false;
   if (!profile.delegado_hasta) return true;

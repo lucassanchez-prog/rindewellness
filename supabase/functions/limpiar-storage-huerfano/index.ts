@@ -54,45 +54,25 @@ Deno.serve(async (req: Request) => {
     const caller = await requireAdmin(req, admin);
     callerId = caller.id;
 
-    // Todas las rutas referenciadas hoy (nunca son demasiadas como para
-    // que esto sea un problema de memoria -- una por ítem con comprobante).
-    const { data: items, error: errItems } = await admin.from("rendicion_items").select("adjunto_url").not("adjunto_url", "is", null);
-    if (errItems) throw errItems;
-    const referenciados = new Set((items || []).map((i) => i.adjunto_url));
-
-    // Storage no tiene un "listar todo el bucket" plano -- hay que recorrer
-    // carpeta por carpeta (una por usuario, ver el path "userId/..." en
-    // submitRendicion). Se listan las carpetas de primer nivel y después
-    // cada una.
-    const { data: carpetas, error: errCarpetas } = await admin.storage.from("comprobantes").list("", { limit: 1000 });
-    if (errCarpetas) throw errCarpetas;
-
-    const limiteFecha = Date.now() - HORAS_MINIMAS * 60 * 60 * 1000;
-    const huerfanos: string[] = [];
-    for (const carpeta of carpetas || []) {
-      if (!carpeta.name || carpeta.id) continue; // carpeta.id existe en archivos sueltos en la raíz, se ignoran (no debería haber ninguno)
-      const { data: archivos, error: errArchivos } = await admin.storage.from("comprobantes").list(carpeta.name, { limit: 1000 });
-      if (errArchivos) continue;
-      for (const archivo of archivos || []) {
-        const path = `${carpeta.name}/${archivo.name}`;
-        if (referenciados.has(path)) continue;
-        const creado = archivo.created_at ? new Date(archivo.created_at).getTime() : 0;
-        if (creado && creado > limiteFecha) continue; // muy reciente, podría estar a mitad de un submitRendicion en curso
-        huerfanos.push(path);
-      }
+    let borrados = 0;
+    // Lotes acotados: cada llamada comprueba las referencias en la base completa.
+    for (let lote = 0; lote < 10; lote++) {
+      const { data: candidatos, error } = await admin.rpc("archivos_huerfanos");
+      if (error) throw error;
+      if (!candidatos?.length) break;
+      const rutas = candidatos.map((fila: { path: string }) => fila.path);
+      // Revalidar inmediatamente antes de eliminar, también ante nuevas referencias.
+      const { data: confirmados, error: errConfirmar } = await admin.rpc("archivos_huerfanos", { p_rutas: rutas });
+      if (errConfirmar) throw errConfirmar;
+      const seguros = (confirmados || []).map((fila: { path: string }) => fila.path);
+      if (!seguros.length) break;
+      const { error: errBorrar } = await admin.storage.from("comprobantes").remove(seguros);
+      if (errBorrar) throw errBorrar;
+      borrados += seguros.length;
     }
 
-    if (!huerfanos.length) {
-      return new Response(JSON.stringify({ ok: true, borrados: 0, nota: "No se encontraron archivos huérfanos." }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    const { error: errBorrar } = await admin.storage.from("comprobantes").remove(huerfanos);
-    if (errBorrar) throw errBorrar;
-
-    await logEvent(admin, "limpieza_storage_ok", { usuarioId: callerId, metadata: { borrados: huerfanos.length } });
-    return new Response(JSON.stringify({ ok: true, borrados: huerfanos.length }), {
+    await logEvent(admin, "limpieza_storage_ok", { usuarioId: callerId, metadata: { borrados: borrados, filas_ocr_previos: 0 } });
+    return new Response(JSON.stringify({ ok: true, borrados, filas_ocr_previos: 0, nota: "Se revisaron hasta 1000 archivos por ejecución; puedes repetir la limpieza si quedan más." }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {

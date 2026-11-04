@@ -1,0 +1,10 @@
+project_id = "rbmmwgndtrgdzherqxko"
+
+# ocr-reintento-pendientes la llama pg_cron (no hay ninguna persona logueada
+# disparándola), así que su propia auth es un secret compartido (CRON_SECRET,
+# ver el código de la función) en vez de un JWT de usuario. Sin este
+# verify_jwt=false, el gateway de Supabase rechaza la llamada con 401
+# "Invalid JWT" ANTES de que el código de la función llegue siquiera a mirar
+# el header -- pasó exactamente eso las primeras corridas del cron.
+[functions.ocr-reintento-pendientes]
+verify_jwt = false

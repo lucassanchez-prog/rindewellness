@@ -6,7 +6,7 @@
 // viven en pure.js (cargado antes que este archivo, ver index.html) -- son
 // funciones puras sin DOM ni red, separadas para poder testearlas con Node
 // (ver tests/pure.test.js) sin arrastrar el resto de la app.
-const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo } = window.RindeCore;
+const { formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion } = window.RindeCore;
 
 const CFG = window.RINDE_WELLNESS_CONFIG || {};
 let db = null; // proyecto propio de la app (lectura/escritura)
@@ -14,6 +14,9 @@ let dbContabilidad = null; // proyecto de contabilidad (SOLO LECTURA)
 let currentUser = null;
 let currentProfile = null;
 let itemSeq = 0;
+let envioRendicionId = null;
+let enviandoRendicion = false;
+const adjuntosBorrador = new Map();
 // null = sin restricción (ve todas las cuentas de gasto directo);
 // Set(...) = solo puede usar esas cuentas. La define el admin en "Usuarios".
 let cuentasPermitidas = null;
@@ -60,7 +63,11 @@ const CENTROS_COSTO_POR_EMPRESA = {
 const TIPOS_DOCUMENTO = ["Factura Electrónica", "Factura Exenta Electrónica", "Boleta de Honorario"];
 
 function tipoItemLabel(tipoItem) {
-  return tipoItem === "ConDocumento" ? "Documento electrónico" : "Boleta";
+  // "Comprobante/Boleta" y no solo "Boleta": por acá entra cualquier
+  // respaldo de gasto que no sea un documento tributario electrónico
+  // (vouchers, comprobantes de transferencia, boletas de papel), y decir
+  // solo "Boleta" hacía dudar de dónde cargar el resto.
+  return tipoItem === "ConDocumento" ? "Documento electrónico" : "Comprobante/Boleta";
 }
 
 const CUENTA_POR_TIPO_DOC = {
@@ -145,6 +152,7 @@ const CATEGORIAS_GASTO = [
 function show(viewId) {
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   document.getElementById(viewId).classList.add("active");
+  window.RindeUI?.show(viewId, document.getElementById("view-dashboard").dataset.section);
 }
 
 // Navegación con historial: para que el botón "Atrás" del navegador
@@ -154,6 +162,7 @@ function show(viewId) {
 // hash y podemos reabrir exactamente esa pantalla en vez de mandar siempre
 // al dashboard.
 function hashDeVista(viewId, params) {
+  if (viewId === "view-dashboard" && params?.section === "fondos") return "fondos";
   if (viewId === "view-detalle" && params?.id) return `detalle/${params.id}`;
   if (viewId === "view-detalle-solicitud" && params?.id) return `detalle-solicitud/${params.id}`;
   return viewId.replace("view-", "");
@@ -162,6 +171,8 @@ function estadoDesdeHash() {
   const [base, param] = location.hash.replace(/^#/, "").split("/");
   if (base === "detalle" && param) return { viewId: "view-detalle", params: { id: param } };
   if (base === "detalle-solicitud" && param) return { viewId: "view-detalle-solicitud", params: { id: param } };
+  if (base === "inicio" || !base) return {viewId:"view-inicio",params:{}};
+  if (base === "fondos") return {viewId:"view-dashboard",params:{section:"fondos"}};
   if (base === "admin") return { viewId: "view-admin", params: {} };
   if (base === "plantillas") return { viewId: "view-plantillas", params: {} };
   if (base === "reportes") return { viewId: "view-reportes", params: {} };
@@ -171,16 +182,19 @@ function estadoDesdeHash() {
 }
 function pushView(viewId, params = {}) {
   show(viewId);
-  history.pushState({ viewId, params }, "", "#" + hashDeVista(viewId, params));
+  history.pushState({ viewId, params, portalDepth:(history.state?.portalDepth||0)+1 }, "", "#" + hashDeVista(viewId, params));
+  window.scrollTo({top:0,behavior:"auto"});
 }
 function replaceView(viewId, params = {}) {
   show(viewId);
-  history.replaceState({ viewId, params }, "", "#" + hashDeVista(viewId, params));
+  history.replaceState({ viewId, params, portalDepth:history.state?.portalDepth||0 }, "", "#" + hashDeVista(viewId, params));
 }
 function renderRoute(state) {
   const resuelto = state || estadoDesdeHash();
   const viewId = resuelto?.viewId || "view-dashboard";
   const params = resuelto?.params || {};
+  if (["view-admin","view-plantillas","view-reportes"].includes(viewId) && currentProfile?.rol !== "admin") {replaceView("view-inicio");loadDashboard();return;}
+  if (viewId === "view-inicio") {show("view-inicio");loadDashboard();return;}
   if (viewId === "view-detalle" && params.id) { openDetalle(params.id, false); return; }
   if (viewId === "view-detalle-solicitud" && params.id) { openDetalleSolicitud(params.id, false); return; }
   if (viewId === "view-admin") { openAdminUsuarios(false); return; }
@@ -188,6 +202,7 @@ function renderRoute(state) {
   if (viewId === "view-reportes") { openReportes(false); return; }
   if (viewId === "view-nueva") { openNuevaRendicion(false); return; }
   if (viewId === "view-nueva-solicitud") { openNuevaSolicitud(false); return; }
+  configurarSeccionDashboard(params.section || "rendiciones");
   show("view-dashboard");
   loadDashboard();
 }
@@ -307,12 +322,26 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+function mostrarErrorInicio(mensaje) {
+  document.getElementById("inicio-sesion-status").textContent=mensaje;
+  document.getElementById("btn-reintentar-inicio").hidden=false;
+}
+
+async function restaurarSesionInicial() {
+  const {data,error}=await db.auth.getSession();
+  if(error)throw error;
+  if(document.getElementById("view-nueva-clave").classList.contains("active"))return;
+  if(data?.session)await onLoggedIn(data.session.user);
+  else show("view-login");
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
+  document.getElementById("btn-reintentar-inicio").addEventListener("click",()=>location.reload());
+  const esperaInicio=setTimeout(()=>mostrarErrorInicio("La conexión está tardando más de lo esperado. Puedes esperar o reintentar."),15000);
+  try {
   wireTheme();
   if (!CFG.SUPABASE_URL || !CFG.SUPABASE_ANON_KEY) {
-    document.getElementById("login-error").textContent =
-      "Falta configurar Supabase en config.js (SUPABASE_URL / SUPABASE_ANON_KEY).";
-    return;
+    throw new Error("Configuración de conexión no disponible");
   }
   db = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
 
@@ -326,6 +355,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireDashboard();
   wireNuevaRendicion();
   wireNuevaSolicitud();
+  window.RindeUI.init({navigate:navegarPortal,detail:openDetalle,fund:openDetalleSolicitud});
+  document.querySelectorAll("[data-portal-route]").forEach(a=>a.addEventListener("click",e=>{e.preventDefault();navegarPortal(a.dataset.portalRoute);}));
 
   // Si la persona llegó desde el link de recuperación de contraseña del
   // correo, Supabase arma una sesión temporal y dispara "PASSWORD_RECOVERY"
@@ -333,10 +364,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   // abajo, porque supabase-js reproduce ese evento apenas alguien se
   // suscribe. Si no lo interceptamos acá, el chequeo de sesión de abajo la
   // metería directo al dashboard en vez de dejarla definir su clave nueva.
-  let esRecuperacionClave = false;
   db.auth.onAuthStateChange((event, session) => {
     if (event === "PASSWORD_RECOVERY") {
-      esRecuperacionClave = true;
       show("view-nueva-clave");
     } else if (event === "SIGNED_OUT") {
       currentUser = null;
@@ -346,10 +375,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  const { data } = await db.auth.getSession();
-  if (data.session && !esRecuperacionClave) {
-    await onLoggedIn(data.session.user);
-  }
+  await restaurarSesionInicial();
+  } catch(error) {
+    console.error("No se pudo iniciar RindeWellness:",error);
+    mostrarErrorInicio("No pudimos cargar tu espacio. Comprueba tu conexión y vuelve a intentar.");
+  } finally {clearTimeout(esperaInicio);}
 });
 
 // ------------------------------------------------------------
@@ -481,7 +511,7 @@ function wireRecuperarClave() {
       // temporal de recuperación, que detectamos más abajo (evento
       // PASSWORD_RECOVERY) para mostrarle el formulario de nueva contraseña.
       const { error } = await db.auth.resetPasswordForEmail(email, {
-        redirectTo: window.location.origin + window.location.pathname,
+        redirectTo: "https://rindewellness.netlify.app/",
       });
       if (error) throw error;
       errBox.style.color = "var(--success)";
@@ -525,7 +555,15 @@ function wireRecuperarClave() {
 async function onLoggedIn(user) {
   currentUser = user;
   let { data: profile, error: selError } = await db.from("profiles").select("*").eq("id", user.id).maybeSingle();
-  if (selError) console.error("Error leyendo perfil:", selError);
+  if(currentUser?.id!==user.id) return;
+  if (selError) {
+    console.error("Error leyendo perfil:",selError);
+    currentProfile = null;
+    document.getElementById("app-shell").style.display = "none";
+    show("view-login");
+    toast("No se pudo comprobar tu perfil. Reintenta el ingreso.");
+    return;
+  }
   if (!profile) {
     // Si el registro original quedó bloqueado por RLS (sesión aún no
     // confirmada), acá está la segunda oportunidad: usamos el nombre/RUT
@@ -538,6 +576,7 @@ async function onLoggedIn(user) {
       .select()
       .maybeSingle();
     if (insError) { console.error("Error creando perfil:", insError); toast("No se pudo crear tu perfil: " + insError.message); }
+    if(currentUser?.id!==user.id) return;
     profile = created;
   }
   // Desactivada en vez de eliminada (ver "Desactivar" en Usuarios): no se
@@ -552,7 +591,9 @@ async function onLoggedIn(user) {
     if (errBox) errBox.textContent = "Tu cuenta fue desactivada. Contacta a un administrador.";
     return;
   }
+  if(!profile){currentProfile=null;document.getElementById("app-shell").style.display="none";show("view-login");return;}
   currentProfile = profile;
+  window.RindeUI?.setProfile(profile);
 
   document.getElementById("user-name").textContent = `${profile?.nombre || user.email} · ${profile?.rol || "empleado"}`;
   document.getElementById("app-shell").style.display = "block";
@@ -575,7 +616,18 @@ async function onLoggedIn(user) {
   document.getElementById("btn-comprobante-rango").style.display =
     esAprobadorEfectivo(profile) ? "inline-block" : "none";
 
-  await cargarCuentasPermitidas();
+  try {
+    await cargarCuentasPermitidas();
+  } catch(err) {
+    if(currentUser?.id!==user.id) return;
+    currentProfile=null;
+    document.getElementById("app-shell").style.display="none";
+    show("view-login");
+    toast("No se pudieron comprobar tus cuentas permitidas. Reintenta el ingreso.");
+    console.error("Error cargando permisos:",err);
+    return;
+  }
+  if(currentUser?.id!==user.id) return;
 
   // Si venías de un F5 (recarga) en "Nueva rendición", el detalle de una
   // rendición o "Usuarios", te dejamos en esa misma pantalla en vez de
@@ -594,14 +646,17 @@ async function onLoggedIn(user) {
 // individuales (perfil_cuentas) + las de su plantilla asignada, si tiene una
 // (ver migracion_plantillas_perfil.sql) -- una no reemplaza a la otra.
 async function cargarCuentasPermitidas() {
+  const usuarioId=currentUser.id;
+  cuentasPermitidas=new Set();
   const consultas = [db.from("perfil_cuentas").select("cuenta_cod").eq("profile_id", currentUser.id)];
   if (currentProfile?.plantilla_id) {
     consultas.push(db.from("plantilla_cuentas").select("cuenta_cod").eq("plantilla_id", currentProfile.plantilla_id));
   }
   const resultados = await Promise.all(consultas);
+  if(currentUser?.id!==usuarioId) return;
   const codigos = new Set();
   resultados.forEach(({ data, error }) => {
-    if (error) { console.error("Error cargando cuentas permitidas:", error); return; }
+    if (error) throw error;
     (data || []).forEach((d) => codigos.add(d.cuenta_cod));
   });
   cuentasPermitidas = codigos.size ? codigos : null;
@@ -610,6 +665,26 @@ async function cargarCuentasPermitidas() {
 // ------------------------------------------------------------
 // Dashboard
 // ------------------------------------------------------------
+function navegarPortal(route) {
+  const allowed=["inicio","dashboard","fondos","reportes","admin","plantillas","nueva","nueva-solicitud"];
+  if(!allowed.includes(route))return;
+  if(location.hash==="#"+route)return;
+  const state=route==="fondos"?{viewId:"view-dashboard",params:{section:"fondos"}}:{viewId:"view-"+route,params:{}};
+  history.pushState({...state,portalDepth:(history.state?.portalDepth||0)+1},"","#"+route);
+  renderRoute(state);
+  window.scrollTo({top:0,behavior:"auto"});
+}
+function configurarSeccionDashboard(section) {
+  const funds=section==="fondos";
+  const dashboard=document.getElementById("view-dashboard");
+  dashboard.dataset.section=funds?"fondos":"rendiciones";
+  dashboard.querySelector("h1").textContent=funds?"Solicitudes de fondos":"Rendiciones";
+  dashboard.querySelector(".hero-row p").textContent=funds?"Revisa lo entregado, lo aprobado y el saldo de cada fondo.":"Encuentra gastos por empleado, empresa, estado o folio.";
+  const tab=funds?(esAprobadorEfectivo(currentProfile)?"solicitudes-aprobacion":"solicitudes-mias"):(esAprobadorEfectivo(currentProfile)?"aprobaciones":"mias");
+  document.querySelector('[data-tab="'+tab+'"]').click();
+  window.RindeUI?.show("view-dashboard",dashboard.dataset.section);
+}
+
 function wireDashboard() {
   document.getElementById("btn-nueva").addEventListener("click", () => openNuevaRendicion());
   document.getElementById("btn-solicitar-fondos").addEventListener("click", () => openNuevaSolicitud());
@@ -641,7 +716,7 @@ function wireDashboard() {
     btnGenerarRango.disabled = false;
   });
   document.querySelectorAll(".back-link").forEach((b) =>
-    b.addEventListener("click", () => history.back())
+    b.addEventListener("click", () => {if(history.state?.portalDepth>0)history.back();else navegarPortal(b.dataset.back||"inicio");})
   );
 
   const empresaSelect = document.getElementById("filtro-empresa");
@@ -650,6 +725,7 @@ function wireDashboard() {
     document.getElementById(id).addEventListener("change", applyDashboardFilters)
   );
   document.getElementById("filtro-texto").addEventListener("input", applyDashboardFilters);
+  document.getElementById("filtro-empleado").addEventListener("input", applyDashboardFilters);
   const LISTAS_POR_TAB = {
     "mias": "list-mias",
     "aprobaciones": "list-aprobaciones",
@@ -661,6 +737,7 @@ function wireDashboard() {
       document.querySelectorAll(".tab-btn").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       const tab = b.dataset.tab;
+      document.getElementById("campo-filtro-empleado").style.display = (tab === "aprobaciones" || tab === "solicitudes-aprobacion") ? "" : "none";
       Object.entries(LISTAS_POR_TAB).forEach(([t, listId]) => {
         document.getElementById(listId).style.display = t === tab ? "flex" : "none";
       });
@@ -669,73 +746,96 @@ function wireDashboard() {
 }
 
 // Cache de la última carga, para poder filtrar sin volver a golpear la base.
-const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [] };
+const dashboardData = { mias: [], aprobaciones: [], solicitudesMias: [], solicitudesAprobacion: [], consumoFondos: new Map() };
 
-// Tope de seguridad para las listas de "Mis rendiciones"/"Mis solicitudes"
-// -- sin esto, el historial de alguien con años de antigüedad crece sin
-// límite y cada carga del dashboard se pone más lenta con el tiempo. OJO:
-// a propósito NO se le pone límite a la consulta de "aprobaciones" que ve
-// el admin más abajo -- Reportes (openReportes/renderReportes) depende de
-// que dashboardData.aprobaciones tenga TODO el histórico para calcular
-// tendencias, anomalías y presupuestos; limitarla rompería esos cálculos
-// en silencio, sin ningún error que lo delate. Si esto llega a pesar
-// demasiado, la solución real es una consulta de agregación server-side
-// para Reportes (no depender de traer todas las filas al navegador), no
-// un límite acá.
-const TOPE_LISTA_PROPIA = 300;
+// Los indicadores y filtros se calculan sobre consultas completas.
+function resumirConsumoFondo(rendiciones, montoFondo) {
+  const vigentes = (rendiciones || []).filter(r => r.estado === "Pendiente" || r.estado === "Aprobado");
+  const consumido = vigentes.reduce((sum,r) => sum + Number(r.monto_total || 0),0);
+  const aprobado = vigentes.reduce((sum,r) => sum + Number(r.monto_aprobado ?? (r.estado === "Aprobado" ? r.monto_total : 0)),0);
+  return {consumido, aprobado, porRevisar: Math.max(0,consumido-aprobado), saldo: Number(montoFondo || 0)-consumido};
+}
 
+async function cargarConsumoFondos(solicitudes) {
+  const resultado = new Map();
+  const ids = [...new Set(solicitudes.map(s => s.id))];
+  for (let inicio = 0; inicio < ids.length; inicio += 100) {
+    const lote = ids.slice(inicio,inicio+100);
+    const rendiciones = [];
+    let correcto = true;
+    for (let pagina = 0; ;) {
+      const {data,error,count} = await db.from("rendiciones")
+        .select("id,solicitud_fondo_id,monto_total,monto_aprobado,estado", {count:"exact"})
+        .in("solicitud_fondo_id",lote).order("id").range(pagina,pagina+499);
+      if (error) {console.error("No se pudo calcular el consumo de fondos",error); correcto=false; break;}
+      rendiciones.push(...(data || []));
+      if (!data || !data.length) {if (count && rendiciones.length < count) correcto=false; break;}
+      pagina += data.length;
+      if (count !== null && pagina >= count) break;
+    }
+    if (correcto) lote.forEach(id => resultado.set(id, rendiciones.filter(r => r.solicitud_fondo_id === id)));
+  }
+  return resultado;
+}
+
+// Recorre todas las páginas y rechaza resultados truncados o inconsistentes.
+const {consultarTodas} = window.RindeData;
+
+let dashboardCarga=0;
 async function loadDashboard() {
-  const { data: mias } = await db
-    .from("rendiciones")
-    .select("*")
-    .eq("empleado_id", currentUser.id)
-    .order("created_at", { ascending: false })
-    .limit(TOPE_LISTA_PROPIA);
-  dashboardData.mias = mias || [];
+  const gen=++dashboardCarga, usuario=currentUser, perfil=currentProfile;
+  if(!usuario || !perfil)return;
+  const nuevo={...dashboardData};
+  const aviso=document.getElementById("dashboard-carga-status");
+  if(aviso){aviso.hidden=false;aviso.textContent="Actualizando rendiciones y montos…";}
+  try {
+  nuevo.mias=await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).eq("empleado_id",usuario.id).order("created_at",{ascending:false}).order("id"));
 
-  const { data: solicitudesMias } = await db
-    .from("solicitudes_fondos")
-    .select("*")
-    .eq("empleado_id", currentUser.id)
-    .order("created_at", { ascending: false })
-    .limit(TOPE_LISTA_PROPIA);
-  dashboardData.solicitudesMias = solicitudesMias || [];
+  nuevo.solicitudesMias=await consultarTodas(() => db.from("solicitudes_fondos").select("*",{count:"exact"}).eq("empleado_id",usuario.id).order("created_at",{ascending:false}).order("id"));
 
-  if (esAprobadorEfectivo(currentProfile)) {
-    // El admin (usuario maestro) ve todas las rendiciones de todo el grupo;
-    // un aprobador normal (o un delegado temporal) solo ve las pendientes
-    // de aprobar.
-    let query = db.from("rendiciones").select("*");
-    query = currentProfile.rol === "admin"
-      ? query.order("created_at", { ascending: false })
-      : query.eq("estado", "Pendiente").order("created_at", { ascending: true });
-    const { data: pendientes } = await query;
-    dashboardData.aprobaciones = pendientes || [];
-    document.getElementById("tab-aprobaciones").textContent =
-      currentProfile.rol === "admin" ? "Todas las rendiciones" : "Aprobaciones pendientes";
+  if (esAprobadorEfectivo(perfil)) {
+    // Aprobadores y admin ven TODAS las rendiciones del grupo, en cualquier
+    // estado. Antes un aprobador solo recibía las que estaban Pendiente, y
+    // eso le tapaba justamente el contexto con el que se aprueba bien: qué
+    // se le aprobó antes a esa persona, si un gasto parecido ya había
+    // pasado, qué se rechazó y por qué. Para volver a la cola de trabajo
+    // está el filtro por estado de la misma vista (ver
+    // applyDashboardFilters), que es una elección de quien mira y no algo
+    // impuesto por la consulta.
+    //
+    // La base ya lo permitía: la policy rendiciones_select habilita a
+    // 'aprobador' y 'admin' por igual. El límite era solo de la app.
+    const todas = await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).order("created_at", { ascending: false }).order("id"));
+    nuevo.aprobaciones = todas || [];
+    document.getElementById("tab-aprobaciones").textContent = "Todas las rendiciones";
 
-    let querySolicitudes = db.from("solicitudes_fondos").select("*");
-    querySolicitudes = currentProfile.rol === "admin"
+    const crearQuerySolicitudes = () => { let querySolicitudes = db.from("solicitudes_fondos").select("*",{count:"exact"});
+    querySolicitudes = perfil.rol === "admin"
       ? querySolicitudes.order("created_at", { ascending: false })
       : querySolicitudes.eq("estado", "Pendiente").order("created_at", { ascending: true });
-    const { data: solicitudesPendientes } = await querySolicitudes;
-    dashboardData.solicitudesAprobacion = solicitudesPendientes || [];
+    return querySolicitudes.order("id"); };
+    const solicitudesPendientes = await consultarTodas(crearQuerySolicitudes);
+    nuevo.solicitudesAprobacion = solicitudesPendientes || [];
     document.getElementById("tab-solicitudes-aprobacion").textContent =
-      currentProfile.rol === "admin" ? "Todas las solicitudes de fondos" : "Solicitudes de fondos pendientes";
+      perfil.rol === "admin" ? "Todas las solicitudes de fondos" : "Solicitudes de fondos pendientes";
   } else {
-    dashboardData.aprobaciones = [];
-    dashboardData.solicitudesAprobacion = [];
+    nuevo.aprobaciones = [];
+    nuevo.solicitudesAprobacion = [];
   }
 
-  // El admin ve totales de TODA la empresa (ya tiene los datos: dashboardData.aprobaciones
+  nuevo.consumoFondos = await cargarConsumoFondos([...nuevo.solicitudesMias,...nuevo.solicitudesAprobacion]);
+
+  // El admin ve totales de TODA la empresa (ya tiene los datos: nuevo.aprobaciones
   // trae cada rendición, sin filtrar por estado, cuando el rol es admin) --
   // antes siempre se mostraban los propios, aunque quien mirara fuera admin
   // y le sirviera más ver el conjunto completo de un vistazo.
-  const esAdmin = currentProfile?.rol === "admin";
-  const paraStats = esAdmin ? dashboardData.aprobaciones : dashboardData.mias;
+  if(gen!==dashboardCarga || currentUser?.id!==usuario.id)return;
+  Object.assign(dashboardData,nuevo);
+  const esAdmin = perfil?.rol === "admin";
+  const paraStats = esAdmin ? nuevo.aprobaciones : nuevo.mias;
   const pendienteStats = paraStats.filter((r) => r.estado === "Pendiente");
-  const pendiente = pendienteStats.reduce((s, r) => s + Number(r.monto_total), 0);
-  const aprobado = paraStats.filter((r) => r.estado === "Aprobado").reduce((s, r) => s + Number(r.monto_total), 0);
+  const pendiente = pendienteStats.reduce((s, r) => s + Math.max(0,Number(r.monto_total||0)-Number(r.monto_aprobado||0)), 0);
+  const aprobado = paraStats.reduce((s,r)=>s+Number(r.monto_aprobado??(r.estado==="Aprobado"?r.monto_total:0)),0);
   // Cuántas de las Pendientes llevan más de 7 días esperando -- antes no
   // había ninguna forma de detectar un cuello de botella sin abrir cada
   // rendición a mirar la fecha una por una.
@@ -744,6 +844,19 @@ async function loadDashboard() {
   renderStats(pendiente, aprobado, paraStats.length, esAdmin, antiguas);
 
   applyDashboardFilters();
+  window.RindeUI.renderHome(dashboardData,esAprobadorEfectivo(perfil),resumirConsumoFondo,renderList);
+  if(aviso)aviso.hidden=true;
+  } catch (error) {
+    if(gen!==dashboardCarga || currentUser?.id!==usuario.id)return;
+    if(aviso){aviso.hidden=false;aviso.textContent="No se pudieron actualizar los datos. Se conserva la última lectura disponible. ";aviso.appendChild(el("button",{type:"button",class:"btn btn-ghost",onclick:loadDashboard},"Reintentar"));}
+    if(document.getElementById("view-inicio").classList.contains("active")) document.getElementById("portal-home-content").replaceChildren(el("p",{},"No se pudieron cargar tus rendiciones."),el("button",{class:"btn btn-secondary",onclick:loadDashboard},"Reintentar"));
+    console.error("No se pudo cargar el dashboard completo",error);
+    toast("No se pudieron actualizar los datos completos. Intenta nuevamente; los montos no se han recalculado.");
+  }
+}
+
+function normalizarBusquedaEmpleado(texto) {
+  return String(texto || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim().toLocaleLowerCase("es");
 }
 
 function applyDashboardFilters() {
@@ -754,7 +867,7 @@ function applyDashboardFilters() {
   const pasaFiltro = (r) =>
     (!estado || r.estado === estado) &&
     (!empresa || r.empresa === empresa) &&
-    (!texto || `${r.comentario || ""} ${r.empleado_nombre || ""}`.toLowerCase().includes(texto));
+    (!texto || `${r.folio || ""} ${r.comentario || ""} ${r.empleado_nombre || ""}`.toLowerCase().includes(texto));
 
   const pasaFiltroSolicitud = (s) =>
     (!estado || s.estado === estado) &&
@@ -762,9 +875,9 @@ function applyDashboardFilters() {
     (!texto || `${s.motivo || ""} ${s.empleado_nombre || ""}`.toLowerCase().includes(texto));
 
   renderList(document.getElementById("list-mias"), dashboardData.mias.filter(pasaFiltro), false);
-  renderList(document.getElementById("list-aprobaciones"), dashboardData.aprobaciones.filter(pasaFiltro), true);
+  renderList(document.getElementById("list-aprobaciones"), dashboardData.aprobaciones.filter(r => pasaFiltro(r) && normalizarBusquedaEmpleado(r.empleado_nombre).includes(normalizarBusquedaEmpleado(document.getElementById("filtro-empleado").value))), true);
   renderListSolicitudes(document.getElementById("list-solicitudes-mias"), dashboardData.solicitudesMias.filter(pasaFiltroSolicitud), false);
-  renderListSolicitudes(document.getElementById("list-solicitudes-aprobacion"), dashboardData.solicitudesAprobacion.filter(pasaFiltroSolicitud), true);
+  renderListSolicitudes(document.getElementById("list-solicitudes-aprobacion"), dashboardData.solicitudesAprobacion.filter(s => pasaFiltroSolicitud(s) && normalizarBusquedaEmpleado(s.empleado_nombre).includes(normalizarBusquedaEmpleado(document.getElementById("filtro-empleado").value))), true);
 }
 
 function renderStats(pendiente, aprobado, count, esAdmin, antiguas) {
@@ -791,83 +904,37 @@ function renderStats(pendiente, aprobado, count, esAdmin, antiguas) {
 }
 
 function renderList(container, rows, showEmpleado) {
-  container.innerHTML = "";
-  if (!rows.length) {
-    container.appendChild(el("div", { class: "empty-state" }, [
-      el("div", { class: "icon" }, "🧾"),
-      el("div", {}, "No hay rendiciones para mostrar todavía."),
-    ]));
-    return;
-  }
-
-  const columnas = ["Folio"];
-  if (showEmpleado) columnas.push("Empleado");
-  columnas.push("Empresa", "Comentario", "Fecha", "Tipo", "Monto", "Estado");
-
-  const columnasCentradas = new Set(["Folio", "Fecha", "Tipo", "Estado"]);
-  const tabla = el("table", { class: "items-table" });
-  tabla.appendChild(el("thead", {}, [
-    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c === "Monto" ? "right" : "") }, c))),
-  ]));
-  const tbody = el("tbody");
-  tabla.appendChild(tbody);
-
-  rows.forEach((r) => {
-    const celdas = [el("td", { class: "center" }, `N° ${r.folio ?? "-"}`)];
-    if (showEmpleado) celdas.push(el("td", {}, r.empleado_nombre || "-"));
-    celdas.push(
-      el("td", {}, r.empresa || "-"),
-      el("td", { class: "wrap" }, r.comentario || "-"),
-      el("td", { class: "center" }, fmtDate(r.created_at)),
-      el("td", { class: "center" }, r.tipo_rendicion),
-      el("td", { class: "monto" }, fmtCLP(r.monto_total)),
-      el("td", { class: "center" }, el("span", { class: "pill " + r.estado }, r.estado)),
-    );
-    celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
-    tbody.appendChild(filaClickable(() => openDetalle(r.id), celdas));
-  });
-
-  container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+  container.replaceChildren();
+  if(!rows.length){container.appendChild(el("div",{class:"empty-state"},"No hay rendiciones para estos filtros."));return;}
+  const cols=["Folio",showEmpleado?"Empleado / Empresa":"Empresa","Motivo / Fecha","Rendido","Aprobado","Estado"];
+  const table=el("table",{class:"items-table portal-list-table portal-rendiciones-table","aria-label":"Rendiciones"},[
+    el("colgroup",{},[8,23,27,15,15,12].map(width=>el("col",{style:"width:"+width+"%"}))),
+    el("thead",{},el("tr",{},cols.map((c,i)=>el("th",{scope:"col",class:i===3||i===4?"right":i===5?"center":""},c))))]);
+  const tbody=el("tbody");
+  rows.forEach(r=>{
+    const cells=[el("td",{},"Nº "+(r.folio??"—")),el("td",{},[el("strong",{},showEmpleado?(r.empleado_nombre||"—"):(r.empresa||"—")),el("small",{},showEmpleado?(r.empresa||"—"):"")]),
+      el("td",{},[el("span",{},r.comentario||"Sin comentario"),el("small",{},(r.tipo_rendicion==="FondoPorRendir"?"Fondo por rendir":"Reembolso")+" · "+fmtDate(r.fecha_rendicion||r.created_at))]),
+      el("td",{class:"monto"},fmtCLP(r.monto_rendido??r.monto_total)),el("td",{class:"monto portal-approved"},fmtCLP(r.monto_aprobado??(r.estado==="Aprobado"?r.monto_total:0))),el("td",{class:"center portal-status"},el("span",{class:"pill "+r.estado},r.estado))];
+    cells.forEach((c,i)=>c.setAttribute("data-label",cols[i]));tbody.appendChild(filaClickable(()=>openDetalle(r.id),cells));
+  });table.append(tbody);container.appendChild(el("div",{class:"table-scroll"},table));
 }
 
 function renderListSolicitudes(container, rows, showEmpleado) {
-  container.innerHTML = "";
-  if (!rows.length) {
-    container.appendChild(el("div", { class: "empty-state" }, [
-      el("div", { class: "icon" }, "💰"),
-      el("div", {}, "No hay solicitudes de fondos para mostrar todavía."),
-    ]));
-    return;
-  }
-
-  const columnas = ["Folio"];
-  if (showEmpleado) columnas.push("Empleado");
-  columnas.push("Empresa", "Centro de Costo", "Motivo", "Fecha", "Monto", "Estado");
-
-  const columnasCentradas = new Set(["Folio", "Fecha", "Estado"]);
-  const tabla = el("table", { class: "items-table" });
-  tabla.appendChild(el("thead", {}, [
-    el("tr", {}, columnas.map((c) => el("th", { class: columnasCentradas.has(c) ? "center" : (c === "Monto" ? "right" : "") }, c))),
-  ]));
-  const tbody = el("tbody");
-  tabla.appendChild(tbody);
-
-  rows.forEach((s) => {
-    const celdas = [el("td", { class: "center" }, `S-${s.folio ?? "-"}`)];
-    if (showEmpleado) celdas.push(el("td", {}, s.empleado_nombre || "-"));
-    celdas.push(
-      el("td", {}, s.empresa || "-"),
-      el("td", {}, s.centro_costo || "-"),
-      el("td", { class: "wrap" }, s.motivo || "-"),
-      el("td", { class: "center" }, fmtDate(s.created_at)),
-      el("td", { class: "monto" }, fmtCLP(s.monto_solicitado)),
-      el("td", { class: "center" }, el("span", { class: "pill " + s.estado }, s.estado)),
-    );
-    celdas.forEach((td, i) => td.setAttribute("data-label", columnas[i]));
-    tbody.appendChild(filaClickable(() => openDetalleSolicitud(s.id), celdas));
-  });
-
-  container.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+  container.replaceChildren();
+  if(!rows.length){container.appendChild(el("div",{class:"empty-state"},"No hay solicitudes de fondos para estos filtros."));return;}
+  const cols=[showEmpleado?"Folio / Empleado":"Folio","Motivo / Empresa","Solicitado","Consumo aprobado","En revisión","Saldo / Exceso","Estado"];
+  const table=el("table",{class:"items-table portal-list-table fondos-tabla","aria-label":"Solicitudes de fondos"},[
+    el("colgroup",{},[16,24,12,14,11,13,10].map(width=>el("col",{style:"width:"+width+"%"}))),
+    el("thead",{},el("tr",{},cols.map((c,i)=>el("th",{scope:"col",class:i>=2&&i<=5?"right":i===6?"center":""},c))))]);
+  const tbody=el("tbody");
+  rows.forEach(s=>{
+    const available=dashboardData.consumoFondos.get(s.id),c=available?resumirConsumoFondo(available,s.monto_solicitado):null,approved=s.estado==="Aprobado";
+    const amount=v=>!approved?"—":c?fmtCLP(v):"No disponible";
+    const cells=[el("td",{},[el("strong",{},"S-"+(s.folio??"—")),el("small",{},showEmpleado?(s.empleado_nombre||"—"):"")]),
+      el("td",{},[el("span",{},s.motivo||"Sin motivo"),el("small",{},s.empresa||"—"),el("small",{},(s.centro_costo||"—")+" · "+fmtDate(s.created_at))]),el("td",{class:"monto"},fmtCLP(s.monto_solicitado)),el("td",{class:"monto portal-approved"},amount(c?.aprobado)),el("td",{class:"monto"},amount(c?.porRevisar)),
+      el("td",{class:"monto "+(c?.saldo<0?"portal-negative":"")},[amount(Math.abs(c?.saldo||0)),el("small",{},approved&&c?(c.saldo<0?"Exceso":"Disponible para rendir"):"")]),el("td",{class:"center portal-status"},el("span",{class:"pill "+s.estado},s.estado))];
+    cells.forEach((cell,i)=>cell.setAttribute("data-label",cols[i]));tbody.appendChild(filaClickable(()=>openDetalleSolicitud(s.id),cells));
+  });table.append(tbody);container.append(el("div",{class:"table-scroll"},table),el("p",{class:"portal-muted"},"El saldo descuenta gastos aprobados y pendientes de revisión. Los rechazados quedan excluidos."));
 }
 
 // ------------------------------------------------------------
@@ -882,12 +949,19 @@ async function openReportes(pushHistory = true) {
   const hastaInput = document.getElementById("reportes-hasta");
   if (!desdeInput.value) {
     const hace30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    desdeInput.value = hace30.toISOString().slice(0, 10);
+    desdeInput.value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(hace30);
   }
-  if (!hastaInput.value) hastaInput.value = new Date().toISOString().slice(0, 10);
+  if (!hastaInput.value) hastaInput.value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
 
   desdeInput.onchange = renderReportes;
   hastaInput.onchange = renderReportes;
+  const card=desdeInput.closest(".card");
+  if(!document.getElementById("portal-reporte-empresa")) {
+    const empresa=el("select",{id:"portal-reporte-empresa"},[el("option",{value:""},"Todas las empresas"),...EMPRESAS.map(e=>el("option",{value:e},e))]);
+    const empleado=el("input",{id:"portal-reporte-empleado",type:"search",placeholder:"Buscar empleado…"});
+    card.appendChild(el("div",{class:"field-row"},[el("div",{class:"field"},[el("label",{for:empresa.id},"Empresa"),empresa]),el("div",{class:"field"},[el("label",{for:empleado.id},"Empleado"),empleado])]));
+    empresa.onchange=renderReportes;empleado.onchange=renderReportes;
+  }
 
   // Si todavía no se cargó el dashboard en esta sesión (ej. F5 directo en
   // #reportes), dashboardData.aprobaciones viene vacío -- lo pedimos antes
@@ -941,18 +1015,33 @@ function calcularAnomalias(porEmpresaRango, desdeMs, hastaMs) {
   return resultados.sort((a, b) => b.variacion - a.variacion);
 }
 
+let generacionReportes = 0;
 async function renderReportes() {
-  const cont = document.getElementById("reportes-contenido");
+  const generation = ++generacionReportes;
+  const target = document.getElementById("reportes-contenido");
+  const cont = el("div", {class:"portal-report-body"});
+  target.replaceChildren(el("p",{role:"status"},"Preparando reportes…"));
+  try {
   const desde = document.getElementById("reportes-desde").value;
   const hasta = document.getElementById("reportes-hasta").value;
   const desdeMs = desde ? new Date(desde + "T00:00:00").getTime() : -Infinity;
   const hastaMs = hasta ? new Date(hasta + "T23:59:59").getTime() : Infinity;
+  if(desdeMs>hastaMs){document.getElementById("portal-report-summary").replaceChildren();target.replaceChildren(el("p",{class:"ocr-status show err"},"La fecha Hasta debe ser igual o posterior a Desde."));return;}
   const enRango = (r, dMs, hMs) => {
     const t = new Date(r.created_at).getTime();
     return t >= dMs && t <= hMs;
   };
 
-  const rendicionesEnRango = dashboardData.aprobaciones.filter((r) => r.estado === "Aprobado" && enRango(r, desdeMs, hastaMs));
+  const empresa=document.getElementById("portal-reporte-empresa")?.value||"";
+  const empleado=normalizarBusquedaEmpleado(document.getElementById("portal-reporte-empleado")?.value);
+  const porPersonaEmpresa=r=>(!empresa||r.empresa===empresa)&&(!empleado||normalizarBusquedaEmpleado(r.empleado_nombre).includes(empleado));
+  const seleccion=dashboardData.aprobaciones.filter(r=>enRango(r,desdeMs,hastaMs)&&porPersonaEmpresa(r));
+  const rendicionesEnRango = seleccion.filter(r=>r.estado==="Aprobado");
+  const ui=window.RindeUI;
+  document.getElementById("portal-report-summary").replaceChildren(
+    ui.metric("Monto rendido",fmtCLP(seleccion.reduce((n,r)=>n+Number(r.monto_rendido??r.monto_total??0),0)),seleccion.length+" rendiciones"),
+    ui.metric("Monto aprobado",fmtCLP(seleccion.reduce((n,r)=>n+Number(r.monto_aprobado??(r.estado==="Aprobado"?r.monto_total:0)),0)),"Gastos aceptados","positive"),
+    ui.metric("Pendiente de revisión",fmtCLP(seleccion.filter(r=>r.estado==="Pendiente").reduce((n,r)=>n+Number(r.monto_total||0)-Number(r.monto_aprobado||0),0)),"Período seleccionado","warning"));
 
   const { data: presupuestosData, error: errPresupuestos } = await db.from("presupuestos").select("*");
   if (errPresupuestos) console.error("Error cargando presupuestos:", errPresupuestos);
@@ -960,6 +1049,7 @@ async function renderReportes() {
   (presupuestosData || []).forEach((p) => { presupuestoPorEmpresa[p.empresa] = p.monto_limite_mensual; });
 
   cont.innerHTML = "";
+  cont.appendChild(el("p",{class:"portal-muted"},"Las distribuciones y el CSV incluyen rendiciones finalizadas aprobadas. El resumen superior también muestra los ítems aprobados en rendiciones todavía pendientes."));
 
   // Tabla genérica "nombre · monto", ordenada de mayor a menor -- la
   // reusan casi todos los reportes de abajo (empresa, categoría, cuenta
@@ -980,7 +1070,7 @@ async function renderReportes() {
   };
 
   if (!rendicionesEnRango.length) {
-    cont.appendChild(el("div", { class: "empty-state" }, "No hay rendiciones aprobadas en este rango de fechas."));
+    cont.appendChild(el("div", { class: "empty-state" }, "No hay rendiciones finalizadas aprobadas para estos filtros."));
   } else {
     const totalGeneral = rendicionesEnRango.reduce((s, r) => s + Number(r.monto_total || 0), 0);
 
@@ -994,7 +1084,7 @@ async function renderReportes() {
       const hastaAnteriorMs = desdeMs - 1;
       const desdeAnteriorMs = hastaAnteriorMs - duracionMs;
       const totalAnterior = dashboardData.aprobaciones
-        .filter((r) => r.estado === "Aprobado" && enRango(r, desdeAnteriorMs, hastaAnteriorMs))
+        .filter((r) => r.estado === "Aprobado" && enRango(r, desdeAnteriorMs, hastaAnteriorMs) && porPersonaEmpresa(r))
         .reduce((s, r) => s + Number(r.monto_total || 0), 0);
       if (totalAnterior > 0) {
         const variacion = ((totalGeneral - totalAnterior) / totalAnterior) * 100;
@@ -1005,7 +1095,7 @@ async function renderReportes() {
     }
 
     cont.appendChild(el("div", { class: "totals-bar", style: "margin-bottom:4px;" }, [
-      el("span", {}, `Total aprobado (${rendicionesEnRango.length} rendición(es))`),
+      el("span", {}, `Rendiciones finalizadas aprobadas (${rendicionesEnRango.length})`),
       el("span", { class: "amount" }, fmtCLP(totalGeneral)),
     ]));
     if (deltaTexto) {
@@ -1176,11 +1266,11 @@ async function renderReportes() {
     // rendiciones) -- se pide una sola vez, ya filtrado por las
     // rendiciones del rango, y se reusa para los tres reportes en vez de
     // repetir la consulta.
-    const { data: items, error } = await db
-      .from("rendicion_items")
-      .select("categoria, monto, empresa, tipo_item, estado, cuenta_contable, centro_costo")
-      .in("rendicion_id", rendicionesEnRango.map((r) => r.id))
-      .eq("estado", "Aprobado");
+    let items=[],error=null;
+    try {
+      const ids=rendicionesEnRango.map(r=>r.id);
+      for(let i=0;i<ids.length;i+=100)items.push(...await consultarTodas(()=>db.from("rendicion_items").select("id,categoria, monto, empresa, tipo_item, estado, cuenta_contable, centro_costo",{count:"exact"}).in("rendicion_id",ids.slice(i,i+100)).eq("estado","Aprobado").order("id")));
+    }catch(err){error=err;}
     if (error) {
       console.error("Error cargando ítems para reportes:", error);
     } else {
@@ -1228,7 +1318,7 @@ async function renderReportes() {
         ...seccionCSV("Por centro de costo", porCentroCosto),
         ...seccionCSV("Tendencia mensual", porMes),
       ];
-      csvContenido = todasLasFilas.map((fila) => fila.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+      csvContenido = todasLasFilas.map(fila => fila.map(c => campoCSVSeguro(c)).join(",")).join("\r\n");
     }
 
     // Métricas de aprobación: tiempo promedio y % de rechazo por
@@ -1265,38 +1355,20 @@ async function renderReportes() {
     }
   }
 
-  // Saldo de Fondos por Rendir: cuánto de lo ya ENTREGADO (solicitudes
-  // Aprobadas) sigue sin justificar con una rendición Aprobada -- es un
-  // saldo a una fecha (como un pasivo), no algo del rango elegido arriba,
-  // así que se muestra siempre, incluso si no hay rendiciones aprobadas
-  // en el rango. Misma fórmula que calcularSplitFondo, pero consolidada
-  // para todas las personas en vez de una solicitud a la vez.
-  const solicitudesAprobadas = dashboardData.solicitudesAprobacion.filter((s) => s.estado === "Aprobado");
-  if (solicitudesAprobadas.length) {
-    cont.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.95rem" }, "Saldo de Fondos por Rendir"));
-    const tablaFondos = el("table", { class: "items-table" });
-    tablaFondos.appendChild(el("thead", {}, [el("tr", {}, ["Empleado", "Empresa", "Otorgado", "Rendido", "Saldo"].map((c) => el("th", { class: ["Empleado", "Empresa"].includes(c) ? "" : "right" }, c)))]));
-    const tbodyFondos = el("tbody");
-    solicitudesAprobadas
-      .map((s) => {
-        const rendido = dashboardData.aprobaciones
-          .filter((r) => r.solicitud_fondo_id === s.id && r.estado === "Aprobado")
-          .reduce((sum, r) => sum + Number(r.monto_total || 0), 0);
-        return { s, rendido, saldo: Number(s.monto_solicitado) - rendido };
-      })
-      .filter(({ saldo }) => saldo > 0)
-      .sort((a, b) => b.saldo - a.saldo)
-      .forEach(({ s, rendido, saldo }) => {
-        tbodyFondos.appendChild(el("tr", {}, [
-          el("td", { "data-label": "Empleado" }, s.empleado_nombre || "-"),
-          el("td", { "data-label": "Empresa" }, s.empresa || "-"),
-          el("td", { class: "monto", "data-label": "Otorgado" }, fmtCLP(s.monto_solicitado)),
-          el("td", { class: "monto", "data-label": "Rendido" }, fmtCLP(rendido)),
-          el("td", { class: "monto", "data-label": "Saldo" }, fmtCLP(saldo)),
-        ]));
-      });
-    tablaFondos.appendChild(tbodyFondos);
-    cont.appendChild(el("div", { class: "table-scroll" }, [tablaFondos]));
+  // Saldo actual: incluye reservas pendientes, independiente del rango de fechas.
+  const solicitudesAprobadas = dashboardData.solicitudesAprobacion.filter(s=>s.estado==="Aprobado"&&porPersonaEmpresa(s));
+  if(solicitudesAprobadas.length){
+    cont.appendChild(el("h2",{},"Saldo actual de fondos"));
+    cont.appendChild(el("p",{class:"portal-muted"},"Saldo al día de hoy. Incluye lo aprobado y lo reservado en revisión; no depende del rango de fechas."));
+    const table=el("table",{class:"items-table"}),cols=["Fondo / Empleado","Empresa","Otorgado","Consumo aprobado","En revisión","Saldo / Exceso"];
+    table.appendChild(el("thead",{},[el("tr",{},cols.map(c=>el("th",{},c)))]));
+    const body=el("tbody");
+    for(const fund of solicitudesAprobadas){
+      const consumption=resumirConsumoFondo(dashboardData.aprobaciones.filter(r=>r.solicitud_fondo_id===fund.id),fund.monto_solicitado);
+      const values=["S-"+(fund.folio??"—")+" · "+(fund.empleado_nombre||"—"),fund.empresa||"—",fmtCLP(fund.monto_solicitado),fmtCLP(consumption.aprobado),fmtCLP(consumption.porRevisar),fmtCLP(Math.abs(consumption.saldo))+(consumption.saldo<0?" · Exceso":" · Disponible")];
+      body.appendChild(el("tr",{},values.map((value,i)=>el("td",{"data-label":cols[i],class:i>1?"monto":""},value))));
+    }
+    table.appendChild(body);cont.appendChild(el("div",{class:"table-scroll"},[table]));
   }
 
   // Posibles gastos recurrentes: mismo proveedor apareciendo en 3 o más
@@ -1305,13 +1377,15 @@ async function renderReportes() {
   // Independiente del rango de fechas elegido arriba (mira TODO el
   // histórico aprobado), porque el patrón solo se ve mirando varios meses
   // a la vez -- por eso es una consulta aparte, no reusa "items" de arriba.
-  const { data: itemsHistoricos, error: errHistoricos } = await db
+  const idsHistoricos = dashboardData.aprobaciones.filter(r=>r.estado==="Aprobado"&&porPersonaEmpresa(r)).map(r=>r.id);
+  const { data: itemsHistoricos, error: errHistoricos } = idsHistoricos.length ? await db
     .from("rendicion_items")
     .select("nombre_proveedor, monto, rendiciones!inner(created_at, estado)")
     .eq("tipo_item", "SinDocumento")
     .eq("estado", "Aprobado")
     .eq("rendiciones.estado", "Aprobado")
-    .not("nombre_proveedor", "is", null);
+    .not("nombre_proveedor", "is", null)
+    .in("rendicion_id",idsHistoricos) : {data:[],error:null};
   if (errHistoricos) {
     console.error("Error buscando gastos recurrentes:", errHistoricos);
   } else if (itemsHistoricos && itemsHistoricos.length) {
@@ -1345,6 +1419,11 @@ async function renderReportes() {
       tablaRec.appendChild(tbodyRec);
       cont.appendChild(el("div", { class: "table-scroll" }, [tablaRec]));
     }
+  }
+  if(generation===generacionReportes)target.replaceChildren(cont);
+  } catch(error) {
+    if(generation===generacionReportes)target.replaceChildren(el("p",{class:"ocr-status show err"},"No se pudo completar el reporte. Cambia el filtro o vuelve a abrirlo para reintentar."));
+    console.error("Error preparando reportes:",error);
   }
 }
 
@@ -1476,7 +1555,7 @@ async function openAdminUsuarios(pushHistory = true) {
     tabla.appendChild(tbody);
 
     filtrados.forEach((u) => {
-      const select = el("select", { style: "width:auto" }, ROLES.map((r) => el("option", { value: r }, r)));
+      const select = el("select", { style: "width:auto", "aria-label":"Rol de "+(u.nombre||"usuario") }, ROLES.map((r) => el("option", { value: r }, r)));
       select.value = u.rol;
       select.addEventListener("change", async () => {
         const nuevoRol = select.value;
@@ -1492,7 +1571,7 @@ async function openAdminUsuarios(pushHistory = true) {
       // "Sin plantilla" + una opción por plantilla existente. Las cuentas
       // permitidas de la persona son la plantilla (si elige una) MÁS sus
       // cuentas individuales -- una no reemplaza a la otra.
-      const selectPlantilla = el("select", { style: "width:auto" }, [
+      const selectPlantilla = el("select", { style: "width:auto", "aria-label":"Plantilla de "+(u.nombre||"usuario") }, [
         el("option", { value: "" }, "Sin plantilla"),
         ...listaPlantillas.map((p) => el("option", { value: p.id }, p.nombre)),
       ]);
@@ -1516,7 +1595,12 @@ async function openAdminUsuarios(pushHistory = true) {
       const mostrarPanel = (tipo, render) => {
         const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
         if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
-        filaExtra.style.display = "table-row";
+        // "" (no "table-row" fijo): deja que el CSS decida -- en mobile
+        // (@media max-width:700px) .items-table tr pasa a display:block para
+        // apilarse como tarjeta, pero un estilo inline le gana a esa regla
+        // (no tiene !important) y dejaba la fila trabada en table-row dentro
+        // de un tbody ya puesto en block, rompiendo el ancho de esta celda.
+        filaExtra.style.display = "";
         extraCell.dataset.tipo = tipo;
         render(extraCell);
       };
@@ -1670,7 +1754,7 @@ function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = 
   }
 
   const contador = el("span", { class: "cuentas-ficha-contador" }, `${cuentasActuales.size} seleccionadas`);
-  const buscador = el("input", { type: "text", class: "cuentas-buscar", placeholder: "Buscar cuenta..." });
+  const buscador = el("input", { type: "text", class: "cuentas-buscar", placeholder: "Buscar cuenta...", "aria-label":"Buscar cuenta contable" });
   ficha.appendChild(el("div", { class: "cuentas-ficha-header" }, [
     el("p", { class: "cuentas-panel-hint", style: "margin:0;" },
       plantilla
@@ -1832,7 +1916,7 @@ async function openAdminPlantillas(pushHistory = true) {
     const mostrarPanel = (tipo, render) => {
       const yaAbiertoConEsto = filaExtra.style.display !== "none" && extraCell.dataset.tipo === tipo;
       if (yaAbiertoConEsto) { filaExtra.style.display = "none"; return; }
-      filaExtra.style.display = "table-row";
+      filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
       extraCell.dataset.tipo = tipo;
       render(extraCell);
     };
@@ -1969,36 +2053,35 @@ function wireNuevaRendicion() {
 // solicitudes de fondos de ESTE empleado, ya Aprobadas, para la Empresa
 // elegida en el encabezado (un fondo entregado para una empresa no debe
 // rendirse contra otra). Muestra el saldo disponible de cada una -- ya
-// consumido por rendiciones Aprobadas anteriores contra ese mismo fondo --
+// reservado por gastos aprobados y pendientes contra ese mismo fondo --
 // aunque esté en $0 (la persona puede seguir rindiendo de más; el
 // excedente se contabiliza aparte, ver calcularSplitFondo).
+let cargaSolicitudesDisponibles = 0;
 async function cargarSolicitudesDisponibles() {
-  const sel = document.getElementById("nr-fondo");
-  sel.innerHTML = "";
-  const empresa = document.getElementById("nr-empresa").value;
-  const { data: solicitudes, error } = await db
-    .from("solicitudes_fondos")
-    .select("*")
-    .eq("empleado_id", currentUser.id)
-    .eq("estado", "Aprobado")
-    .eq("empresa", empresa)
-    .order("created_at", { ascending: false });
-  if (error) { console.error("Error cargando solicitudes de fondos:", error); return; }
-  if (!solicitudes || !solicitudes.length) {
-    sel.appendChild(el("option", { value: "" }, "No tienes fondos aprobados en esta empresa"));
-    return;
-  }
-  const ids = solicitudes.map((s) => s.id);
-  const { data: rendidas } = await db.from("rendiciones").select("solicitud_fondo_id, monto_total").in("solicitud_fondo_id", ids).eq("estado", "Aprobado");
-  const rendidoPorId = {};
-  (rendidas || []).forEach((r) => { rendidoPorId[r.solicitud_fondo_id] = (rendidoPorId[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0); });
-
-  solicitudes.forEach((s) => {
-    const rendido = rendidoPorId[s.id] || 0;
-    const saldo = Math.max(0, Number(s.monto_solicitado) - rendido);
-    const label = `S-${s.folio} · Otorgado ${fmtCLP(s.monto_solicitado)} · Saldo disponible ${fmtCLP(saldo)}`;
-    sel.appendChild(el("option", { value: s.id }, label));
-  });
+  const generation=++cargaSolicitudesDisponibles,usuarioId=currentUser?.id;
+  const sel=document.getElementById("nr-fondo"),empresa=document.getElementById("nr-empresa").value;
+  const vigente=()=>generation===cargaSolicitudesDisponibles&&currentUser?.id===usuarioId&&document.getElementById("nr-empresa").value===empresa;
+  sel.disabled=true;sel.replaceChildren(el("option",{value:""},"Comprobando fondos y saldos…"));
+  try{
+    const solicitudes=await consultarTodas(()=>db.from("solicitudes_fondos").select("*",{count:"exact"}).eq("empleado_id",usuarioId).eq("estado","Aprobado").eq("empresa",empresa).order("created_at",{ascending:false}).order("id"));
+    if(!vigente())return;
+    if(!solicitudes.length){
+      const otras=await consultarTodas(()=>db.from("solicitudes_fondos").select("id, empresa",{count:"exact"}).eq("empleado_id",usuarioId).eq("estado","Aprobado").order("id"));
+      if(!vigente())return;
+      const empresas=[...new Set(otras.map(s=>s.empresa).filter(e=>e&&e!==empresa))];
+      sel.replaceChildren(el("option",{value:""},empresas.length?"Sin fondos en esta empresa. Cambia Empresa a: "+empresas.join(", "):"No tienes fondos aprobados"));return;
+    }
+    const rendidas=await consultarTodas(()=>db.from("rendiciones").select("id, solicitud_fondo_id, monto_total, monto_aprobado, estado",{count:"exact"}).in("solicitud_fondo_id",solicitudes.map(s=>s.id)).order("created_at").order("id"));
+    if(!vigente())return;
+    sel.replaceChildren(...solicitudes.map(fund=>{
+      const consumption=resumirConsumoFondo(rendidas.filter(r=>r.solicitud_fondo_id===fund.id),fund.monto_solicitado);
+      const balance=consumption.saldo<0?"Exceso "+fmtCLP(Math.abs(consumption.saldo)):"Disponible "+fmtCLP(consumption.saldo);
+      return el("option",{value:fund.id},"S-"+fund.folio+" · Otorgado "+fmtCLP(fund.monto_solicitado)+" · "+balance+" · En revisión "+fmtCLP(consumption.porRevisar));
+    }));
+  }catch(error){
+    if(vigente())sel.replaceChildren(el("option",{value:""},"No se pudo comprobar el saldo. Cambia el tipo de rendición para reintentar."));
+    console.error("Error comprobando fondos disponibles:",error);
+  }finally{if(vigente()){sel.disabled=false;window.RindeUI?.updateFormSummary();}}
 }
 
 // El Centro de Costo se elige UNA vez a nivel de encabezado (igual que la
@@ -2029,7 +2112,10 @@ function actualizarCentroCostoRendicion() {
 }
 
 function openNuevaRendicion(pushHistory = true) {
-  document.getElementById("nr-fecha").value = new Date().toISOString().slice(0, 10);
+  if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
+  envioRendicionId = crypto.randomUUID();
+  adjuntosBorrador.clear();
+  document.getElementById("nr-fecha").value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
   document.getElementById("nr-tipo").value = "Reembolso";
   document.getElementById("nr-fondo-wrap").style.display = "none";
   document.getElementById("nr-comentario").value = "";
@@ -2037,6 +2123,25 @@ function openNuevaRendicion(pushHistory = true) {
   actualizarCentroCostoRendicion();
   document.getElementById("items-container").innerHTML = "";
   itemSeq = 0;
+  // itemSeq vuelve a 0, así que el primer ítem de esta rendición se vuelve a
+  // llamar "item-1" igual que el de la rendición anterior. Si estos dos mapas
+  // no se limpian, ese id reciclado arrastra el estado del formulario viejo:
+  //  - un OCR que quedó en vuelo de la rendición anterior encuentra su "gen"
+  //    todavía vigente y los elementos otra vez existentes, y escribe el RUT,
+  //    folio, fecha y monto del documento ANTERIOR en este formulario en
+  //    blanco -- la persona ve un ítem lleno y lo puede enviar así.
+  //  - ocrExitoso.get("item-1") sigue en true, así que estadoReintentoOcr
+  //    decide no encolar un ítem cuyo OCR en realidad falló, y el agente en
+  //    segundo plano nunca lo toma, sin ninguna señal visible.
+  ocrGeneracion.clear();
+  ocrExitoso.clear();
+  for (const revision of revisionesComprobante.values()) revision.limpiar();
+  revisionesComprobante.clear();
+  ocrArchivoActual.clear();
+  ocrBloqueado.clear();
+  ocrConflictos.clear();
+  ocrOrigen.clear();
+  ocrMonto.clear();
   addItemRow();
   if (pushHistory) pushView("view-nueva"); else show("view-nueva");
 }
@@ -2078,6 +2183,7 @@ function addItemRow() {
           const tieneArchivo = [...wrap.querySelectorAll('input[type=file]')].some((i) => i.files.length);
           if ((tieneMonto || tieneArchivo) && !confirm("¿Quitar este ítem? Se pierde el comprobante y los datos cargados, no se puede deshacer.")) return;
           wrap.remove();
+          actualizarAlertasDuplicados();
           renumerarItems();
           recalcTotal();
         },
@@ -2087,7 +2193,7 @@ function addItemRow() {
 
   const toggle = el("div", { class: "toggle-group", role: "tablist" }, [
     el("button", { type: "button", class: "active", "data-tipo": "ConDocumento", "aria-pressed": "true" }, "Documento electrónico"),
-    el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Boleta"),
+    el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Comprobante/Boleta"),
   ]);
 
   const bodyConDoc = buildConDocumentoFields(id);
@@ -2102,6 +2208,7 @@ function addItemRow() {
       const isCon = b.dataset.tipo === "ConDocumento";
       bodyConDoc.style.display = isCon ? "block" : "none";
       bodySinDoc.style.display = isCon ? "none" : "block";
+      actualizarAlertasDuplicados();
     });
   });
 
@@ -2109,6 +2216,17 @@ function addItemRow() {
   wrap.appendChild(toggle);
   wrap.appendChild(bodyConDoc);
   wrap.appendChild(bodySinDoc);
+  wrap.appendChild(bodyConDoc.querySelector(`#${id}-dup-status`));
+  wrap.appendChild(el("p", { class: "ocr-status", id: id + "-dup-local" }));
+  const identidadCampos = /-(rut2?|folio2?|tipodoc2?)$/;
+  wrap.addEventListener("input", (event) => {
+    if (event.isTrusted) camposEditadosOcr.add(event.target.id);
+    if (identidadCampos.test(event.target.id)) actualizarAlertasDuplicados();
+  });
+  wrap.addEventListener("change", (event) => { if (event.isTrusted) camposEditadosOcr.add(event.target.id); actualizarAlertasDuplicados(); });
+  wrap.addEventListener("focusout", (event) => {
+    if (identidadCampos.test(event.target.id)) chequearDuplicadoHistorico(id);
+  });
   document.getElementById("items-container").appendChild(wrap);
   // itemSeq solo sigue subiendo (nunca vuelve atrás, para que los ids del
   // DOM no se repitan) -- si antes se quitó un ítem, el título inicial de
@@ -2133,7 +2251,7 @@ function dividirItem(wrap, id) {
         nombreprov: v("-nombreprov"), rut: v("-rut"), tipodoc: v("-tipodoc"),
         folio: v("-folio"), venc: v("-venc"), categoria: v("-categoriacon"), monto: v("-monto"),
       }
-    : { nombreprov2: v("-nombreprov2"), categoria: v("-categoria"), monto2: v("-monto2") };
+    : { nombreprov2: v("-nombreprov2"), rut2: v("-rut2"), tipodoc2: v("-tipodoc2"), folio2: v("-folio2"), fecha2: v("-fecha2"), categoria: v("-categoria"), monto2: v("-monto2") };
 
   addItemRow();
   const nuevoId = "item-" + itemSeq;
@@ -2151,6 +2269,7 @@ function dividirItem(wrap, id) {
     document.getElementById(`${nuevoId}-monto`).value = datos.monto;
   } else {
     document.getElementById(`${nuevoId}-nombreprov2`).value = datos.nombreprov2;
+    for (const campo of ["rut2", "tipodoc2", "folio2", "fecha2"]) document.getElementById(`${nuevoId}-${campo}`).value = datos[campo];
     const catSel = document.getElementById(`${nuevoId}-categoria`);
     if (catSel && datos.categoria) { catSel.value = datos.categoria; catSel.dispatchEvent(new Event("change")); }
     document.getElementById(`${nuevoId}-monto2`).value = datos.monto2;
@@ -2164,6 +2283,7 @@ function dividirItem(wrap, id) {
   }
 
   recalcTotal();
+  actualizarAlertasDuplicados();
   toast("Ítem dividido. Ajusta el monto y el Centro de Costo de cada uno para que sumen el total real del documento.");
   document.getElementById(esCon ? `${nuevoId}-cccon` : `${nuevoId}-cc`)?.focus();
 }
@@ -2243,8 +2363,8 @@ function buildConDocumentoFields(id) {
   const fotoInput = foto.querySelector("input[type=file]");
   fotoInput.addEventListener("change", async () => {
     if (!validarTamanoArchivo(fotoInput)) return;
-    await reemplazarConVersionComprimida(fotoInput);
-    if (fotoInput.files && fotoInput.files[0]) analizarComprobante(id, fotoInput.files[0], ocrStatus);
+    nuevaGeneracionOcr(id);
+    await prepararArchivoParaLectura(fotoInput,ocrStatus,file => analizarComprobante(id,file,ocrStatus));
   });
 
   // Si ese RUT ya aparece en la contabilidad, usamos su razón social real
@@ -2263,30 +2383,60 @@ function buildConDocumentoFields(id) {
     } else {
       rutHint.className = "ocr-status";
     }
-    const nombre = await buscarNombreProveedorPorRut(rutInput.value);
-    if (nombre) nombreProvInput.value = nombre;
-    chequearDuplicado();
+    const rutConsultado = rutInput.value;
+    const nombre = await buscarNombreProveedorPorRut(rutConsultado);
+    if (nombre && rutInput.value === rutConsultado && !camposEditadosOcr.has(nombreProvInput.id)) nombreProvInput.value = nombre;
   });
-  folioInput.addEventListener("blur", chequearDuplicado);
-
-  // Detector de comprobantes duplicados: mismo RUT + N° de documento ya
-  // cargado antes en OTRA rendición (propia o ajena) que no esté Rechazada.
-  // Es solo un aviso, no bloquea -- puede haber compras legítimas repetidas
-  // al mismo proveedor con folios que coinciden por error de tipeo, así que
-  // la decisión final la sigue tomando la persona (o quien aprueba).
-  async function chequearDuplicado() {
-    const rut = rutInput.value.trim();
-    const folio = folioInput.value.trim();
-    dupStatus.className = "ocr-status";
-    if (!rut || !folio || !validarRut(rut)) return;
-    const { data, error } = await db.rpc("buscar_documento_duplicado", { p_rut: rut, p_nro: folio });
-    if (error || !data || !data.length) return;
-    const match = data[0];
-    dupStatus.textContent = `⚠ Este documento ya está registrado en la rendición N° ${match.folio} de ${match.empleado_nombre} (${match.estado}). Revisa que no sea un duplicado.`;
-    dupStatus.className = "ocr-status show err";
-  }
 
   return box;
+}
+
+function documentoDeTarjeta(card) {
+  const con = card.querySelector('[data-tipo="ConDocumento"]').classList.contains("active");
+  const v = (campo) => document.getElementById(card.id + campo)?.value || "";
+  return { rut_proveedor: v(con ? "-rut" : "-rut2"), tipo_documento: v(con ? "-tipodoc" : "-tipodoc2"), nro_documento: v(con ? "-folio" : "-folio2") };
+}
+
+function actualizarAlertasDuplicados() {
+  const cards = [...document.querySelectorAll(".item-card")];
+  const grupos = documentosDuplicados(cards.map(documentoDeTarjeta));
+  cards.forEach((card) => {
+    const aviso = document.getElementById(card.id + "-dup-local");
+    if (aviso) { aviso.textContent = ""; aviso.className = "ocr-status"; }
+  });
+  grupos.forEach((indices) => {
+    const texto = "⚠ El mismo documento aparece en los ítems " + indices.map((i) => i + 1).join(", ") + ". Si lo repartiste entre centros de costo, verifica que los montos sumen el total de la factura.";
+    indices.forEach((indice) => {
+      const aviso = document.getElementById(cards[indice].id + "-dup-local");
+      if (aviso) { aviso.textContent = texto; aviso.className = "ocr-status show err"; }
+    });
+  });
+  return grupos;
+}
+
+async function chequearDuplicadoHistorico(id) {
+  const card = document.getElementById(id);
+  if (!card) return;
+  actualizarAlertasDuplicados();
+  const documento = documentoDeTarjeta(card);
+  const aviso = document.getElementById(id + "-dup-status");
+  const identidad = JSON.stringify(documento);
+  aviso.dataset.consulta = identidad;
+  aviso.className = "ocr-status";
+  if (!documento.rut_proveedor || !documento.nro_documento || !validarRut(documento.rut_proveedor)) return;
+  const { data, error } = await db.rpc("buscar_documento_duplicado", {
+    p_rut: documento.rut_proveedor, p_nro: documento.nro_documento, p_tipo: documento.tipo_documento,
+  });
+  if (!document.body.contains(card) || aviso.dataset.consulta !== identidad) return;
+  if (error) {
+    aviso.textContent = "No se pudo comprobar si el documento ya fue rendido. Revisa antes de enviar.";
+    aviso.className = "ocr-status show err";
+    return;
+  }
+  if (data?.length) {
+    aviso.textContent = "⚠ Este documento ya está registrado en la rendición N° " + data[0].folio + " de " + data[0].empleado_nombre + ". Revisa que no sea un duplicado.";
+    aviso.className = "ocr-status show err";
+  }
 }
 
 // Lee la foto del comprobante, se la manda a la Edge Function "ocr-recibo"
@@ -2309,7 +2459,1278 @@ function conTimeout(promise, ms, mensaje) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(idTimeout));
 }
 
-async function llamarOcrRecibo(file) {
+// ---------------------------------------------------------------------
+// Lectura LOCAL de facturas electrónicas en PDF, sin IA.
+//
+// Una factura electrónica chilena generada digitalmente trae el texto
+// adentro del PDF (RUT, folio, total, fecha) -- no hace falta que un modelo
+// lo "mire" e interprete: se lee el dato exacto. Es gratis, instantáneo, no
+// consume la cuota de Gemini (que el 2026-09-22 se agotó y dejó la app sin
+// OCR todo un día) y es MÁS preciso que la IA para este caso, porque no
+// interpreta: extrae.
+//
+// La IA sigue siendo necesaria para fotos y PDF escaneados (imagen sin
+// texto), que es donde de verdad aporta. Si acá no se logra sacar lo
+// esencial, se cae a la IA como siempre.
+// ---------------------------------------------------------------------
+const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+let pdfjsCargando = null;
+
+// Se carga recién cuando alguien adjunta un PDF (son ~300KB): no tiene
+// sentido que los pague en descarga quien solo sube fotos.
+function cargarPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (pdfjsCargando) return pdfjsCargando;
+  pdfjsCargando = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    const fallo=()=>{clearTimeout(timer);s.remove();pdfjsCargando=null;reject(new Error("No se pudo cargar el lector de PDF. Puedes reintentar."));};
+    const timer=setTimeout(fallo,30000);
+    s.src = PDFJS_URL;
+    s.onload = () => {
+      clearTimeout(timer);
+      if(!window.pdfjsLib){fallo();return;}
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+      resolve(window.pdfjsLib);
+    };
+    s.onerror = fallo;
+    document.head.appendChild(s);
+  });
+  return pdfjsCargando;
+}
+
+// OCR de fotos en el propio navegador, sin API ni cuota. Es la red de
+// seguridad para el caso que antes no tenía ninguna: una foto cuando Gemini
+// no está disponible no daba absolutamente nada, y el cupo gratuito son ~20
+// solicitudes por modelo al día.
+//
+// Es bastante peor que Gemini leyendo fotos, y por eso NO le compite: solo
+// corre cuando la IA ya falló (ver analizarComprobante). Lo que lo hace
+// seguro pese a ser ruidoso es que el texto que produce pasa por el MISMO
+// parsearTextoFactura que los PDF, y ese parser ya valida lo que extrae: el
+// RUT tiene que pasar su dígito verificador y el monto tiene que cuadrar con
+// neto + IVA. Si el OCR distorsiona un dígito, esas dos comprobaciones
+// fallan y se devuelve null -- que es exactamente lo que se quiere, porque
+// un monto equivocado que nadie revisa es peor que un campo vacío.
+const TESSERACT_URL = "https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/7.0.0/tesseract.min.js";
+let tesseractCargando = null;
+
+// Pesa varios MB (motor WASM + datos del idioma español), así que se carga
+// recién cuando de verdad hace falta: nadie que suba PDF lo descarga, y
+// quien sube fotos tampoco mientras la IA esté respondiendo.
+function cargarTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (tesseractCargando) return tesseractCargando;
+  tesseractCargando = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = TESSERACT_URL;
+    const timer=setTimeout(()=>{s.remove();reject(new Error("El escáner no terminó de cargar. Intenta nuevamente."));},30000);
+    s.onload = () => {
+      clearTimeout(timer);
+      // Si el script cargó pero no dejó el global, tirar acá adentro dejaría
+      // la promesa colgada para siempre y el ítem clavado en "Analizando".
+      if (window.Tesseract) resolve(window.Tesseract);
+      else reject(new Error("El lector de fotos cargó incompleto."));
+    };
+    s.onerror = () => {clearTimeout(timer);s.remove();reject(new Error("No se pudo cargar el lector de fotos."));};
+    document.head.appendChild(s);
+  });
+  // Una promesa rechazada quedaba cacheada para siempre: un corte de red
+  // momentáneo dejaba el lector inutilizable por el resto de la sesión.
+  tesseractCargando.catch(() => { tesseractCargando = null; });
+  return tesseractCargando;
+}
+
+// Una foto de celular moderna viene en 4000px o más, y pasársela así a
+// Tesseract es peor por los dos lados: tarda mucho más y no lee mejor (el
+// motor trabaja alrededor de un tamaño de texto, no con el máximo detalle
+// posible). Se reescala a un lado máximo razonable y en calidad alta -- alta
+// a propósito, distinto de comprimirImagenSiCorresponde, que apunta a que el
+// archivo pese poco para subirlo: acá los artefactos de compresión son
+// justamente lo que hace que un 8 se lea como 3.
+const LADO_MAXIMO_OCR = 2000;
+async function prepararImagenParaOcr(file, ampliar = false) {
+  try {
+    file = await prepararComprobanteIa(file);
+    const bitmap = await createImageBitmap(file);
+    // Aumentar comprobantes pequeños ayuda al escáner a separar los caracteres.
+    const escala = Math.min(ampliar ? 3 : 1, LADO_MAXIMO_OCR / Math.max(bitmap.width, bitmap.height));
+    if (escala === 1) { bitmap.close(); return file; }
+    const w = Math.round(bitmap.width * escala);
+    const h = Math.round(bitmap.height * escala);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+    return blob ? new File([blob], file.name, { type: "image/png" }) : file;
+  } catch (err) {
+    console.error("No se pudo preparar la imagen para OCR, se usa la original:", err);
+    return file;
+  }
+}
+
+
+const lectorLocalPersistente=window.RindeOcrLocal.crearLector(cargarTesseract);
+window.addEventListener("pagehide",()=>{lectorLocalPersistente.cerrar();});
+
+async function leerFotoLocal(file) {
+  if (!(file.type || "").startsWith("image/")) return null;
+  try {
+    let preparado=await prepararImagenParaOcr(file);
+    const { data } = await lectorLocalPersistente.leer(preparado);
+    let texto = data?.text || "";
+    let lecturaAlternativa=null;
+    // Los comprobantes deslavados o con bloques separados pueden quedar
+    // vacíos con la segmentación automática. Prueba bloques dispersos una vez.
+    if(texto.replace(/\s/g, "").length < 40){
+      preparado=await prepararImagenParaOcr(file,true);
+      lecturaAlternativa=await lectorLocalPersistente.leer(preparado,11);
+      texto=lecturaAlternativa.data?.text || "";
+    }
+    if (texto.replace(/\s/g, "").length < 40) return null; // no salió texto legible
+    let datos = parsearTextoFactura(texto);
+    if(!datos.rut_proveedor && !datos.tipo_documento && !datos.nro_documento && !["aritmetica","etiqueta","palabras+digitos"].includes(datos.monto_origen) && !lecturaAlternativa){
+      preparado=await prepararImagenParaOcr(file,true);
+      lecturaAlternativa=await lectorLocalPersistente.leer(preparado,11);
+      datos=parsearTextoFactura(lecturaAlternativa.data?.text || "");
+    }
+    // Umbral de utilidad: hace falta AL MENOS un dato con respaldo propio.
+    // Vale un RUT (lo valida su dígito verificador) o un monto con
+    // procedencia fuerte (aritmética del documento, o pegado a su etiqueta).
+    //
+    // La condición anterior exigía RUT o aritmética, y por eso descartaba
+    // entera la foto del comprobante de transferencia real: no trae RUT del
+    // destinatario ni desglose de IVA, pero SÍ decía "Monto $230.000" junto
+    // a su etiqueta, que es el dato correcto y el único que importaba. Con
+    // el filtro viejo, todo ese tipo de comprobante quedaba fuera por
+    // definición, sin importar lo bien que se hubiera leído.
+    // También vale un folio o un tipo de documento reconocido. Se agregó tras
+    // el comprobante de pago municipal del 2026-09-24: el lector había sacado
+    // bien el tipo ("Comprobante de Pago") y el folio (1501346), pero el
+    // documento no trae desglose de IVA y su único RUT es el NUESTRO -- somos
+    // quienes pagamos la multa --, así que no cumplía ninguna de las dos
+    // condiciones y se descartaba entero. La persona terminó escribiendo a
+    // mano dos datos que ya estaban leídos.
+    const montoConRespaldo = datos.monto && ["aritmetica","etiqueta","palabras+digitos"].includes(datos.monto_origen);
+    if (!datos.rut_proveedor && !montoConRespaldo && !datos.nro_documento && !datos.tipo_documento) return null;
+
+    // Desde una foto, el monto solo se acepta si hay EVIDENCIA de que es el
+    // total: o la aritmética del documento lo confirma, o venía pegado a una
+    // etiqueta ("TOTAL $ 8.990", "Monto transferido: $230.000"). Lo que no
+    // se acepta nunca es el paso de último recurso, que elige el mayor
+    // importe con $: eso es una conjetura, y sobre una foto sale mal.
+    //
+    // Medido, no supuesto. En la factura de Supletech fotografiada por
+    // WhatsApp, el total real ($350.874) no llegó a leerse EN ABSOLUTO, así
+    // que esa conjetura agarró el subtotal de una línea ($273.008) y lo puso
+    // en el campo tan campante. Y no sirve filtrar por la confianza del OCR:
+    // ese número equivocado salió con confianza 83, mientras que el RUT, que
+    // estaba bien, salió con 40. La confianza mide nitidez del trazo, no
+    // acierto.
+    //
+    // La distinción importa sobre todo para boletas, comprobantes de
+    // transferencia y vouchers: esos no traen desglose de IVA, así que la
+    // verificación aritmética NUNCA les va a aplicar y la etiqueta es la
+    // única evidencia fuerte que pueden ofrecer.
+    // QUÉ SE COMPLETA DESDE UNA FOTO Y QUÉ NO. El criterio es uno solo: se
+    // llena la fuente que MIDE mejor que el azar, y se deja en blanco la que
+    // no. Sobre 409 comprobantes reales del archivo de Rindegastos:
+    //
+    //   monto con evidencia fuerte .... 46 llenados,   0 equivocados
+    //   monto rellenando siempre ...... 135 llenados, 58 equivocados (43%)
+    //   RUT ........................... 159 leídos,   15 equivocados (9%)
+    //   folio pegado al tipo de doc ... acierta ~6 de cada 10
+    //   folio suelto en la hoja ....... 109 leídos,   67 equivocados (61%)
+    //
+    // De ahí sale todo lo de abajo. El MONTO solo se llena con evidencia
+    // fuerte: entre los llenados sin ella, era más probable que estuviera
+    // mal que bien, y no es un campo donde valga arriesgar -- va a
+    // contabilidad, es obligatorio, y la persona lo escribe igual, así que
+    // el blanco le cuesta segundos y el error equivocado le cuesta a
+    // contabilidad. Los errores tampoco son sutiles: $10.130 leído
+    // $310.130, $221.390 leído $4.221.390.
+    //
+    // El FOLIO se conserva solo cuando venía pegado al tipo de documento
+    // ("FACTURA ELECTRONICA N° 7960"); el suelto se descarta porque acierta
+    // menos de la mitad de las veces, y un campo que miente más de lo que
+    // acierta es peor que vacío: la persona aprende a no mirarlo.
+    //
+    // El RUT se conserva: 9 de cada 10 salen bien, y además es la llave que
+    // destraba proveedor y categoría desde contabilidad.
+    //
+    // Lo que se conserva pero puede fallar queda listado en confianza_baja,
+    // y aplicarRespaldoFoto se lo nombra a la persona uno por uno. Rellenar
+    // sin avisar sería lo único peor que dejar en blanco.
+    datos.confianza_baja = [];
+    let totalCoincidente=false;
+    if(datos.monto && datos.monto_origen === "etiqueta"){
+      const segunda=lecturaAlternativa ? await lectorLocalPersistente.leer(preparado,3) : await lectorLocalPersistente.leer(preparado,11);
+      const otro=parsearTextoFactura(segunda.data?.text || "");
+      totalCoincidente=Number(otro.monto)===Number(datos.monto) && ["etiqueta","aritmetica","palabras+digitos"].includes(otro.monto_origen) && !otro.monto_discrepante;
+      if(otro.monto && Number(otro.monto)!==Number(datos.monto))datos.monto_discrepante=true;
+    }
+    // Una discrepancia exige confirmación humana, aunque un valor parezca plausible.
+    if (datos.monto_origen === "discrepancia" || datos.monto_discrepante) {
+      datos.monto=null;datos.monto_discrepante=true;datos.monto_verificado=false;
+    }
+    const MONTO_FUERTE = ["palabras+digitos", "aritmetica", "palabras"];
+    if (!MONTO_FUERTE.includes(datos.monto_origen) && !totalCoincidente) datos.monto = null;
+    if(totalCoincidente){datos.confianza_baja.push("monto");datos.monto_verificado=false;datos.monto_origen="dos_escaneos";}
+    // El folio se conserva SIEMPRE, incluso el "suelto" (un número con
+    // etiqueta N° en cualquier parte de la hoja), que medido acierta unas 4
+    // de cada 10 veces. Antes se descartaba por eso. Se cambió a pedido, con
+    // el criterio de que un folio no es plata: uno equivocado no genera un
+    // pago mal hecho, se nota al cruzarlo con contabilidad y el aviso pide
+    // compararlo. El monto, que sí es plata, mantiene su barra alta.
+    if (datos.nro_documento) datos.confianza_baja.push("nro_documento");
+    // El tipo de documento también puede venir de una lectura floja.
+    if (datos.tipo_documento) datos.confianza_baja.push("tipo_documento");
+
+    // Misma lógica para la fecha: en esa foto el año salió 2025 en vez de
+    // 2026, un solo dígito mal que manda el gasto a otro período contable.
+    // No hay forma de validarla, así que se descarta la que no sea
+    // plausible para una rendición (nada de más de un año atrás ni futuro).
+    if (datos.fecha) {
+      const f = new Date(datos.fecha + "T00:00:00");
+      const hoy = new Date();
+      const haceUnAnio = new Date(hoy.getFullYear() - 1, hoy.getMonth(), hoy.getDate());
+      const enUnMes = new Date(hoy.getFullYear(), hoy.getMonth() + 1, hoy.getDate());
+      const calendario=/^(\d{4})-(\d{2})-(\d{2})$/.exec(datos.fecha);
+      if (isNaN(f) || !calendario || f.getFullYear()!==Number(calendario[1]) || f.getMonth()+1!==Number(calendario[2]) || f.getDate()!==Number(calendario[3]) || f < haceUnAnio || f > enUnMes) datos.fecha = null;
+    }
+    datos.verificacion_campos={};
+    for(const campo of ["nombre_proveedor","rut_proveedor","tipo_documento","nro_documento","fecha","monto"]){
+      const valor=datos[campo];
+      if(valor && !datos.confianza_baja.includes(campo))datos.confianza_baja.push(campo);
+      datos.verificacion_campos[campo]={estado:valor?"por_confirmar":"ilegible",texto:valor?String(valor):"",motivo:valor?"Leído por el escáner local. Compara este dato con el comprobante.":"El escáner local no encontró evidencia suficiente para completar este campo."};
+    }
+    if(datos.monto && datos.monto_verificado){datos.verificacion_campos.monto.motivo="El importe concuerda con la aritmética o las cifras y palabras leídas. Revisa también el documento.";}
+    if(datos.monto_discrepante){datos.verificacion_campos.monto={estado:"por_confirmar",motivo:"Hay montos contradictorios. Confirma el total mirando el comprobante."};}
+    return datos;
+  } catch (err) {
+    console.error("No se pudo leer la foto localmente:", err);
+    return null;
+  }
+}
+
+const MESES_ES = {
+  enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
+  julio: 7, agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+};
+const RE_RUT_EN_TEXTO = /(\d{1,2}\.?\d{3}\.?\d{3}\s*-\s*[\dkK])/g;
+
+// Los patrones de acá abajo NO son inventados: se ajustaron contra dos
+// facturas reales de emisores y maquetados distintos (Supletech/bsale y
+// Rindegastos/simpledte), y cada regla existe porque una versión anterior
+// se equivocó con una de ellas. Ver los comentarios puntuales.
+// El nombre de la contraparte cuando viene rotulado. Pensado sobre todo para
+// los comprobantes que NO son DTE: una transferencia dice "Destinatario
+// Fulano", un voucher dice el comercio, y ninguno trae RUT. El corte contra
+// la siguiente etiqueta conocida es lo que evita arrastrar media pantalla:
+// en el comprobante real el texto seguía con "Cuenta Corriente N° ...".
+function nombreDesdeEtiqueta(t) {
+  const m = /(?:Destinatario|Beneficiario|Comercio|Raz[oó]n\s*Social|Nombre\s*del?\s*(?:comercio|local))\s*:?\s*(.{3,70})/i.exec(t);
+  if (!m) return null;
+  // Se captura ancho y se corta después, en vez de pedirle al regex que se
+  // detenga solo. Un corte perezoso dentro del propio patrón falla en los
+  // dos extremos: si la etiqueta siguiente no está en la lista se pasa de
+  // largo hasta el tope (el voucher devolvía null), y si el nombre es más
+  // corto que el mínimo se lo salta y se come la etiqueta siguiente
+  // ("Destinatario: 4 Cuenta Corriente" devolvía "4 Cuenta Corriente").
+  const SIGUIENTE_ETIQUETA = /\b(Cuenta|RUT|R\.U\.T|Banco|Motivo|Fecha|Giro|Direcci[oó]n|Monto|C[oó]digo|Total|Autorizaci[oó]n|Tarjeta|Terminal|Folio|N[°º])\b/i;
+  const corte = m[1].search(SIGUIENTE_ETIQUETA);
+  const nombre = (corte >= 0 ? m[1].slice(0, corte) : m[1])
+    .replace(/\s+/g, " ").trim().replace(/[.,;:|\-]+$/, "").trim();
+  // Tiene que empezar con letra y traer una palabra de verdad: lo que quede
+  // en puros números o símbolos es ruido de OCR, no un nombre.
+  if (nombre.length < 3 || !/^[A-Za-zÁÉÍÓÚÑÜáéíóúñü]/.test(nombre) || !/[A-Za-zÁÉÍÓÚÑáéíóúñ]{3}/.test(nombre)) return null;
+  return nombre;
+}
+
+// Las boletas y facturas chilenas casi siempre imprimen el total EN LETRAS
+// ("SON: CIENTO ONCE MIL CIENTO SETENTA"). Eso es oro para una lectura por
+// foto, porque es el mismo número codificado de otra forma, y los errores de
+// OCR en los dígitos no se correlacionan con los de las palabras: en una
+// boleta real el total salió "TOTAL $ 11.179" -- un dígito menos que los
+// $111.170 verdaderos -- y estaba pegado a su etiqueta, así que ninguna de
+// las defensas que había lo detectó. Las letras decían el número correcto.
+//
+// Y se autoverifica: una secuencia de palabras o forma un número válido en
+// español o no forma nada. Un error de OCR en una palabra rompe el parseo en
+// vez de producir un número equivocado, que es exactamente el modo de falla
+// que se busca.
+const NUM_PALABRAS = {
+  cero:0, un:1, uno:1, una:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9,
+  diez:10, once:11, doce:12, trece:13, catorce:14, quince:15, dieciseis:16, diecisiete:17,
+  dieciocho:18, diecinueve:19, veinte:20, veintiuno:21, veintidos:22, veintitres:23,
+  veinticuatro:24, veinticinco:25, veintiseis:26, veintisiete:27, veintiocho:28, veintinueve:29,
+  treinta:30, cuarenta:40, cincuenta:50, sesenta:60, setenta:70, ochenta:80, noventa:90,
+  cien:100, ciento:100, doscientos:200, trescientos:300, cuatrocientos:400, quinientos:500,
+  seiscientos:600, setecientos:700, ochocientos:800, novecientos:900,
+};
+const SIN_TILDES = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+function montoDesdePalabras(texto) {
+  // El bloque arranca en "SON" y termina donde deja de haber palabras de
+  // número (típicamente "PESOS", o basura del OCR).
+  const m = /\bSON\s*:?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ\s]{6,120})/i.exec(texto);
+  if (!m) return null;
+  const tokens = SIN_TILDES(m[1]).split(/\s+/).filter(Boolean);
+  let total = 0, grupo = 0, hubo = false, consumidos = 0;
+  for (const tk of tokens) {
+    if (tk === "y") continue;                 // "treinta y cinco"
+    if (tk === "mil") { grupo = (grupo || 1) * 1000; total += grupo; grupo = 0; hubo = true; consumidos++; continue; }
+    if (tk === "millon" || tk === "millones") { total = (total + (grupo || 1)) * 1000000; grupo = 0; hubo = true; consumidos++; continue; }
+    const v = NUM_PALABRAS[tk];
+    if (v === undefined) break;               // se acabó el número: "PESOS", ruido, etc.
+    grupo += v;
+    consumidos++;
+    hubo = true;
+  }
+  const valor = total + grupo;
+  if (!hubo || valor <= 0) return null;
+  // Dos guardas contra un parseo que se cortó a la mitad. "OCHO MXL
+  // NOVECIENTOS" (con la palabra "MIL" rota por el OCR) devolvía 8: se
+  // consumía un solo token, se frenaba en la palabra ilegible y entregaba
+  // ese 8 como si fuera el total -- pisando el monto correcto que los
+  // dígitos sí habían leído bien. Un total escrito en letras de verdad usa
+  // varias palabras y no baja de mil en una rendición.
+  if (consumidos < 2 || valor < 1000) return null;
+  return valor;
+}
+
+function parsearTextoFactura(texto) {
+  const t = texto.replace(/\s+/g, " ");
+
+  // El RUT del EMISOR va antes que el del receptor en los dos formatos
+  // probados. Se valida el dígito verificador (validarRut) para descartar
+  // números que solo parecen RUT.
+  //
+  // Antes de eso se descartan los RUT del propio grupo: en toda factura que
+  // recibimos aparece el nuestro como RECEPTOR, y en los formatos donde va
+  // primero, "el primer RUT del texto" nos ponía a nosotros mismos como
+  // proveedor. Eso no solo llena mal el campo: buscarCategoriaEnContabilidad
+  // y buscarDatosPreviosPorRut salen a buscar el historial de ese RUT y
+  // sugieren una categoría deducida de la entidad equivocada, y como la
+  // lectura local igual "funcionó" (hay un RUT válido y un monto), nunca se
+  // consulta a la IA para contrastar.
+  const rutsPropios = new Set(Object.values(RUT_POR_EMPRESA).map((r) => r.replace(/[.\-]/g, "").toUpperCase()));
+  // También se descarta el RUT rotulado como del COMPRADOR. En las boletas
+  // de caja es habitual que el cliente dicte su RUT y quede impreso como
+  // "RUT SOLICITANTE: 10.247.521-6"; ese RUT es válido (pasa el dígito
+  // verificador) y venía antes que el del emisor, así que se tomaba como
+  // proveedor. Medido sobre el archivo de Rindegastos: era la causa de
+  // varios de los RUT equivocados, y arrastra consigo la categoría sugerida,
+  // porque se le busca el historial contable a la entidad equivocada.
+  const ETIQUETA_COMPRADOR = /(solicitante|cliente|comprador|receptor|se[nñ]or\(?e?s?\)?|adquirente)\s*:?\s*$/i;
+  const ruts = [...t.matchAll(RE_RUT_EN_TEXTO)]
+    .filter((m) => !ETIQUETA_COMPRADOR.test(t.slice(Math.max(0, m.index - 30), m.index).replace(/R\.?U\.?T\.?\s*:?\s*$/i, "").trim()))
+    .map((m) => m[1].replace(/\s/g, ""))
+    .filter((r) => validarRut(r))
+    .filter((r) => !rutsPropios.has(r.replace(/[.\-]/g, "").toUpperCase()));
+
+  let tipo_documento = null;
+  // Las notas van PRIMERO y no es un detalle de orden: una nota de crédito
+  // trae un bloque de referencias ("Referencia: Factura Electrónica N° ..."),
+  // así que /FACTURA\s+ELECTR/ matchea igual y la NC entraba como factura.
+  // Como "Nota de Crédito" no existe en TIPOS_DOCUMENTO, el select se quedaba
+  // en su valor por defecto (Factura Electrónica) y el monto se cargaba
+  // POSITIVO a la cuenta por pagar -- una nota que debía REBAJAR el pasivo
+  // terminaba aumentándolo, con el signo al revés y sin aviso.
+  if (/NOTA\s+DE\s+CR[EÉ]DITO/i.test(t)) tipo_documento = "Nota de Crédito";
+  else if (/NOTA\s+DE\s+D[EÉ]BITO/i.test(t)) tipo_documento = "Nota de Débito";
+  // "FACTURA NO AFECTA O EXENTA ELECTRÓNICA" es como el SII rotula las
+  // exentas, y en la foto de una factura real de Correos el OCR dejó solo
+  // "CURA EXENTA ELECTRÓNICA": se perdió la palabra FACTURA entera. Por eso
+  // alcanza con que aparezca "EXENTA ELECTR", sin exigir lo de antes.
+  else if (/FACTURA\s+EXENTA|EXENTA\s+ELECTR|NO\s+AFECTA\s+O\s+EXENTA|FACTURA\s+NO\s+AFECTA/i.test(t)) tipo_documento = "Factura Exenta Electrónica";
+  else if (/FACTURA\s+ELECTR/i.test(t)) tipo_documento = "Factura Electrónica";
+  else if (/BOLETA\s+DE\s+HONORARIO/i.test(t)) tipo_documento = "Boleta de Honorario";
+  else if (/BOLETA\s+ELECTR/i.test(t)) tipo_documento = "Boleta Electrónica";
+  // A partir de acá ya no son documentos tributarios electrónicos, y por eso
+  // van al final: si el documento es un DTE, alguna de las reglas de arriba
+  // ya ganó. Estos son los que se rinden por la pestaña Comprobante/Boleta y
+  // que hasta ahora el lector no reconocía en absoluto, así que ni el tipo
+  // ni el folio ni la fecha se sacaban de ellos.
+  else if (/BOLETA\s+DE\s+VENTAS?(\s+Y\s+SERVICIOS?)?/i.test(t)) tipo_documento = "Boleta";
+  // "Comprobante de Pago" va aparte de la transferencia: son cosas distintas.
+  // Un comprobante de pago municipal (una multa, una patente) no tiene
+  // proveedor ni RUT emisor impreso -- el único RUT del papel es el NUESTRO,
+  // porque somos quienes pagamos. Meterlo en el mismo saco que una
+  // transferencia bancaria confundía el tipo en pantalla.
+  else if (/COMPROBANTE\s+DE\s+PAGO|TESORER[IÍ]A\s+MUNICIPAL/i.test(t)) tipo_documento = "Comprobante de Pago";
+  else if (/COMPROBANTE\s+DE\s+TRANSFERENCIA|TRANSFERENCIA\s+(ELECTR[OÓ]NICA|EXITOSA|REALIZADA)|TRANSFERENCIA\s+A\s+TERCEROS/i.test(t)) tipo_documento = "Comprobante de Transferencia";
+  else if (/COMPROBANTE\s+DE\s+DEP[OÓ]SITO/i.test(t)) tipo_documento = "Comprobante de Depósito";
+  else if (/\bVOUCHER\b|COMPROBANTE\s+DE\s+VENTA|TRANSBANK|REDCOMPRA/i.test(t)) tipo_documento = "Voucher";
+  else if (/\bRECIBO\b/i.test(t)) tipo_documento = "Recibo";
+  else if (/\bBOLETA\b/i.test(t)) tipo_documento = "Boleta";
+  // Las apps de los bancos no escriben "comprobante de transferencia" en
+  // ninguna parte: la pantalla real de una transferencia hecha dice
+  // "Operación realizada", "Monto", "Destinatario", "Cuenta Corriente". Se
+  // reconoce por esa combinación, que ningún otro tipo de documento tiene.
+  else if (/Destinatario/i.test(t) && /Cuenta\s+Corriente|Cuenta\s+Vista|Cuenta\s+RUT/i.test(t)) tipo_documento = "Comprobante de Transferencia";
+
+  // Folio solo si viene con su etiqueta pegada ("N° 136982"). Cuando la
+  // etiqueta quedó separada del número en el flujo de texto, se prefiere
+  // dejarlo en blanco antes que adivinar: un folio equivocado en
+  // contabilidad es peor que un campo vacío.
+  //
+  // Dos trampas que costaron folios equivocados y que explican por qué esto
+  // no es un simple /N°\s*(\d+)/i:
+  //  - Con el flag "i", la clase N[°ºo] también matchea la palabra "no".
+  //    "Pago no 30 dias" devolvía folio 30. Por eso "No" va aparte y sin
+  //    ignorar mayúsculas, y se exige que la N sea mayúscula.
+  //  - Se tomaba el PRIMER match de todo el texto, y en el encabezado suelen
+  //    venir antes la orden de compra ("Orden de compra No 4500123456") y la
+  //    resolución del SII ("Res. Ex. N° 80 de 2014"). Ahora se descartan los
+  //    números precedidos por esas etiquetas y se prefiere el que viene
+  //    pegado al tipo de documento.
+  // La "N" sola (sin ° ni º) está incluida porque el OCR de fotos pierde el
+  // símbolo de grado muy seguido ("FACTURA ELECTRONICA N 136982"). Va en
+  // mayúscula y sin flag "i" en esa alternativa: con "i" volvería a matchear
+  // la palabra "no" y el folio sería cualquier número detrás de un "no".
+  // Los documentos que no son DTE numeran con otras palabras: una
+  // transferencia trae "N° de operación", un voucher un "código de
+  // autorización". Sin estas etiquetas, el número identificador de esos
+  // comprobantes no se leía nunca.
+  // OJO: esta expresión NO lleva flag "i", y no es un descuido. Con "i", la
+  // alternativa "No" matchea la palabra española "no" y cualquier número
+  // detrás pasa por folio ("Pago no 30 dias" -> folio 30). Por eso las
+  // etiquetas de varias palabras traen sus variantes de mayúscula escritas a
+  // mano en vez de resolverse con el flag.
+  // El "°" de "N°" es de lo que peor le sale al OCR de una foto: en dos
+  // facturas reales salió como "N* 7960" y como "Ne 003191702". Por eso la
+  // clase incluye esas confusiones además del símbolo correcto. Siguen
+  // dependiendo de una N MAYÚSCULA, que es lo que impide que esto degenere
+  // en "cualquier número precedido por la palabra no".
+  const RE_FOLIO = /(N[°º*e]\.?|No\.?|N(?=\s+\d)|FOLIO|Folio|[NnPp][°º]?\s*[Dd][Ee]\s*[OoTtCcDd][a-zíóé]+|N[UÚuú]MERO\s+[Dd][Ee]\s+[A-Za-zíóé]+|C[oó]digo\s+[Dd][Ee]\s+[A-Za-zíóé]+)\s*:?\s*(\d{2,12})\b/g;
+  const ANTES_NO_ES_FOLIO = /(orden\s+de\s+compra|nota\s+de\s+venta|res(?:oluci[oó]n)?\.?\s*ex\.?|cotizaci[oó]n|gu[ií]a\s+de\s+despacho|contrato|pago)\s*$/i;
+  const candidatosFolio = [];
+  for (const m of t.matchAll(RE_FOLIO)) {
+    const contextoPrevio = t.slice(Math.max(0, m.index - 40), m.index);
+    if (ANTES_NO_ES_FOLIO.test(contextoPrevio.trim())) continue;
+    // Puros ceros no es un folio, es una casilla vacía del formulario o un
+    // relleno que el OCR leyó como número. Salió en la foto de la factura de
+    // Correos, que devolvía "00000000" como número de documento.
+    if (/^0+$/.test(m[2])) continue;
+    candidatosFolio.push({ valor: m[2], pegadoAlTipo: /(factura|boleta|documento)[^.]{0,30}$/i.test(contextoPrevio) });
+  }
+  const mFolio = candidatosFolio.find((c) => c.pegadoAlTipo) || candidatosFolio[0];
+
+  // Los RUT se sacan del texto ANTES de buscar importes: si no, sus dígitos
+  // se leen como pesos (77.574.911-3 daba un "monto" de $77.574.911).
+  const sinRuts = t.replace(RE_RUT_EN_TEXTO, " ");
+  const aNumero = (s) => Number(String(s).replace(/[.,]/g, ""));
+  // Tres formas de escribir un importe. La del medio -- coma como separador
+  // de MILES -- se agregó tras un comprobante de pago municipal real que
+  // escribía el total "107,582": no matcheaba ninguna de las otras dos
+  // ("107" son 3 dígitos, no 4+; y no hay punto), así que el documento
+  // entero se descartaba por quedarse sin monto.
+  //
+  // Es segura en pesos chilenos porque el grupo tiene que ser de EXACTAMENTE
+  // tres dígitos: un decimal de verdad ("8,50") no matchea, y el peso no usa
+  // centavos en la práctica. El orden también importa: la alternativa con
+  // puntos va primera para que "13.650,42" se lea 13650 y no 1365042.
+  const RE_MONTO = "(\\d{1,3}(?:\\.\\d{3})+|\\d{1,3}(?:,\\d{3})+|\\d{4,})";
+
+  // 1) La mejor fuente: el total CONFIRMADO por la propia aritmética del
+  //    documento (neto + IVA = total, con el IVA al 19%). Cuando ese trío
+  //    aparece, el monto deja de ser una heurística -- queda verificado
+  //    contra los subtotales de la factura, que es justo lo que hace falta
+  //    para un dato que termina en contabilidad.
+  //    OJO con el conjunto de candidatos: si se le pasan TODOS los números
+  //    del texto, la aritmética encuentra tríos por casualidad. Con los
+  //    números de referencia típicos de una factura real
+  //    ({136982, 115277, 21705, ...}) se cumple 136982 - 115277 = 21705 y
+  //    round(115277 * 0.19) = 21903, que cae dentro de la tolerancia: tres
+  //    folios pasan por neto+IVA=total y devuelven $136.982 como monto. Y es
+  //    peor que un mal número suelto, porque queda marcado como VERIFICADO:
+  //    se le muestra a la persona "monto confirmado" y encima se salta el
+  //    contraste con la IA, que era justo la red de seguridad. Por eso solo
+  //    entran importes con "$" delante o pegados a una etiqueta de subtotal.
+  const RE_IMPORTE_CREIBLE = new RegExp(`(?:\\$\\s*|(?:neto|iva|i\\.v\\.a\\.|afecto|exento|subtotal|total|monto)\\W{0,12})${RE_MONTO}\\b`, "gi");
+  const todosLosImportes = [...sinRuts.matchAll(RE_IMPORTE_CREIBLE)]
+    .map((m) => aNumero(m[1]))
+    .filter((n) => n >= 1000);
+  const verificado = totalPorNetoMasIva(todosLosImportes);
+  let monto = verificado ? verificado.total : null;
+  // De DÓNDE salió el monto, que importa tanto como el monto mismo:
+  //   "aritmetica" -> neto + IVA cuadran con el total. Certeza.
+  //   "etiqueta"   -> venía pegado a un "TOTAL". Evidencia fuerte.
+  //   "maximo"     -> el mayor importe con $. Una CONJETURA, y sobre una
+  //                   foto es peligrosa: en la factura fotografiada de
+  //                   Supletech el total real ni siquiera se alcanzó a leer,
+  //                   así que este paso eligió el subtotal de una línea
+  //                   ($273.008 en vez de $350.874) con toda naturalidad.
+  // leerFotoLocal usa esto para aceptar solo las dos primeras. En un PDF,
+  // donde el texto es exacto, las tres siguen valiendo.
+  let monto_origen = verificado ? "aritmetica" : null;
+
+  // 2) Si no cuadra (factura exenta, sin IVA, o subtotales ilegibles), el
+  //    importe etiquetado "Total $". El \\$ es obligatorio y "total" va como
+  //    palabra propia: sin eso matcheaba "SUBTOTAL 1577" (un SKU) y
+  //    "Total 2.40 CLF" (texto de una glosa).
+  //    Las etiquetas van más allá de "total" a propósito: una boleta, un
+  //    comprobante de transferencia o un recibo no dicen "TOTAL" ni traen
+  //    desglose de IVA, y son justamente los documentos donde este paso es
+  //    la ÚNICA evidencia fuerte disponible (el paso 1 nunca va a aplicar).
+  if (!monto) {
+    const ETIQUETAS_TOTAL = String.raw`total(?:\s*a\s*pagar|\s*boleta)?|monto(?:\s*(?:transferido|total|a\s*pagar|de\s*la\s*transferencia))?|valor\s*total|importe(?:\s*total)?|a\s*pagar|neto\s*a\s*pagar|te\s*transfiri[oó]|valores?`;
+    const mTotal = new RegExp(`(?:^|[^a-záéíóúñ])(?:${ETIQUETAS_TOTAL})\\s*\\(?\\s*\\$?\\s*\\)?\\s*:?\\s*\\$?\\s*${RE_MONTO}`, "i").exec(sinRuts);
+    monto = mTotal ? aNumero(mTotal[1]) : null;
+    if (monto) monto_origen = "etiqueta";
+  }
+  // 3) Último recurso: si la etiqueta quedó lejos de su valor (pasa en el
+  //    formato bsale), el mayor importe CON SIGNO $ del documento. El "$" es
+  //    clave: sin él ganaba un número de referencia de la sección
+  //    "Referencias a otros Documentos", que era más grande que el total.
+  //    El ":?" cubre los formatos que escriben "Neto $ : 98.103".
+  if (!monto) {
+    const candidatos = [...sinRuts.matchAll(new RegExp(`\\$\\s*:?\\s*${RE_MONTO}`, "g"))]
+      .map((m) => aNumero(m[1]))
+      .filter((n) => n >= 1000);
+    monto = candidatos.length ? Math.max(...candidatos) : null;
+    if (monto) monto_origen = "maximo";
+  }
+
+  // Todo lo anterior da por sentado que los importes están en pesos. Si el
+  // documento está en otra moneda, "US$ 1.500" se lee como $1.500 y la
+  // diferencia no la nota nadie: el campo queda con un número creíble. Ante
+  // una moneda extranjera cerca de un importe se abandona la lectura local
+  // (monto = null) y el comprobante cae al camino de la IA, que sí ve el
+  // símbolo en la imagen. El chequeo va acá y no antes porque solo importa
+  // cuando efectivamente se encontró un monto que reportar.
+  // El total en letras le GANA a los dígitos, y no es arbitrario: las letras
+  // tienen que formar un número válido en español para parsearse, así que un
+  // error de OCR ahí se detecta solo; un dígito mal leído no se detecta de
+  // ninguna forma. Si además coinciden, el monto queda confirmado con la
+  // misma fuerza que neto + IVA: son dos codificaciones independientes del
+  // mismo número dentro del propio documento.
+  const enPalabras = montoDesdePalabras(sinRuts);
+  if (enPalabras) {
+    if (monto === enPalabras) {
+      monto_origen = "palabras+digitos";
+    } else {
+      // Desacuerdo. Las letras SON más confiables (se autoverifican), pero
+      // preferirlas en silencio igual significaría elegir por la persona con
+      // un documento que se contradice a sí mismo -- y un parseo de letras
+      // con una palabra mal leída en el medio puede dar un número plausible
+      // y equivocado. Se marca la discrepancia y el filtro de fotos lo
+      // rechaza: en una foto el monto queda en blanco y lo escribe la
+      // persona. En un PDF el texto es exacto, así que se conserva el valor
+      // de los dígitos.
+      monto_origen = "discrepancia";
+    }
+  }
+
+  let montoConfirmado = !!verificado || monto_origen === "palabras+digitos";
+  if (monto && /(US\$|USD|EUR|€|\bUF\b|\bCLF\b|\bUTM\b)\W{0,15}\d|\d\W{0,8}(USD|EUR|\bUF\b|\bCLF\b|\bUTM\b)/i.test(sinRuts)) {
+    monto = null;
+    montoConfirmado = false; // sin monto no hay nada que declarar verificado
+  }
+
+  let fecha = null;
+  // Prefiere emisión: vencimiento puede aparecer antes y corresponder a otro año.
+  const emision=/(?:fecha\s*(?:de\s*)?emisi[oó]n|emitid[ao]\s*(?:el)?)\s*:?\s*(\d{1,2}(?:[/-]\d{1,2}[/-]\d{4}|\s+de\s+[a-záéíóú]+\s+(?:del?\s+)?\d{4}))/i.exec(t);
+  const textoFecha=emision?.[1] || t;
+  const mNum = /\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/.exec(textoFecha);
+  const mTxt = /\b(\d{1,2})\s+de\s+([a-záéíóú]+)\s+(?:del?\s+)?(\d{4})\b/i.exec(textoFecha);
+  const iso = (a, m, d) => `${a}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  if (mNum) fecha = iso(mNum[3], mNum[2], mNum[1]);
+  else if (mTxt && MESES_ES[mTxt[2].toLowerCase()]) fecha = iso(mTxt[3], MESES_ES[mTxt[2].toLowerCase()], mTxt[1]);
+
+  return {
+    // Normalmente se resuelve por RUT contra contabilidad, que es más
+    // confiable que leerlo del documento. Pero hay comprobantes que no traen
+    // RUT en absoluto -- una transferencia bancaria no identifica
+    // tributariamente a quien recibe la plata, solo lo nombra. Para esos, el
+    // nombre leído es lo único que hay, y alcanza para buscarle el historial
+    // por nombre y sugerir una categoría. En la fusión igual pierde contra
+    // la razón social real de contabilidad cuando sí hay RUT.
+    nombre_proveedor: nombreDesdeEtiqueta(t),
+    rut_proveedor: ruts[0] || null,
+    tipo_documento,
+    nro_documento: mFolio ? mFolio.valor : null,
+    // "tipo" = venía pegado al tipo de documento (evidencia fuerte);
+    // "suelto" = un número con etiqueta N° en cualquier parte del papel.
+    folio_origen: mFolio ? (mFolio.pegadoAlTipo ? "tipo" : "suelto") : null,
+    fecha,
+    monto,
+    // true solo cuando el monto se confirmó con neto + IVA = total. Se usa
+    // para decirle a la persona qué revisar: un monto verificado no necesita
+    // segunda mirada, uno deducido sí.
+    monto_verificado: montoConfirmado,
+    monto_origen,
+    // El total leído EN LETRAS, cuando existe. leerFotoLocal lo prefiere
+    // ante una discrepancia con los dígitos: es el único que se autoverifica.
+    monto_en_palabras: enPalabras || null,
+    descripcion: descripcionDesdeDetalle(t),
+    categoria_sugerida: null,
+  };
+}
+
+// Busca el trío neto + IVA = total entre los importes del documento, con el
+// IVA al 19% (tolerancia por redondeo). Es la única forma de CONFIRMAR el
+// monto en vez de deducirlo: si los tres números cuadran entre sí, no hay
+// ambigüedad posible sobre cuál era el total. Devuelve null en facturas
+// exentas (sin IVA) o si los subtotales no se pudieron leer, y ahí se cae a
+// las heurísticas de siempre.
+function totalPorNetoMasIva(importes) {
+  const valores = [...new Set(importes)].sort((a, b) => a - b);
+  let mejor = null;
+  for (const total of valores) {
+    for (const neto of valores) {
+      if (neto >= total) continue;
+      const iva = total - neto;
+      if (!valores.includes(iva)) continue;
+      const ivaEsperado = Math.round(neto * 0.19);
+      // Tolerancia de 2 PESOS, no de un porcentaje. Antes era
+      // max(2, ivaEsperado * 0.01): para un IVA de $2.700 eso daba 27 pesos
+      // de margen, y ese margen alcanzaba para que un total mal leído
+      // encontrara un neto que lo respaldara. Medido sobre el archivo de
+      // Rindegastos: un comprobante de $16.940 se leyó $16.960 y pasó como
+      // CONFIRMADO por aritmética, que es el peor resultado posible -- el
+      // sello de confianza puesto sobre un número equivocado.
+      //
+      // El IVA chileno es round(neto * 0.19) exacto al peso; la holgura solo
+      // existe para absorber cómo redondea cada emisor, y eso nunca son
+      // decenas de pesos. Apretarlo no pierde facturas buenas y saca de
+      // circulación las coincidencias.
+      if (Math.abs(iva - ivaEsperado) > 2) continue;
+      if (!mejor || total > mejor.total) mejor = { total, neto, iva };
+    }
+  }
+  return mejor;
+}
+
+// ============================================================
+// UN LECTOR, DOS FUENTES
+// ------------------------------------------------------------
+// Antes había DOS caminos paralelos y excluyentes: si la lectura local
+// devolvía algo se aplicaba y la IA no se llamaba nunca (salvo para
+// contrastar el monto), y si devolvía null todo venía de la IA. El
+// resultado era que un PDF que sí se leía local pero al que le faltaba el
+// folio, o cuya descripción quedaba en null, dejaba esos campos VACÍOS
+// aunque la IA los habría podido leer.
+//
+// Ahora los dos caminos terminan en la misma función de fusión
+// (fusionarLecturas) y la IA es una segunda fuente que solo rellena huecos.
+// El tope de UNA llamada por comprobante no es negociable: la cuota gratuita
+// de Gemini es de ~20 solicitudes POR MODELO AL DÍA, el usuario decidió no
+// pagar, y ya hubo un día entero sin OCR porque la propia maquinaria de
+// reintentos se la comió sola. Cuando la lectura local dejó todo lleno y la
+// aritmética confirmó el monto, se gastan CERO llamadas.
+// ============================================================
+
+// Los campos que conoce la fusión, por formulario. "Documento electrónico"
+// los tiene todos; "Gasto directo" solo muestra proveedor, descripción,
+// monto y categoría, así que pedirle a la IA lo que ese formulario ni
+// siquiera puede mostrar sería gastar cuota para nada.
+const CAMPOS_OCR_CON = ["nombre_proveedor", "rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto", "descripcion", "categoria_sugerida"];
+const CAMPOS_OCR_SIN = ["nombre_proveedor", "rut_proveedor", "tipo_documento", "nro_documento", "fecha", "monto", "descripcion", "categoria_sugerida"];
+
+// Solo para el mensaje que se le muestra a la persona: los nombres internos
+// ("nro_documento") no significan nada para quien está rindiendo.
+const ETIQUETA_CAMPO_OCR = {
+  nombre_proveedor: "proveedor",
+  rut_proveedor: "RUT",
+  tipo_documento: "tipo de documento",
+  nro_documento: "folio",
+  fecha: "fecha",
+  monto: "monto",
+  descripcion: "descripción",
+  categoria_sugerida: "categoría",
+};
+
+// Todo lo que se puede saber de un RUT sin gastar una sola solicitud de
+// Gemini: razón social real, categoría con la que contabilidad registró
+// antes a este proveedor, y qué se cargó la última vez en la propia app.
+// Van juntas y en paralelo porque son independientes entre sí y el
+// formulario está esperando.
+// La categoría que esta persona usó más veces para un proveedor, buscando
+// por NOMBRE. Es más débil que la que sale de contabilidad por RUT (la
+// comparación es por texto, y el mismo local puede escribirse de dos formas),
+// así que se exige haberlo clasificado al menos dos veces antes de sugerir
+// algo: con una sola vez es una coincidencia, no un patrón.
+async function categoriaMasUsadaPorNombre(nombre) {
+  try {
+    const historial = await buscarHistorialCategoriasProveedor(nombre);
+    if (!historial || historial.length < 2) return null;
+    const conteo = {};
+    historial.forEach((h) => { if (h.categoria) conteo[h.categoria] = (conteo[h.categoria] || 0) + 1; });
+    const top = Object.entries(conteo).sort((a, b) => b[1] - a[1])[0];
+    return top ? top[0] : null;
+  } catch (err) {
+    console.error("No se pudo buscar el historial por nombre:", err);
+    return null;
+  }
+}
+
+async function resolverDatosContables(rut, nombre) {
+  const vacio = { rut: null, nombre_proveedor: null, categoria: null, descripcion: null, desdeContabilidad: false };
+  // Sin RUT no hay a quién buscarle el historial contable, pero eso no
+  // significa que no se pueda sugerir nada: los comprobantes que no son DTE
+  // (transferencias, vouchers) no traen RUT NUNCA, y antes quedaban sin
+  // proveedor ni categoría por definición, no por no haberse leído bien.
+  // Con el nombre alcanza para mirar cómo clasificó esta misma persona
+  // compras anteriores al mismo destinatario.
+  if (!rut) return nombre ? { ...vacio, nombre_proveedor: nombre, categoria: await categoriaMasUsadaPorNombre(nombre) } : vacio;
+  // El RUT se normaliza ANTES de consultar: la lectura local lo saca con
+  // puntos ("77.574.911-3") y la IA suele devolverlo pelado ("77574911-3"),
+  // pero las dos bases lo guardan en la forma con puntos (es la que escribe
+  // aplicarResultadoOcrCon). Sin esto, el mismo proveedor encontraba
+  // historial cuando venía del PDF y no cuando venía de una foto.
+  const rutFormateado = formatearRut(rut);
+  const [razonSocial, categoriaContable, previos] = await Promise.all([
+    buscarNombreProveedorPorRut(rutFormateado),
+    buscarCategoriaEnContabilidad(rutFormateado),
+    buscarDatosPreviosPorRut(rutFormateado),
+  ]);
+  return {
+    rut: rutFormateado,
+    // La razón social real de contabilidad le gana al nombre leído del
+    // documento; si el RUT no está en contabilidad, queda el leído.
+    nombre_proveedor: razonSocial || nombre || null,
+    categoria: categoriaContable || previos.categoria,
+    descripcion: previos.descripcion,
+    // Se distingue la categoría que sale de la CONTABILIDAD REAL (años de
+    // asientos) de la que sale del historial de la app, porque el mensaje
+    // que ve la persona dice de dónde viene y eso cambia cuánto confiar.
+    desdeContabilidad: !!categoriaContable,
+  };
+}
+
+// Campos que quedaron sin valor después de la lectura local + contabilidad.
+function camposFaltantesOcr(datos, campos) {
+  return campos.filter((c) => !datos || !datos[c]);
+}
+
+// Lo que se le pide a la IA: los campos faltantes, MÁS el monto cuando la
+// aritmética del documento no lo pudo confirmar. El monto ahí no está
+// técnicamente "faltando" (hay un número), pero es el dato que más caro sale
+// equivocado, así que vale la pena que la única llamada que tenemos también
+// traiga una segunda lectura suya para contrastar -- que es exactamente lo
+// que hacía contrastarMontoConIA antes de integrarse a la fusión. Si la
+// aritmética ya lo confirmó no se pide: no hay nada que contrastar.
+function camposAPedirOcr(datos, campos) {
+  const faltan = camposFaltantesOcr(datos, campos);
+  if (campos.includes("monto") && datos && datos.monto && !datos.monto_verificado && !faltan.includes("monto")) faltan.push("monto");
+  return faltan;
+}
+
+// Qué campos JUSTIFICAN gastar una solicitud de Gemini, que es distinto de
+// qué campos se le piden. Los que están acá salen del documento y son caros
+// de equivocar o latosos de tipear a mano; los que NO están (nombre del
+// proveedor, descripción, categoría) son comodidades que la persona
+// completa en segundos y que casi siempre resuelve contabilidad gratis.
+//
+// La distinción no es un refinamiento: sin ella este cambio AUMENTABA el
+// consumo en vez de mantenerlo. Antes se llamaba a la IA solo cuando la
+// aritmética no confirmaba el monto; con la fusión, un proveedor nuevo sin
+// historial deja vacíos nombre, categoría y descripción, y eso habría
+// disparado una llamada en un caso donde antes había cero. Con un techo de
+// ~20 solicitudes por modelo al día, esa diferencia se nota el mismo día.
+const CAMPOS_QUE_JUSTIFICAN_IA = new Set(["rut_proveedor", "monto", "nro_documento", "fecha", "tipo_documento"]);
+
+// Se le pide TODO lo que falta (los campos extra salen gratis en la misma
+// solicitud), pero solo se gasta la solicitud si falta algo sustantivo.
+function valeLaPenaLlamarIA(pedidos) {
+  return pedidos.some((c) => CAMPOS_QUE_JUSTIFICAN_IA.has(c));
+}
+
+// Lo que la lectura local SÍ obtuvo, para mandárselo a ocr-recibo y que no
+// tenga que adivinar de nuevo lo que ya sabemos (contrato acordado con el
+// lado servidor).
+function datosParcialesOcr(datos) {
+  const out = {};
+  if (!datos) return out;
+  CAMPOS_OCR_CON.forEach((c) => { if (datos[c]) out[c] = datos[c]; });
+  return out;
+}
+
+// LA función de fusión: todo lo que termina en los campos del formulario
+// pasa por acá, venga de la lectura local, de contabilidad o de la IA.
+//
+// La precedencia no es un gusto, sale de cuán determinista es cada fuente:
+//  - RUT, tipo, folio y fecha salen del TEXTO del documento, así que lo
+//    local gana siempre que exista; la IA (que interpreta una imagen) solo
+//    rellena huecos.
+//  - Nombre, categoría y descripción no están en el texto, o están peor que
+//    en el historial: contabilidad primero, IA después, local al final.
+//  - El monto NUNCA se cambia solo. Si las dos fuentes coinciden queda
+//    confirmado; si difieren se avisa y se deja el local, porque cuál es el
+//    correcto lo decide la persona mirando la factura.
+//
+// Devuelve tres cosas:
+//  - datos: la fusión completa, para aplicar cuando no se aplicó nada aún.
+//  - aporteIA: SOLO los campos que puso la IA. Es lo que se aplica en la
+//    segunda pasada -- repisar los campos locales 20 segundos después
+//    borraría lo que la persona haya corregido a mano mientras esperaba.
+//  - avisos: lo que hay que decirle a la persona sobre el monto.
+function fusionarLecturas(local, ia, contable) {
+  const L = local || {};
+  const I = ia || {};
+  const C = contable || {};
+  const datos = {};
+  const aporteIA = {};
+  const avisos = [];
+  const conflictos = new Set((Array.isArray(I.campos_discrepantes) ? I.campos_discrepantes : []).filter(c => ["rut_proveedor","tipo_documento","nro_documento","fecha","monto"].includes(c)));
+
+  // Determinista primero: lo local manda, la IA solo rellena.
+  ["rut_proveedor", "tipo_documento", "nro_documento", "fecha"].forEach((campo) => {
+    datos[campo] = L[campo] || I[campo] || null;
+    if (!L[campo] && I[campo]) aporteIA[campo] = I[campo];
+    const normalizar = v => campo === "rut_proveedor" ? String(v).replace(/[^0-9kK]/g,"").toUpperCase() : campo === "nro_documento" ? String(v).trim().replace(/^0+(?=\d)/,"") : String(v).normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim().toLowerCase();
+    const revision=I.verificacion_campos?.[campo];
+    if ((L[campo] && I[campo] && normalizar(L[campo])!==normalizar(I[campo])) || (revision?.estado === "por_confirmar" && /discrepan|contradict/i.test(revision.motivo || ""))) {
+      conflictos.add(campo);
+      avisos.push({ok:false,texto:"Hay lecturas contradictorias del campo "+campo+". Confirma el valor mirando el comprobante."});
+    }
+  });
+
+  // Contabilidad manda: son datos de personas y de asientos reales, no de
+  // un modelo mirando una imagen.
+  [["nombre_proveedor", C.nombre_proveedor], ["descripcion", C.descripcion], ["categoria_sugerida", C.categoria]].forEach(([campo, valorContable]) => {
+    datos[campo] = valorContable || I[campo] || L[campo] || null;
+    if (!valorContable && I[campo] && I[campo] !== L[campo]) aporteIA[campo] = I[campo];
+  });
+
+  // El monto pasa por montoValidoCLP a propósito: es el último filtro antes
+  // de que un número de afuera aterrice en un campo que va a contabilidad.
+  const montoLocal = montoValidoCLP(L.monto);
+  const montoIA = montoValidoCLP(I.monto);
+  datos.monto = montoLocal || montoIA || null;
+  // La IA también puede traer el monto confirmado: ocr-recibo le pide el
+  // total EN LETRAS tal como está impreso y lo contrasta contra los dígitos
+  // del lado del servidor (ver montoDesdePalabras en _shared/gemini-ocr.ts).
+  // Antes ese camino no pasaba por ninguna verificación -- se consumía el
+  // JSON del modelo tal cual -- así que era el único sin red.
+  datos.monto_verificado = !!L.monto_verificado || (!montoLocal && !!I.monto_verificado);
+  if (montoLocal && montoIA) {
+    if (montoLocal === montoIA) {
+      // Dos lectores independientes que coinciden son mucha más evidencia
+      // que uno solo: el monto queda tan confirmado como por aritmética.
+      datos.monto_verificado = true;
+      avisos.push({ ok: true, texto: `Monto confirmado: la IA leyó el mismo total (${fmtCLP(montoLocal)}).` });
+    } else {
+      datos.monto = null; datos.monto_verificado = false; datos.monto_discrepante = true;
+      avisos.push({ ok: false, texto: `⚠ Ojo con el monto: del texto del PDF se leyó ${fmtCLP(montoLocal)}, pero la IA leyó ${fmtCLP(montoIA)}. Se requiere confirmación del monto mirando la factura antes de enviar.` });
+    }
+  } else if (!montoLocal && montoIA) {
+    aporteIA.monto = montoIA;
+  }
+
+  if (L.monto_discrepante || I.monto_discrepante || datos.monto_discrepante) {
+    datos.monto=null; datos.monto_verificado=false; datos.monto_discrepante=true;
+    aporteIA.monto=null; aporteIA.monto_discrepante=true; aporteIA.monto_verificado=false;
+    if (!avisos.some(a => !a.ok)) avisos.push({ok:false,texto:"El comprobante contiene montos contradictorios. Confirma el total mirando el documento antes de enviar."});
+  }
+  if (datos.monto_discrepante) conflictos.add("monto");
+  for(const campo of conflictos){datos[campo]=null;aporteIA[campo]=null;}
+  if(conflictos.size){datos.campos_discrepantes=[...conflictos];aporteIA.campos_discrepantes=[...conflictos];}
+  if (I.requiere_separacion) {datos.requiere_separacion=true; datos.aviso_documento=I.aviso_documento || "Este archivo requiere separar los comprobantes por gasto."; aporteIA.requiere_separacion=true; aporteIA.aviso_documento=datos.aviso_documento;}
+  if (Array.isArray(L.confianza_baja)) datos.confianza_baja=[...L.confianza_baja];
+  if (L.verificacion_campos || I.verificacion_campos) datos.verificacion_campos={...(L.verificacion_campos || {}),...(I.verificacion_campos || {})};
+  if (I.verificacion_campos) aporteIA.verificacion_campos=I.verificacion_campos;
+  if (I.analisis_documento) datos.analisis_documento = I.analisis_documento;
+  if (I.proveedor_lectura) datos.proveedor_lectura = I.proveedor_lectura;
+  return { datos, aporteIA, avisos };
+}
+
+// La ÚNICA llamada a la IA del camino con lectura local, y solo cuando
+// quedaron huecos. Corre en segundo plano a propósito: los campos locales ya
+// están en pantalla, nadie tiene que mirar un spinner 15-25s para recién ver
+// algo. Si falla (cuota agotada, timeout) no se alarma a nadie ni se muestra
+// el botón de reintento -- lo local ya sirve para enviar la rendición.
+async function completarConIA({ id, file, gen, statusEl, local, contable, datos, campos, aplicar, textoBase }) {
+  try {
+    const ia = await llamarOcrRecibo(file, camposAPedirOcr(datos, campos), datosParcialesOcr(datos), campos === CAMPOS_OCR_CON ? "ConDocumento" : "SinDocumento");
+    // Re-chequeo OBLIGATORIO después de CADA await, y con "return": mientras
+    // la IA respondía, la persona pudo adjuntar otro comprobante. Si esto
+    // sigue de largo, deja el ítem con datos de dos documentos distintos.
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+
+    // Si el RUT lo aportó la IA (el PDF tenía texto pero no un RUT legible),
+    // recién ahora se le puede preguntar a contabilidad por ese proveedor.
+    let contableFinal = contable;
+    if (!contableFinal || !contableFinal.rut) {
+      if (ia && ia.rut_proveedor) {
+        contableFinal = await resolverDatosContables(ia.rut_proveedor, ia.nombre_proveedor || local?.nombre_proveedor);
+        if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+      }
+    }
+
+    const { datos: fusion, aporteIA, avisos } = fusionarLecturas(local, ia, contableFinal);
+    mostrarVerificacionOcr(id, ia);
+    const revisionAplicada = await aplicar(id, aporteIA, gen);
+    if (revisionAplicada?.estado === "requiere_separacion" || revisionAplicada?.estado === "obsoleto") return;
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+    // La IA aportó algo: queda registrado como origen mixto. Y el monto pudo
+    // pasar a confirmado justo acá, si los dos lectores leyeron el mismo
+    // total -- dos fuentes independientes que coinciden valen tanto como la
+    // aritmética del documento.
+    registrarOrigenOcr(id, local ? "local+ia" : "ia", fusion);
+    if(ia.previaId)dispararAgenteYEsperar(id,ia.previaId,gen,(data,g)=>aplicar(id,data,g),statusEl);
+
+    // Una discrepancia de monto se come el mensaje entero: es lo único que
+    // hay que mirar antes de enviar, y mezclarlo con "la IA completó el
+    // folio" lo esconde.
+    const problema = avisos.find((a) => !a.ok);
+    if (problema) {
+      statusEl.textContent = problema.texto;
+      statusEl.className = "ocr-status show err";
+      return;
+    }
+    const llenados = Object.keys(aporteIA).filter((c) => campos.includes(c)).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
+    const extra = (llenados.length ? ` La IA completó lo que faltaba: ${llenados.join(", ")}.` : "")
+      + avisos.map((a) => ` ${a.texto}`).join("");
+    statusEl.textContent = `${textoBase}${extra} ${revisionAplicada?.mensaje || ""}`;
+    statusEl.className = "ocr-status show " + (revisionAplicada?.estado === "completo" ? "ok" : "err");
+  } catch (err) {
+    if (err.noReintentar && esGeneracionVigenteOcr(id,gen)) {ocrBloqueado.add(id);statusEl.textContent=err.message;statusEl.className="ocr-status show err";return;}
+    // Que falle la segunda fuente no es un problema: la lectura local ya
+    // llenó los campos. Se registra y se sigue, sin alarmar a nadie.
+    console.error("No se pudieron completar los campos faltantes con la IA:", err);
+  }
+}
+
+// Etiquetas que forman la fila de encabezado de la tabla de detalle. Se usan
+// para dos cosas: saber dónde empieza el detalle y limpiar los restos que
+// queden mezclados con los productos.
+// "Impto Adic." y "Desc. Valor" se agregaron después de probar contra una
+// factura real guardada (importadora FA DA 9): el resto de la cabecera se
+// limpiaba bien, pero esas dos columnas sobrevivían y la descripción salía
+// "%Impto Adic.* %Desc. Valor - ARTICULOS VARIOS" en vez de los productos.
+const CABECERA_DETALLE = String.raw`(?:SKU|ITEM|Item|Detalle|Descripci[oó]n|VALOR\s*UNITARIO|P\.?\s*unitario|Precio|CANTIDAD|Cant\.?|%?\s*Desc(?:uento|\.)?(?:\s*Valor)?|%?\s*Impto\.?\s*Adic\.?\*?|SUBTOTAL|Total\s*item)`;
+
+// Descripción sacada del detalle del propio documento (lo que se compró).
+// Ojo con el encabezado: hay que consumirlo ENTERO antes de capturar, porque
+// si no, el "SUBTOTAL" que forma parte del propio encabezado corta la
+// captura antes de llegar a los productos (probado: devolvía "% Descuento").
+function descripcionDesdeDetalle(texto) {
+  const re = new RegExp(
+    // "Forma de Pago" se sumó a los cortes tras probar contra una factura
+    // real (importadora FA DA 9): venía después del detalle y antes de los
+    // totales, así que la captura seguía de largo y la descripción terminaba
+    // en "...Forma de Pago:Crédito".
+    String.raw`\b(?:ITEM|Item|Detalle|Descripci[oó]n)\b(?:\s*${CABECERA_DETALLE})*(.{0,500}?)(?:Neto|NETO|Total\s*\$|TOTAL\s*\(|I\.V\.A|IVA\s*\(|Timbre|Son:|Referencias|Forma\s+de\s+Pago)`,
+    "is"
+  );
+  const m = re.exec(texto);
+  if (!m) return null;
+  let z = m[1]
+    // Las etiquetas de cabecera se quitan PRIMERO, antes que los números.
+    // Al revés no alcanza: quitar "%Desc." deja pegados dos fragmentos que
+    // por separado ya habían pasado el filtro numérico ("20 %Desc. ,33" ->
+    // "20 ,33"), y esa cola aparecía en la descripción de una factura real.
+    .replace(new RegExp(CABECERA_DETALLE, "gi"), " ")
+    .replace(/\$\s*[\d.,]+/g, " ")
+    .replace(/\b\d+[.,]\d+\s*%/g, " ")
+    // Un importe con miles Y decimales es UN solo token: "1.819,33". Antes
+    // se quitaban por separado los miles y los decimales, y sobre una
+    // factura real ("- ARTICULOS VARIOS 20 1.819,33 36.387") eso se comía
+    // "1.819" y dejaba ",33" suelto pegado a la descripción. La coma
+    // decimal tiene que estar en la MISMA alternativa que los puntos de mil.
+    .replace(/\b\d{1,3}(?:\.\d{3})+(?:,\d+)?\b|\b\d+,\d+\b/g, " ")
+    // Rachas de dos o más números sueltos son columnas de la tabla
+    // (cantidad, código del ítem siguiente). Un número solo se respeta:
+    // suele ser parte del producto ("1kg", "2 lbs").
+    // OJO: acá NO se puede usar lookbehind ((?<=\s)). Los literales de regex
+    // se validan al PARSEAR el archivo, así que un lookbehind en un
+    // navegador que no lo soporta no rompe esta función: rompe app.js
+    // entero, y la app queda muerta (pantalla en blanco) para esa persona.
+    // Safari recién lo soporta desde la 16.4 y acá hay gente rindiendo
+    // desde iPhones viejos. Se captura el separador y se devuelve.
+    .replace(/(^|\s)\d+(?:\s+\d+)+(?=\s|$)/g, "$1 ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s\-·,.|]+|[\s\-·,.|]+$/g, "")
+    .replace(/^\d+\s+/, "") // código/SKU suelto al principio
+    // ...y la cantidad suelta al final, que es lo que queda de la fila una
+    // vez quitados los importes ("ARTICULOS VARIOS 20"). Un producto que
+    // termina de verdad en un número es raro; una columna sobrante, no.
+    .replace(/[\s,.]*\b\d+\s*$/, "")
+    .trim();
+  if (z.length < 8) return null;
+  if (z.length > 110) z = z.slice(0, 110).replace(/\s+\S*$/, "") + "…"; // cortar en palabra entera, no a la mitad
+  return z;
+}
+
+// Sugerencias SIN IA sacadas del historial real de ESTE MISMO RUT: qué
+// categoría y qué descripción se usaron antes para facturas del mismo
+// proveedor. Para un proveedor recurrente esto es más confiable que lo que
+// pueda deducir un modelo mirando el documento, y la categoría además
+// alimenta la sugerencia de cuenta contable que ve el aprobador (ver
+// actualizarSugerenciaCuenta en iniciarEdicionItem).
+async function buscarDatosPreviosPorRut(rutProveedor) {
+  if (!rutProveedor) return { categoria: null, descripcion: null };
+  const { data, error } = await db
+    .from("rendicion_items")
+    .select("categoria, descripcion")
+    .eq("rut_proveedor", rutProveedor)
+    .order("id", { ascending: false })
+    .limit(20);
+  if (error || !data?.length) return { categoria: null, descripcion: null };
+
+  // Categoría: la más usada (si hay empate gana la más reciente, por el
+  // orden de la consulta). Puede venir toda en null -- los ítems "Documento
+  // electrónico" no tenían este campo hasta hace poco, así que para
+  // proveedores cargados antes de eso simplemente todavía no hay qué sugerir.
+  const conteo = {};
+  data.forEach((d) => { if (d.categoria) conteo[d.categoria] = (conteo[d.categoria] || 0) + 1; });
+  const categoria = Object.keys(conteo).length
+    ? Object.entries(conteo).sort((a, b) => b[1] - a[1])[0][0]
+    : null;
+
+  // Descripción: la del ítem más reciente, no la más repetida -- si a este
+  // proveedor se le compran cosas distintas, la última es la referencia más
+  // útil para editarla encima.
+  const descripcion = data.find((d) => d.descripcion && d.descripcion.trim())?.descripcion || null;
+
+  return { categoria, descripcion };
+}
+
+// Categoría deducida de la CONTABILIDAD REAL: con qué cuenta de gasto se
+// contabilizó históricamente a este proveedor. Es la mejor fuente que hay --
+// son años de asientos hechos por el área contable, contra los pocos ítems
+// que pueda tener la app.
+//
+// El detalle importante: filtrar movimientos por el RUT del proveedor NO
+// devuelve la cuenta de gasto. Por partida doble, la compra genera dos
+// líneas -- el gasto (4.01.03.xx) y el pasivo (2.01.07.01 Proveedores
+// Nacionales) -- y solo esta última lleva la ficha del proveedor. Hay que
+// saltar del proveedor a su comprobante, y del comprobante a la línea de
+// gasto del mismo asiento. Además el número de comprobante se repite entre
+// empresas, así que hay que cruzar por empresa también o se mezclan asientos
+// ajenos (probado: sin ese filtro aparecían "Banco Santander" y "Comisión
+// Transbank" de otras empresas).
+const cacheCategoriaContable = new Map();
+
+async function buscarCategoriaEnContabilidad(rut) {
+  if (!rut || !dbContabilidad) return null;
+  if (cacheCategoriaContable.has(rut)) return cacheCategoriaContable.get(rut);
+  try {
+    const { data: lineasProveedor } = await dbContabilidad
+      .from("movimientos")
+      .select(`${MOVIMIENTOS_COLS.comprobante}, ${MOVIMIENTOS_COLS.empresa}`)
+      .eq(MOVIMIENTOS_COLS.rutFicha, rut)
+      .not(MOVIMIENTOS_COLS.comprobante, "is", null)
+      .limit(25);
+    if (!lineasProveedor?.length) { cacheCategoriaContable.set(rut, null); return null; }
+
+    const comprobantesPorEmpresa = {};
+    lineasProveedor.forEach((l) => {
+      const empresa = l[MOVIMIENTOS_COLS.empresa];
+      (comprobantesPorEmpresa[empresa] ||= new Set()).add(l[MOVIMIENTOS_COLS.comprobante]);
+    });
+
+    // En paralelo, no en serie: un proveedor puede aparecer en varias de las
+    // ~10 empresas del grupo, y encadenar una consulta por cada una hace que
+    // el formulario espere de más justo cuando se cargan varias facturas.
+    const resultados = await Promise.all(
+      Object.entries(comprobantesPorEmpresa).map(([empresa, comprobantes]) =>
+        dbContabilidad
+          .from("movimientos")
+          .select(MOVIMIENTOS_COLS.cuentaCod)
+          .eq(MOVIMIENTOS_COLS.empresa, empresa)
+          .in(MOVIMIENTOS_COLS.comprobante, [...comprobantes].slice(0, 15))
+          .limit(200)
+      )
+    );
+
+    const conteo = {};
+    resultados.forEach(({ data }) => {
+      (data || []).forEach((m) => {
+        const cod = m[MOVIMIENTOS_COLS.cuentaCod];
+        if (String(cod || "").startsWith("4.01.03")) conteo[cod] = (conteo[cod] || 0) + 1;
+      });
+    });
+
+    const codGanador = Object.entries(conteo).sort((a, b) => b[1] - a[1])[0]?.[0];
+    const categoria = codGanador ? (CATEGORIAS_GASTO.find((c) => c.cuenta === codGanador)?.nombre || null) : null;
+    cacheCategoriaContable.set(rut, categoria);
+    return categoria;
+  } catch {
+    return null;
+  }
+}
+
+// El folio a veces no se puede sacar del texto del PDF porque su etiqueta
+// ("Nº") queda separada del número en el flujo. Pero los sistemas de
+// facturación suelen ponerlo en el NOMBRE del archivo ("Factura N9893
+// FoodTech.pdf", "GW_2026_09_FACTURA_136982_RINDEGASTOS SPA.pdf"), así que
+// sirve como segunda fuente. Se exige que venga acompañado de "factura",
+// "boleta", "N" o "F" para no confundirlo con una fecha o un correlativo
+// interno cualquiera del nombre.
+function folioDesdeNombreArchivo(nombre) {
+  if (!nombre) return null;
+  const sinExtension = nombre.replace(/\.[a-z0-9]+$/i, "");
+  // Sin el flag "i" esto no matcheaba justamente el caso para el que se
+  // escribió ("..._FACTURA_136982_..." en mayúsculas), y en cambio sí caía en
+  // los que debía ignorar: "boleta-2026-09-15.pdf" devolvía 2026 como folio y
+  // "factura_20260915.pdf" devolvía la fecha completa. Un año o una fecha
+  // metidos en nro_documento son peores que un campo vacío: alimentan el
+  // control de duplicados y el cruce con contabilidad del aprobador.
+  const m = /(?:factura|boleta|dte|n|f)[ _\-°º]*(\d{3,10})(?![\d])/i.exec(sinExtension);
+  if (!m) return null;
+  const candidato = m[1];
+  if (/^(19|20)\d{2}$/.test(candidato)) return null;            // un año suelto
+  if (/^(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$/.test(candidato)) return null; // AAAAMMDD
+  return candidato;
+}
+
+// Devuelve los datos si el PDF traía texto suficiente, o null para que siga
+// el camino normal con IA (PDF escaneado, protegido, o sin los datos clave).
+function clasificarPaginaComprobante(texto) {
+  const t = String(texto || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (/gasto\s+\d+\s*\/\s*\d+|campos adicionales:|monto original|resumen de rendicion|total informe|detalle de gastos incluidos/.test(t)) return "Ficha de rendición";
+  if (/factura/.test(t)) return "Factura";
+  if (/boleta/.test(t)) return "Boleta";
+  if (/transbank|redcompra|comprobante de venta|tarjeta de credito/.test(t)) return "Voucher";
+  if (/transferencia/.test(t)) return "Transferencia";
+  return t.trim().length < 40 ? "Comprobante en imagen" : "Documento";
+}
+
+const preparacionesArchivo = new WeakMap();
+async function prepararArchivoParaLectura(input, status, analizar) {
+  const original = input.files?.[0];
+  preparacionesArchivo.get(input)?.limpiar?.();
+  input.dataset.paginaPendiente = original?.type === "application/pdf" ? "true" : "false";
+  const token = {}; preparacionesArchivo.set(input, token);
+  const vigente = () => preparacionesArchivo.get(input) === token && input.isConnected;
+  input.parentElement.querySelector(".selector-pagina-ocr")?.remove();
+  if (!original) return;
+  nuevaGeneracionOcr(input.id.replace(/-foto2?$/, ""));
+  try {
+    if (original.type !== "application/pdf") {
+      // La copia optimizada solo se usa para leer. El adjunto guardado conserva la foto original.
+      if (vigente()) await analizar(original);
+      return;
+    }
+    status.className = "ocr-status show"; status.textContent = "Revisando las páginas del PDF…";
+    const pdfjs = await cargarPdfJs();
+    const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await original.arrayBuffer()).promise;
+    if (!vigente()) {await pdf.destroy(); return;}
+    if (pdf.numPages === 1) {input.dataset.paginaPendiente="false";await pdf.destroy(); await analizar(original); return;}
+    const panel = el("div", {class:"selector-pagina-ocr"});
+    panel.appendChild(el("p", {}, "Este PDF contiene " + pdf.numPages + " páginas. Elige el comprobante de este gasto; las fichas de rendición no son el documento original."));
+    const select = el("select", {"aria-label":"Página del comprobante"});
+    let sugerida = null;
+    for (let n=1;n<=pdf.numPages;n++) {
+      const page = await pdf.getPage(n);
+      const contenido = await page.getTextContent();
+      if (!vigente()) {await pdf.destroy();return;}
+      const tipo = clasificarPaginaComprobante(contenido.items.map(i=>i.str).join(" "));
+      select.appendChild(el("option", {value:String(n)}, "Página " + n + " · " + tipo));
+      if (sugerida === null && tipo !== "Ficha de rendición" && tipo !== "Documento") sugerida=n;
+      status.textContent="Identificando páginas: " + n + " de " + pdf.numPages;
+      page.cleanup();
+    }
+    if (sugerida !== null) select.value=String(sugerida);
+    panel.appendChild(select);
+    const vista = el("img", {alt:"Vista previa de la página seleccionada"}); panel.appendChild(vista);
+    const usar = el("button", {type:"button",class:"btn btn-primary",disabled:true}, "Leer este comprobante"); panel.appendChild(usar);
+    input.parentElement.appendChild(panel);
+    let renderToken=0, archivoPagina=null, url=null;
+    token.limpiar = () => {if(url)URL.revokeObjectURL(url);pdf.destroy();};
+    async function mostrarPagina() {
+      const lectura=++renderToken; usar.disabled=true; archivoPagina=null; input.dataset.paginaPendiente="true";
+      try {
+        const pagina=await pdf.getPage(Number(select.value));
+        const contenido=await pagina.getTextContent();
+        const tipo=clasificarPaginaComprobante(contenido.items.map(i=>i.str).join(" "));
+        const viewport=pagina.getViewport({scale:1});
+        const escala=Math.min(3,2400/Math.max(viewport.width,viewport.height));
+        const v=pagina.getViewport({scale:escala});
+        const canvas=document.createElement("canvas");canvas.width=Math.ceil(v.width);canvas.height=Math.ceil(v.height);
+        await pagina.render({canvasContext:canvas.getContext("2d"),viewport:v}).promise;
+        const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",.94));
+        if (!vigente() || lectura!==renderToken || !blob) return;
+        if (url) URL.revokeObjectURL(url);
+        url=URL.createObjectURL(blob);vista.src=url;
+        panel.querySelector(".pagina-clasificacion")?.remove();
+        panel.insertBefore(el("p", {class:"pagina-clasificacion"}, "Página " + select.value + " · " + tipo),vista);
+        archivoPagina=new File([blob],original.name.replace(/\.pdf$/i,"")+"-pagina-"+select.value+".jpg",{type:"image/jpeg"});
+        usar.disabled=tipo==="Ficha de rendición";
+        status.textContent=tipo==="Ficha de rendición" ? "Esta página es una ficha. Selecciona la página con la boleta, factura o voucher original." : "Confirma la página antes de leerla. Se adjuntará solo este comprobante al gasto.";
+      } catch (error) {if(vigente()){status.textContent="No se pudo preparar esta página. Elige otra o adjunta una foto del comprobante.";status.className="ocr-status show err";}}
+    }
+    select.addEventListener("change",()=>{const id=input.id.replace(/-foto2?$/,"");nuevaGeneracionOcr(id);mostrarPagina();});
+    usar.addEventListener("click",async()=>{
+      if(!vigente() || !archivoPagina || usar.disabled)return;
+      usar.disabled=true;
+      const dt=new DataTransfer();dt.items.add(archivoPagina);input.files=dt.files;input.dataset.paginaPendiente="false";
+      await analizar(archivoPagina);
+      if(vigente())usar.disabled=false;
+    });
+    await mostrarPagina();
+  } catch(error) {
+    if(vigente()){status.className="ocr-status show err";status.textContent="No se pudo abrir el archivo. Prueba con una foto o un PDF del comprobante original.";}
+  }
+}
+
+async function leerPdfLocal(file) {
+  if ((file.type || "") !== "application/pdf") return null;
+  try {
+    const pdfjs = await cargarPdfJs();
+    const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
+    let texto = "";
+    if (pdf.numPages !== 1) {await pdf.destroy(); return null;}
+    // Tope de páginas: una factura tiene 1-2; leer un PDF enorme entero solo
+    // para buscar un RUT no aporta y traba el navegador.
+    for (let p = 1; p <= Math.min(pdf.numPages, 3); p++) {
+      const contenido = await (await pdf.getPage(p)).getTextContent();
+      texto += contenido.items.map((i) => i.str).join(" ") + "\n";
+    }
+    if (clasificarPaginaComprobante(texto) === "Ficha de rendición") {await pdf.destroy(); return null;}
+    await pdf.destroy();
+    if (texto.trim().length < 50) return null; // PDF escaneado: es una imagen, no hay texto que leer
+    const datos = parsearTextoFactura(texto);
+    // El piso para considerarlo bueno: RUT válido + monto. Sin esos dos no
+    // vale la pena saltarse la IA.
+    return datos.rut_proveedor && datos.monto ? datos : null;
+  } catch (err) {
+    console.error("No se pudo leer el PDF localmente, se usará la IA:", err);
+    return null;
+  }
+}
+
+// "camposFaltantes" y "datosParciales" son opcionales y van en el body para
+// que ocr-recibo lea SOLO lo que la lectura local no pudo sacar, en vez de
+// releer el documento entero. No cambian el costo de la llamada (sigue
+// siendo una sola solicitud a Gemini), pero sí lo que se le pide. Si el
+// servidor todavía no los soporta simplemente los ignora y responde como
+// siempre, así que mandarlos es inofensivo.
+const fotosPreparadas = new WeakMap();
+const opcionesFotos = new WeakMap();
+async function prepararComprobanteIa(file) {
+  if (!fotosPreparadas.has(file)) fotosPreparadas.set(file, (async () => {
+    let imagen = file;
+    if (file.type === "application/pdf") {
+      const pdfjs = await cargarPdfJs();
+      const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
+      try {
+        if (pdf.numPages !== 1) return file;
+        const pagina = await pdf.getPage(1),base = pagina.getViewport({scale:1});
+        const viewport = pagina.getViewport({scale:Math.min(3,2000/Math.max(base.width,base.height))});
+        const canvas = document.createElement("canvas");canvas.width = Math.ceil(viewport.width);canvas.height = Math.ceil(viewport.height);
+        await pagina.render({canvasContext:canvas.getContext("2d"),viewport}).promise;
+        const blob = await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
+        if (!blob) throw new Error("No se pudo preparar la página del comprobante.");
+        imagen = new File([blob],"pagina-comprobante.png",{type:"image/png"});
+      } finally {await pdf.destroy();}
+    }
+    if (!imagen.type.startsWith("image/")) return imagen;
+    const resultado = await window.RindeFoto.preparar(imagen,{recortar:file.type!=="application/pdf",...opcionesFotos.get(file)});
+    return resultado.file;
+  })().catch(error=>{fotosPreparadas.delete(file);throw error;}));
+  return fotosPreparadas.get(file);
+}
+async function llamarOcrRecibo(file, camposFaltantes, datosParciales, tipoItem) {
+  // Ambos proveedores ven la misma copia; la cola de nube recibe también esa imagen.
+  file = await prepararComprobanteIa(file);
   const imageBase64 = await new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
@@ -2317,9 +3738,26 @@ async function llamarOcrRecibo(file) {
     reader.readAsDataURL(file);
   });
 
+  const body = { imageBase64, mimeType: file.type || "image/jpeg" };
+  if (camposFaltantes && camposFaltantes.length) body.camposFaltantes = camposFaltantes;
+  if (datosParciales && Object.keys(datosParciales).length) body.datosParciales = datosParciales;
+  // De qu� pesta�a viene el �tem. El modelo no puede deducirlo del papel, y
+  // de eso depende si para dar la lectura por completa se exigen RUT, tipo y
+  // folio: sin esto, una factura fotografiada con el encabezado ilegible se
+  // daba por le�da con solo proveedor, fecha y monto.
+  if (tipoItem) body.tipoItem = tipoItem;
+
   const { data, error } = await conTimeout(
-    db.functions.invoke("ocr-recibo", { body: { imageBase64, mimeType: file.type || "image/jpeg" } }),
-    30000,
+    db.functions.invoke("ocr-recibo", { body }),
+    // Tiene que ser MAYOR que el presupuesto del servidor (PRESUPUESTO_EN_VIVO
+    // en _shared/gemini-ocr.ts, 30s) más el viaje de red -- si no, cortamos
+    // acá justo antes de que la respuesta buena llegue. Sí, 45s de spinner es
+    // harto, pero leer un documento con visión tarda tranquilamente 15-25s:
+    // el timeout corto de antes (30s de acá con 12s por llamada allá)
+    // garantizaba fallar aunque Gemini estuviera respondiendo bien. Si igual
+    // falla, el agente en segundo plano sigue con el archivo (ver
+    // dispararAgenteYEsperar), así que nadie se queda esperando de verdad.
+    45000,
     "Se agotó el tiempo de espera leyendo el comprobante (conexión muy lenta o caída). Completa los datos a mano, o inténtalo de nuevo."
   );
   if (error) {
@@ -2330,61 +3768,528 @@ async function llamarOcrRecibo(file) {
     // falta de configuración) queda en error.context (el Response),
     // así que hay que leerlo a mano para no perderlo.
     let mensaje = error.message;
+    let previaId = null;
     try {
       const cuerpo = await error.context?.json();
       if (cuerpo?.error) mensaje = cuerpo.error;
+      // ocr-recibo sube el comprobante y lo encola en ocr_previos apenas
+      // falla en vivo (ver migracion_ocr_previo.sql) -- este id es lo que
+      // deja seguirlo (disparar el agente altiro + saber cuándo esté listo)
+      // sin esperar a que se envíe la rendición.
+      if (cuerpo?.previaId) previaId = cuerpo.previaId;
     } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
-    throw new Error(mensaje);
+    const err = new Error(mensaje);
+    err.previaId = previaId;
+    throw err;
   }
   if (data?.error) throw new Error(data.error);
+  if (data?.requiere_separacion) {
+    const err = new Error(data.aviso_documento || "Selecciona un comprobante por gasto.");
+    err.noReintentar = true; throw err;
+  }
   return data;
 }
 
+// Evita que la respuesta de una llamada de OCR vieja pise a una más nueva
+// para el mismo ítem -- puede pasar si la persona reselecciona el archivo
+// (o pulsa "reintenta con IA") mientras la llamada anterior todavía está en
+// vuelo: antes, cualquiera de las dos que respondiera último ganaba, sin
+// importar si correspondía al archivo que en realidad quedó adjunto.
+const camposEditadosOcr = new Set();
+const SUFIJOS_OCR = {nombre_proveedor:["nombreprov","nombreprov2"],rut_proveedor:["rut","rut2"],tipo_documento:["tipodoc","tipodoc2"],nro_documento:["folio","folio2"],fecha:["venc","fecha2"],monto:["monto","monto2"],descripcion:["desc","desc2"],categoria_sugerida:["categoriacon","categoria"]};
+function protegerEdicionOcr(id, data) {
+  const copia = {...data};
+  for (const [campo,sufijos] of Object.entries(SUFIJOS_OCR)) {
+    if (sufijos.some(s => camposEditadosOcr.has(id+"-"+s))) delete copia[campo];
+  }
+  return copia;
+}
+function mostrarVerificacionOcr(id, data) {
+  const card = document.getElementById(id);
+  const file = ocrArchivoActual.get(id);
+  if (!card || !file) return;
+  revisionesComprobante.get(id)?.limpiar();
+  const campo = nombre => SUFIJOS_OCR[nombre]?.map(s=>document.getElementById(id+"-"+s)).find(n=>n&&n.offsetParent!==null);
+  const revisiones = Object.fromEntries(Object.keys(SUFIJOS_OCR).filter(c=>c!=="descripcion"&&c!=="categoria_sugerida").map(c=>[c,data.verificacion_campos?.[c]||{estado:"ilegible",motivo:"Revisa este campo en el adjunto."}]));
+  revisionesComprobante.set(id,window.RindeRevision.montar({contenedor:card,datos:{...data,verificacion_campos:revisiones},original:file,fuente:()=>prepararComprobanteIa(file),campo,manual:nombre=>SUFIJOS_OCR[nombre]?.some(s=>camposEditadosOcr.has(id+"-"+s)),ajustar:async opcion=>{
+    if (ocrArchivoActual.get(id)!==file) return;
+    const opciones = {...opcionesFotos.get(file)};
+    if(opcion==="giro")opciones.giro=(opciones.giro||0)+1;
+    if(opcion==="contraste")opciones.contraste=!opciones.contraste;
+    if(opcion==="completo")opciones.recortar=false;
+    opcionesFotos.set(file,opciones);fotosPreparadas.delete(file);
+    const estado = card.querySelector(".ocr-status");
+    if(document.getElementById(id+"-monto2")?.offsetParent!==null)await analizarComprobanteGastoDirecto(id,file,estado);
+    else await analizarComprobante(id,file,estado);
+  }}));
+}
+
+const revisionesComprobante = new Map();
+const ocrGeneracion = new Map();
+const ocrArchivoActual = new Map();
+function nuevaGeneracionOcr(id, conservarEdiciones = false) {
+  if (!conservarEdiciones) for (const campo of camposEditadosOcr) if (campo.startsWith(id+"-")) camposEditadosOcr.delete(campo);
+  revisionesComprobante.get(id)?.limpiar();revisionesComprobante.delete(id);
+  const gen = (ocrGeneracion.get(id) || 0) + 1;
+  ocrGeneracion.set(id, gen);
+  if(!conservarEdiciones){ocrBloqueado.delete(id);ocrConflictos.delete(id);}
+  return gen;
+}
+function esGeneracionVigenteOcr(id, gen) {
+  return ocrGeneracion.get(id) === gen;
+}
+
+// Si el OCR en vivo nunca tuvo éxito para este ítem (ConDocumento), al
+// enviar la rendición se encola para reintento en segundo plano (ver
+// ocr_reintento_estado en submitRendicion) -- un "agente" en Supabase
+// (Edge Function ocr-reintento-pendientes + pg_cron, ver
+// migracion_ocr_reintento.sql) lo sigue intentando cada 5 minutos aunque la
+// persona ya haya cerrado el navegador.
+const ocrExitoso = new Map();
+const ocrBloqueado = new Set();
+const ocrConflictos = new Map();
+
+// Encolar tiene un costo real: cada reintento del agente gasta solicitudes de
+// la cuota gratuita de Gemini, que es de ~20 por modelo AL DÍA. Antes se
+// encolaba TODO ítem cuyo OCR en vivo no hubiera salido bien, incluso cuando
+// la persona ya había escrito los datos a mano -- el agente reintentaba
+// durante horas para "sugerir" exactamente lo que ya estaba en pantalla, y
+// esa cuota le faltaba después a un comprobante que sí la necesitaba. Solo
+// vale la pena encolar si queda algún hueco que el agente pueda llenar.
+function aplicarConflictosOcr(id,data) {
+  const conflictos=new Set(ocrConflictos.get(id) || []);
+  for(const campo of [...(data.campos_discrepantes || []),...(data.monto_discrepante ? ["monto"] : [])]) {
+    if(!SUFIJOS_OCR[campo])continue;
+    conflictos.add(campo);
+    for(const sufijo of SUFIJOS_OCR[campo]){
+      const entrada=document.getElementById(id+"-"+sufijo);
+      if(entrada && !camposEditadosOcr.has(id+"-"+sufijo))entrada.value="";
+    }
+  }
+  ocrConflictos.set(id,[...conflictos]);
+}
+function conflictosSinConfirmar(id) {
+  return (ocrConflictos.get(id)||[]).filter(c => !SUFIJOS_OCR[c]?.some(s => camposEditadosOcr.has(id+"-"+s)));
+}
+function estadoLecturaFormulario(id, directo, data) {
+  const campos=directo ? ["nombreprov2","fecha2","monto2","desc2"] : ["nombreprov","rut","tipodoc","folio","venc","monto","desc"];
+  const etiquetas={nombreprov:"Proveedor",nombreprov2:"Proveedor",rut:"RUT",tipodoc:"Documento",folio:"Folio",venc:"Fecha",fecha2:"Fecha",monto:"Monto",monto2:"Monto",desc:"Descripción",desc2:"Descripción"};
+  const faltantes=campos.filter(s => !document.getElementById(id+"-"+s)?.value?.trim());
+  const pendientesConflicto=conflictosSinConfirmar(id);
+  const conflicto=pendientesConflicto.length>0 || (data.monto_discrepante && !["monto","monto2"].some(s => camposEditadosOcr.has(id+"-"+s)));
+  const completo=!faltantes.length && !conflicto;
+  ocrExitoso.set(id,completo);
+  return {estado:conflicto ? "conflicto" : completo ? "completo" : "parcial",mensaje:conflicto ? "Datos contradictorios: confirma "+(pendientesConflicto.join(", ") || "monto")+" mirando el comprobante." : completo ? "Lectura completa. Revisa los datos y su evidencia; se conservaron tus correcciones." : "Lectura parcial. Falta revisar: "+faltantes.map(s => etiquetas[s]).join(", ")+". El agente puede reintentar los campos pendientes."};
+}
+
+function estadoReintentoOcr(id, huecos) {
+  // Una respuesta parcial no cancela la cola de campos pendientes.
+  if (ocrBloqueado.has(id)) return null;
+  return huecos.some((v) => !v) ? "pendiente" : null;
+}
+
+// De dónde salieron los datos de cada ítem ("local", "ia", "local+ia") y si
+// el monto quedó confirmado por la aritmética del documento. Se guardan con
+// el ítem al enviar la rendición, y sirven para dos cosas distintas:
+//  - Quien aprueba puede distinguir un total CONFIRMADO contra los
+//    subtotales de la factura de uno deducido por heurística.
+//  - Permite notar que el parser local se degradó. Si un proveedor cambia el
+//    formato de su factura, lo único que se vería sin esto es que la cuota
+//    de Gemini se acaba antes, sin ninguna explicación; con esto se puede
+//    consultar cuántos ítems vienen de cada origen y cuándo cambió.
+// Va acá, en un dato que ya se guarda igual, y no en una llamada de red
+// aparte: no cuesta ninguna solicitud extra.
+const ocrOrigen = new Map();
+// id -> { verificado: boolean, monto: number } con el monto que dejó el OCR.
+// Se guarda el monto además del flag porque si la persona lo corrige a mano
+// después, "verificado" dejaría de ser cierto: se compara al enviar.
+const ocrMonto = new Map();
+
+function registrarOrigenOcr(id, origen, datos) {
+  ocrOrigen.set(id, origen);
+  ocrMonto.set(id, { verificado: !!datos.monto_verificado, monto: datos.monto || null });
+}
+
+// "Verificado" describe el monto que leyó el OCR, no el que finalmente se
+// envía. Si la persona lo corrigió a mano, ese respaldo aritmético ya no
+// aplica al número que va a contabilidad, y marcarlo igual sería peor que no
+// marcar nada: quien aprueba confiaría en una confirmación que no existe.
+function montoSigueVerificado(id, montoEnviado) {
+  const reg = ocrMonto.get(id);
+  return !!(reg && reg.verificado && reg.monto === montoEnviado);
+}
+
+// El comprobante ya quedó adjunto en el <input type=file> antes de llamar a
+// esto (fotoInput/fotoInput2 lo retienen aunque el OCR falle -- ver
+// addItemRow / buildSinDocumentoFields), así que reintentar no requiere que
+// la persona vuelva a elegir el archivo: basta con volver a llamar al mismo
+// analizador con el mismo File. Común a "Con documento" y "Gasto directo"
+// para no duplicar el armado del botón en los dos catch.
+function mostrarErrorOcr(statusEl, err, reintentar) {
+  statusEl.textContent = "";
+  statusEl.className = "ocr-status show err";
+  statusEl.appendChild(document.createTextNode(
+    // No es obligatorio completar todo a mano acá: alcanza con el monto para
+    // poder enviar la rendición (lo único que de verdad exige el formulario
+    // -- ver submitRendicion). Si se envía igual, el ítem queda en cola y el
+    // agente de reintento en segundo plano (ocr-reintento-pendientes, cada
+    // 5 min) se encarga de leer el resto solo, sin que nadie tenga que
+    // volver a intentarlo a mano.
+    `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). No hace falta completar todo a mano: con el monto alcanza para enviar la rendición igual, y la IA sigue intentando leer el resto sola en segundo plano. O reintenta ahora mismo:`
+  ));
+  // .btn-sm real (no un link de texto disfrazado de botón) -- en su propia
+  // línea, para que quede claro que es una acción y no parte de la oración.
+  statusEl.appendChild(el("div", { style: "margin-top:8px;" }, [
+    el("button", {
+      type: "button",
+      class: "btn btn-sm",
+      onclick: reintentar,
+    }, "🔄 Reintentar con IA"),
+  ]));
+}
+
+// Último filtro antes de que un monto venga de afuera (IA o cola
+// ocr_previos) y aterrice en el campo. El servidor ya normaliza
+// (normalizarMonto en _shared/gemini-ocr.ts), pero el cliente es el último
+// salto antes de contabilidad y repetía exactamente el bug que se acababa
+// de sacar allá: "Number.isFinite(Number(x))" deja pasar "15.000" como 15
+// (formato chileno leído como decimal, error de 1000x hacia abajo), y un
+// decimal como 13650.42 se renderizaba "13.650,42", que parseMoneyValue
+// -- que borra todo lo que no sea dígito -- convierte en 1.365.042 al
+// enviar, un error de 100x hacia arriba. Además, las filas de ocr_previos
+// guardadas ANTES del arreglo del servidor se aplican por acá.
+//
+// OJO con la tentación de resolverlo con Number.isInteger: Number("15.000")
+// es 15, que ES un entero positivo, así que el chequeo pasa y el error de
+// 1000x sigue vivo. Hay que mirar el FORMATO del string, no solo el número
+// que resulta. Es el mismo criterio que normalizarMonto del servidor: si el
+// formato es ambiguo (ej. "15.00": ¿centavos o miles mal escritos?) se
+// devuelve null y el campo queda vacío, que es preferible a un monto
+// equivocado que nadie revisa.
+function montoValidoCLP(valor) {
+  if (valor === null || valor === undefined) return null;
+  if (typeof valor === "number") return Number.isFinite(valor) && valor > 0 ? Math.round(valor) : null;
+  if (typeof valor !== "string") return null;
+  const s = valor.trim().replace(/^\$\s*/, "");
+  // "1.234.567" o "1.234.567,89": puntos de miles al estilo chileno.
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) return Math.round(Number(s.replace(/\./g, "").replace(",", "."))) || null;
+  if (/^\d+$/.test(s)) return Number(s) || null;
+  if (/^\d+,\d+$/.test(s)) return Math.round(Number(s.replace(",", "."))) || null;
+  return null;
+}
+
+// Aplica el resultado de la IA a los campos de un ítem "Documento
+// electrónico" -- lo usa tanto el éxito en vivo (más abajo) como la cola
+// PRE-envío (ocr_previos) cuando el agente en segundo plano lo resuelve
+// mientras el formulario sigue abierto (ver dispararAgenteYEsperar). "gen"
+// evita pisar datos más nuevos si la persona ya seleccionó otro archivo
+// mientras tanto.
+async function aplicarResultadoOcrCon(id, data, gen) {
+  if (!esGeneracionVigenteOcr(id, gen)) return {estado:"obsoleto"};
+  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}ocrBloqueado.add(id);return {estado:"requiere_separacion",mensaje:data.aviso_documento};}
+  if (!esGeneracionVigenteOcr(id, gen)) return;
+  mostrarVerificacionOcr(id, data);
+  data = protegerEdicionOcr(id, data);
+  aplicarConflictosOcr(id,data);
+  ocrExitoso.set(id, true);
+  if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
+  if (data.rut_proveedor) {
+    const rutFormateado = formatearRut(data.rut_proveedor);
+    document.getElementById(`${id}-rut`).value = rutFormateado;
+    // Si ese RUT ya está en la contabilidad, su razón social real le gana
+    // a lo que la IA haya alcanzado a leer de la imagen. Se salta cuando el
+    // nombre ya vino resuelto: los caminos que pasan por fusionarLecturas ya
+    // consultaron contabilidad (resolverDatosContables), y repetir la
+    // consulta acá no solo es una query de más, es un await de más en el que
+    // la persona puede adjuntar otro comprobante.
+    const nombreReal = data.nombre_proveedor ? null : await buscarNombreProveedorPorRut(rutFormateado);
+    // Re-chequeo OBLIGATORIO después del await, y con "return", no con un
+    // "&&" que solo cubra esta línea: mientras la consulta a contabilidad
+    // estaba en vuelo, la persona pudo adjuntar OTRO comprobante. Esa
+    // segunda corrida ya limpió y llenó los campos; si esta sigue de largo,
+    // pisa folio, fecha, descripción y MONTO con los del documento anterior
+    // y deja un ítem con datos de dos comprobantes distintos -- justo lo
+    // que la limpieza de campos venía a evitar.
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+    if (nombreReal && !camposEditadosOcr.has(`${id}-nombreprov`)) document.getElementById(`${id}-nombreprov`).value = nombreReal;
+  }
+  if (data.tipo_documento) {
+    if (TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
+      document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
+    } else {
+      // El desplegable no tiene esta opción (típico: una nota de crédito o
+      // de débito). Antes esto se descartaba en silencio y el select se
+      // quedaba con "Factura Electrónica", así que una NC entraba como
+      // factura, con monto positivo y a la cuenta por pagar -- con el signo
+      // al revés y sin que nadie se enterara. Avisar es lo mínimo.
+      toast(`El comprobante parece ser "${data.tipo_documento}", que no se puede rendir por acá. Revísalo antes de enviar.`);
+    }
+  }
+  if (data.nro_documento) document.getElementById(`${id}-folio`).value = data.nro_documento;
+  if (data.fecha) document.getElementById(`${id}-venc`).value = data.fecha;
+  if (data.descripcion) document.getElementById(`${id}-desc`).value = data.descripcion;
+  const montoIA = montoValidoCLP(data.monto);
+  if (montoIA) document.getElementById(`${id}-monto`).value = montoIA.toLocaleString("es-CL");
+  // Igual que en "Gasto directo": solo se aplica si existe tal cual en
+  // el desplegable, el campo queda visible y editable para confirmarla.
+  if (data.categoria_sugerida) {
+    const catSelect = document.getElementById(`${id}-categoriacon`);
+    if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+      catSelect.value = data.categoria_sugerida;
+    }
+  }
+  if (esGeneracionVigenteOcr(id, gen)) { recalcTotal(); chequearDuplicadoHistorico(id); }
+  return estadoLecturaFormulario(id,false,data);
+}
+
+// Dispara el agente de reintento en segundo plano AHORA MISMO (en vez de
+// esperar hasta 5 minutos al próximo tick del cron -- ver
+// ocr-reintento-pendientes) y sondea el resultado mientras el ítem siga en
+// el formulario. Si el agente termina antes de que se envíe la rendición,
+// el resultado se aplica directo a los campos vía "aplicar" (como una
+// lectura en vivo exitosa: acá todavía no se guardó ni decidió nada). Si la
+// persona ya envió la rendición o cambió de archivo antes de que termine,
+// esta fila de ocr_previos simplemente queda sin aplicar -- no rompe nada,
+// el ítem ya guardado tiene su propia cola aparte (submitRendicion).
+function dispararAgenteYEsperar(id, previaId, gen, aplicar, statusEl) {
+  if (!previaId) return;
+  notificarAsync("ocr-reintento-pendientes", {}, "No se pudo disparar el reintento inmediato de OCR:");
+
+  const INTERVALO_MS = 5000;
+  const MAX_SONDEOS = 24; // ~90s de sondeo -- pasado eso, se deja que el cron lo siga intentando solo, sin seguir consultando desde un formulario que quizás ni sigue abierto
+  let intento = 0, ultimaLectura = null;
+  const sondear = async () => {
+    intento++;
+    // Se corta en silencio (no es un error, es solo dejar de esperar) si:
+    // ya hay una llamada más nueva para este ítem, el ítem se quitó del
+    // formulario, o se acabaron los sondeos.
+    if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return;
+    const { data, error } = await db.from("ocr_previos").select("estado, resultado").eq("id", previaId).maybeSingle();
+    if (error || !data) return;
+    const huella = data.resultado ? JSON.stringify(data.resultado) : null;
+    if (data.resultado && huella !== ultimaLectura) {
+      ultimaLectura = huella;
+      const resultado = await aplicar(data.resultado, gen);
+      if (esGeneracionVigenteOcr(id, gen) && resultado?.estado !== "obsoleto") {
+        statusEl.textContent = resultado?.mensaje || "Lectura parcial: revisa los campos pendientes y su evidencia.";
+        statusEl.className = "ocr-status show " + (resultado?.estado === "completo" ? "ok" : "err");
+      }
+      if (data.estado === "listo" || data.estado === "agotado") return;
+    }
+    if (data.estado === "agotado" || intento >= MAX_SONDEOS) return;
+    setTimeout(sondear, INTERVALO_MS);
+  };
+  setTimeout(sondear, INTERVALO_MS);
+}
+
+// Al adjuntar un comprobante NUEVO hay que borrar lo que había cargado el
+// anterior: si la lectura nueva no logra sacar algún dato, ese campo se
+// quedaba con el valor del archivo viejo. Pasa de verdad cuando alguien
+// adjunta el PDF equivocado, se da cuenta y elige el correcto -- y quedaba
+// mezclando el folio/RUT/descripción de una factura con el monto de otra.
+// Son campos que describen al documento adjunto: conservar el valor de otro
+// documento nunca es lo correcto.
+// Los <select> necesitan trato aparte: ponerles value="" cuando no existe
+// una opción con ese valor los deja en selectedIndex = -1 (sin nada
+// seleccionado), y submitRendicion leería "" -- que para tipodoc significa
+// CUENTA_POR_TIPO_DOC[""] = undefined, es decir un ítem sin cuenta contable.
+// Volver al índice 0 los deja en su estado inicial de verdad.
+function limpiarCamposDeComprobante(ids) {
+  ids.forEach((campoId) => {
+    const campo = document.getElementById(campoId);
+    if (!campo) return;
+    if (campo.tagName === "SELECT") campo.selectedIndex = 0;
+    else campo.value = "";
+  });
+}
+
 async function analizarComprobante(id, file, statusEl) {
-  statusEl.textContent = "🪄 Analizando comprobante con IA...";
+  const esReintento=ocrArchivoActual.get(id)===file;
+  const gen = nuevaGeneracionOcr(id,esReintento);
+  ocrArchivoActual.set(id,file);
+  mostrarVerificacionOcr(id,{});
+  if(!esReintento)limpiarCamposDeComprobante([`${id}-nombreprov`, `${id}-rut`, `${id}-folio`, `${id}-venc`, `${id}-monto`, `${id}-desc`, `${id}-tipodoc`, `${id}-categoriacon`]);
+  statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
-    const data = await llamarOcrRecibo(file);
+    // Primero se intenta leer el PDF localmente: si es una factura
+    // electrónica con texto, sale al instante, gratis y sin gastar cuota de
+    // Gemini. Solo si eso no alcanza (foto, PDF escaneado) se llama a la IA.
+    const datosLocales = await leerPdfLocal(file);
+    // Freno duro para notas de crédito/débito, ANTES de tocar ningún campo.
+    // Una NC rebaja el pasivo con el proveedor; rendirla como si fuera una
+    // factura lo AUMENTA por el mismo monto, y el error viaja hasta el
+    // asiento contable. El desplegable de tipo de documento no tiene esa
+    // opción, así que no hay forma de cargarla bien por acá. El aviso va en
+    // statusEl y no en un toast a propósito: el toast se desvanece y esto
+    // tiene que quedar a la vista mientras la persona decide qué hacer.
+    if (datosLocales && /^Nota de (Cr[eé]dito|D[eé]bito)$/i.test(datosLocales.tipo_documento || "")) {
+      statusEl.textContent = `⛔ Este documento es una ${datosLocales.tipo_documento}, no una factura o boleta: no se puede rendir por acá porque rebaja lo que se le debe al proveedor en vez de sumarlo. Envíalo a contabilidad directamente y quita este ítem.`;
+      statusEl.className = "ocr-status show err";
+      return;
+    }
+    if (datosLocales) {
+      // El folio, cuando no se pudo leer del texto, suele venir en el nombre
+      // del archivo.
+      if (!datosLocales.nro_documento) datosLocales.nro_documento = folioDesdeNombreArchivo(file.name);
+      // Categoría, descripción y razón social no salen del PDF: salen de la
+      // CONTABILIDAD (con qué cuenta de gasto se registró antes a este
+      // proveedor: años de asientos reales) y del historial de la propia
+      // app. Es información que no cuesta ni una solicitud de Gemini.
+      const contable = await resolverDatosContables(datosLocales.rut_proveedor, datosLocales.nombre_proveedor);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
 
-    if (data.nombre_proveedor) document.getElementById(`${id}-nombreprov`).value = data.nombre_proveedor;
-    if (data.rut_proveedor) {
-      const rutFormateado = formatearRut(data.rut_proveedor);
-      document.getElementById(`${id}-rut`).value = rutFormateado;
-      // Si ese RUT ya está en la contabilidad, su razón social real le gana
-      // a lo que la IA haya alcanzado a leer de la imagen.
-      const nombreReal = await buscarNombreProveedorPorRut(rutFormateado);
-      if (nombreReal) document.getElementById(`${id}-nombreprov`).value = nombreReal;
-    }
-    if (data.tipo_documento && TIPOS_DOCUMENTO.includes(data.tipo_documento)) {
-      document.getElementById(`${id}-tipodoc`).value = data.tipo_documento;
-    }
-    if (data.nro_documento) document.getElementById(`${id}-folio`).value = data.nro_documento;
-    if (data.fecha) document.getElementById(`${id}-venc`).value = data.fecha;
-    if (data.descripcion) document.getElementById(`${id}-desc`).value = data.descripcion;
-    if (data.monto) {
-      const montoInput = document.getElementById(`${id}-monto`);
-      montoInput.value = Number(data.monto).toLocaleString("es-CL");
-    }
-    // Igual que en "Gasto directo": solo se aplica si existe tal cual en
-    // el desplegable, el campo queda visible y editable para confirmarla.
-    if (data.categoria_sugerida) {
-      const catSelect = document.getElementById(`${id}-categoriacon`);
-      if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
-        catSelect.value = data.categoria_sugerida;
+      const { datos } = fusionarLecturas(datosLocales, null, contable);
+      registrarOrigenOcr(id, "local", datos);
+      const revisionLocal=await aplicarResultadoOcrCon(id, datos, gen);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
+      // Se dice explícitamente si el monto quedó CONFIRMADO por la
+      // aritmética del documento: sirve para dirigir la revisión al dato que
+      // de verdad la necesita, en vez de pedir que se revise todo por igual.
+      const montoOk = datos.monto_verificado ? " Monto confirmado (neto + IVA cuadran con el total)." : "";
+      // También de dónde salió la categoría: si viene de contabilidad,
+      // conviene decirlo -- es un dato más fuerte que el historial de la app
+      // y ayuda a que la persona decida si confiar en él o cambiarlo.
+      let textoBase;
+      if (contable.desdeContabilidad) {
+        textoBase = `✔ Datos leídos del PDF.${montoOk} Categoría sugerida: "${contable.categoria}", que es la cuenta con la que contabilidad registró antes a este proveedor. Revísalo antes de enviar.`;
+      } else if (contable.categoria || contable.descripcion) {
+        textoBase = `✔ Datos leídos del PDF, más categoría y descripción según cómo cargaste antes a este proveedor.${montoOk} Revísalos antes de enviar.`;
+      } else {
+        textoBase = `✔ Datos leídos del PDF de la factura.${montoOk} Revísalos antes de enviar.`;
       }
-    }
-    recalcTotal();
+      statusEl.textContent = textoBase+" "+(revisionLocal?.mensaje || "");
+      statusEl.className = "ocr-status show " + (revisionLocal?.estado === "completo" ? "ok" : "err");
 
-    statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
-    statusEl.className = "ocr-status show ok";
+      // Acá está el ahorro: la IA se llama SOLO si después de lo local y de
+      // contabilidad todavía quedaron huecos (o el monto no lo confirmó la
+      // aritmética). Cuando la factura se leyó completa, son cero llamadas.
+      // No se espera el resultado a propósito: los campos ya están en
+      // pantalla y la IA completa después, sin que nadie mire un spinner.
+      if (valeLaPenaLlamarIA(camposAPedirOcr(datos, CAMPOS_OCR_CON))) {
+        completarConIA({ id, file, gen, statusEl, local: datosLocales, contable, datos,
+          campos: CAMPOS_OCR_CON, aplicar: aplicarResultadoOcrCon, textoBase });
+      }
+      return;
+    }
+
+    // Sin lectura local (foto, PDF escaneado o protegido): la IA es la única
+    // fuente. Igual pasa por la MISMA fusión, para que exista un solo camino
+    // por el que los datos llegan a los campos -- antes eran dos, y lo que se
+    // arreglaba en uno seguía roto en el otro.
+    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_CON, {}, "ConDocumento");
+    if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
+    const contableIA = await resolverDatosContables(ia?.rut_proveedor, ia?.nombre_proveedor);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+    const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
+    registrarOrigenOcr(id, "ia", datosIA);
+    const revision = await aplicarResultadoOcrCon(id, datosIA, gen);
+    if(ia.previaId)dispararAgenteYEsperar(id,ia.previaId,gen,(data,g)=>aplicarResultadoOcrCon(id,data,g),statusEl);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+
+    statusEl.textContent = revision?.mensaje || "Revisa los campos pendientes.";
+    statusEl.className = "ocr-status show " + (revision?.estado === "completo" ? "ok" : "err");
   } catch (err) {
+    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {ocrBloqueado.add(id);statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
+    if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
+
+    // Último recurso para las FOTOS: hasta acá, una foto con Gemini caído o
+    // sin cuota no dejaba absolutamente nada y la persona tenía que tipear
+    // todo. El OCR local es peor que la IA, pero entre algo verificado y
+    // nada, gana algo. Solo se aplica si pasó los controles de
+    // leerFotoLocal (RUT con dígito verificador válido, o monto que cuadra
+    // con neto + IVA).
+    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrCon, CAMPOS_OCR_CON)) {
+      dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrCon(id, data, g), statusEl);
+      return;
+    }
+
     // Antes se mostraba siempre el mismo mensaje genérico, así que un PDF
     // que fallaba por una razón concreta y diagnosticable (ver ocr-recibo)
     // se veía exactamente igual que cualquier otro problema.
-    statusEl.textContent = `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano.`;
-    statusEl.className = "ocr-status show err";
+    mostrarErrorOcr(statusEl, err, () => analizarComprobante(id, file, statusEl));
+    dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrCon(id, data, g), statusEl);
   }
+}
+
+// Intenta rescatar una foto leyéndola en el navegador cuando la IA ya falló.
+// Devuelve true si logró llenar algo (y entonces el llamador no muestra el
+// error), false si no hubo nada rescatable y hay que seguir con el camino
+// de error de siempre.
+async function leerEscaneadoLocal(file){
+  if((file.type || "").startsWith("image/"))return leerFotoLocal(file);
+  if(file.type!=="application/pdf")return null;
+  let pdf;
+  try{
+    const pdfjs=await cargarPdfJs();
+    pdf=await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
+    if(pdf.numPages!==1)return null;
+    const pagina=await pdf.getPage(1),base=pagina.getViewport({scale:1});
+    const escala=Math.min(2.5,LADO_MAXIMO_OCR/Math.max(base.width,base.height));
+    const viewport=pagina.getViewport({scale:escala});
+    const canvas=document.createElement("canvas");canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
+    await pagina.render({canvasContext:canvas.getContext("2d"),viewport,background:"rgb(255,255,255)"}).promise;
+    const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
+    return blob?await leerFotoLocal(new File([blob],"comprobante.png",{type:"image/png"})):null;
+  }catch(error){console.error("El respaldo local no pudo leer el PDF:",error);return null;}
+  finally{if(pdf)await pdf.destroy();}
+}
+
+async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
+  if (!(file.type || "").startsWith("image/") && file.type!=="application/pdf") return false;
+  statusEl.textContent = "La IA no está disponible. El bot está escaneando el comprobante en este navegador...";
+  statusEl.className = "ocr-status show";
+  const local = await leerEscaneadoLocal(file);
+  if (!esGeneracionVigenteOcr(id, gen) || !document.body.contains(statusEl)) return true;
+  if (!local) return false;
+
+  const contable = await resolverDatosContables(local.rut_proveedor, local.nombre_proveedor);
+  if (!esGeneracionVigenteOcr(id, gen)) return true;
+  const { datos } = fusionarLecturas(local, null, contable);
+  registrarOrigenOcr(id, "local", datos);
+  await aplicar(id, datos, gen);
+  if (!esGeneracionVigenteOcr(id, gen)) return true;
+
+  // El mensaje dice explícitamente que esto NO lo leyó la IA y qué hay que
+  // mirar. Una lectura de foto hecha acá es bastante menos confiable que la
+  // de un PDF, y presentarla con el mismo "✔ Datos leídos" de siempre sería
+  // esconder esa diferencia justo donde importa.
+  // camposFaltantesOcr y no camposAPedirOcr: son preguntas distintas. A la
+  // IA se le pide también el monto cuando está lleno pero sin confirmar,
+  // para contrastarlo; a la PERSONA hay que nombrarle solo lo que quedó
+  // vacío de verdad. Con el otro, el aviso del comprobante de transferencia
+  // decía "completa a mano: ... monto" con el monto correcto ya en el campo.
+  const faltan = camposFaltantesOcr(datos, campos).map((c) => ETIQUETA_CAMPO_OCR[c] || c);
+  // El folio y el RUT se nombran aparte, y no por cortesía: medidos contra
+  // 188 comprobantes reales, leyendo de una foto el folio sale mal 1 de
+  // cada 3 veces y el RUT 1 de cada 10, casi siempre por un solo dígito.
+  // Son errores que no se notan de reojo justamente porque el número se ve
+  // bien formado, así que hay que pedir que se contrasten contra el papel.
+  // Los campos que se llenaron con lectura débil se nombran uno por uno.
+  // Todos vienen completos, así que lo único que separa a la persona de un
+  // dato equivocado es que sepa CUÁL mirar: "revisa todo" no funciona, se
+  // lee como una fórmula. El RUT va siempre en la lista porque, aunque lo
+  // valide su dígito verificador, medido sale mal 1 de cada 10 veces.
+  const dudosos = [
+    ...(datos.confianza_baja || []).map((c) => ETIQUETA_CAMPO_OCR[c] || c),
+    datos.rut_proveedor && "RUT",
+  ].filter(Boolean);
+  // El monto se nombra aparte del resto de los faltantes: es obligatorio, y
+  // cuando queda vacío no es que "no se pudo leer" sino que se leyó algo
+  // que no era lo bastante confiable como para ponerlo. Decirlo así evita
+  // que la persona crea que el lector no vio nada y busque el problema.
+  const faltaMonto = !datos.monto;
+  const otrosFaltantes = faltan.filter((f) => f !== ETIQUETA_CAMPO_OCR.monto);
+  statusEl.textContent = `El bot recuperó datos con el escáner local. Compara los campos con el comprobante.`
+    + (datos.monto_verificado ? " El monto sí quedó confirmado contra el propio documento." : "")
+    + (faltaMonto ? " El monto necesita confirmación: no se encontró evidencia suficiente. Escríbelo mirando el comprobante." : "")
+    + (otrosFaltantes.length ? ` Completa a mano: ${otrosFaltantes.join(", ")}.` : "")
+    + (dudosos.length
+      ? ` Revisa: ${[...new Set(dudosos)].join(", ")}.`
+      : "");
+  statusEl.className = "ocr-status show";
+  return true;
 }
 
 // Misma IA que en "Con documento", pero para "Gasto directo" (boletas
@@ -2426,41 +4331,131 @@ async function mostrarHistorialProveedor(id, nombreProveedor) {
   hint.className = "ocr-status show";
 }
 
+// Par de aplicarResultadoOcrCon, para "Boleta" (Gasto directo) -- ver el
+// comentario de aquella.
+async function aplicarResultadoOcrSin(id, data, gen) {
+  if (!esGeneracionVigenteOcr(id, gen)) return {estado:"obsoleto"};
+  if (data.requiere_separacion) {const estado=document.querySelector(`#${id} .ocr-status`);if(estado){estado.textContent=data.aviso_documento;estado.className="ocr-status show err";}ocrBloqueado.add(id);return {estado:"requiere_separacion",mensaje:data.aviso_documento};}
+  if (!esGeneracionVigenteOcr(id, gen)) return;
+  mostrarVerificacionOcr(id, data);
+  data = protegerEdicionOcr(id, data);
+  aplicarConflictosOcr(id,data);
+  ocrExitoso.set(id, true);
+  if (data.nombre_proveedor) {
+    document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
+    mostrarHistorialProveedor(id, data.nombre_proveedor);
+  }
+  if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
+  const montoIA2 = montoValidoCLP(data.monto);
+  if (montoIA2) document.getElementById(`${id}-monto2`).value = montoIA2.toLocaleString("es-CL");
+  // Datos del documento, informativos. A diferencia de "Documento
+  // electrónico", acá el tipo es texto libre: por esta pestaña entra
+  // cualquier cosa (boleta, voucher, comprobante de transferencia, recibo)
+  // y encajonarlo en una lista cerrada obligaría a descartar lo que no
+  // calce, que es justo lo que hacía que no se leyera nada de ellos.
+  if (data.tipo_documento) document.getElementById(`${id}-tipodoc2`).value = data.tipo_documento;
+  if (data.nro_documento) document.getElementById(`${id}-folio2`).value = data.nro_documento;
+  if (data.rut_proveedor) document.getElementById(`${id}-rut2`).value = formatearRut(data.rut_proveedor);
+  if (data.fecha) document.getElementById(`${id}-fecha2`).value = data.fecha;
+  // La categoría sugerida solo se aplica si existe tal cual en el
+  // desplegable (puede estar filtrado por las cuentas permitidas del
+  // usuario) -- el campo queda igual visible y editable para que la
+  // persona la confirme o la cambie, nunca se oculta.
+  if (data.categoria_sugerida) {
+    const catSelect = document.getElementById(`${id}-categoria`);
+    if (catSelect && [...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
+      catSelect.value = data.categoria_sugerida;
+      catSelect.dispatchEvent(new Event("change"));
+    }
+  }
+  if (esGeneracionVigenteOcr(id, gen)) { recalcTotal(); chequearDuplicadoHistorico(id); }
+  return estadoLecturaFormulario(id,true,data);
+}
+
 async function analizarComprobanteGastoDirecto(id, file, statusEl) {
-  statusEl.textContent = "🪄 Analizando comprobante con IA...";
+  const esReintento=ocrArchivoActual.get(id)===file;
+  const gen = nuevaGeneracionOcr(id,esReintento);
+  ocrArchivoActual.set(id,file);
+  mostrarVerificacionOcr(id,{});
+  if(!esReintento)limpiarCamposDeComprobante([`${id}-nombreprov2`, `${id}-desc2`, `${id}-monto2`, `${id}-categoria`, `${id}-cuenta`, `${id}-tipodoc2`, `${id}-folio2`, `${id}-rut2`, `${id}-fecha2`]);
+  statusEl.textContent = "🪄 Analizando comprobante...";
   statusEl.className = "ocr-status show";
   try {
-    const data = await llamarOcrRecibo(file);
+    // Igual que en "Documento electrónico": si es un PDF con texto, se lee
+    // local (gratis, al instante, sin gastar cuota de Gemini). Este
+    // formulario no tiene campos de RUT/folio/tipo, pero el RUT leído
+    // igual sirve para resolver proveedor, categoría y descripción.
+    const datosLocales = await leerPdfLocal(file);
+    if (datosLocales) {
+      const contable = await resolverDatosContables(datosLocales.rut_proveedor, datosLocales.nombre_proveedor);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
+      const { datos } = fusionarLecturas(datosLocales, null, contable);
+      registrarOrigenOcr(id, "local", datos);
+      const revisionLocal=await aplicarResultadoOcrSin(id, datos, gen);
+      if (!esGeneracionVigenteOcr(id, gen)) return;
 
-    if (data.nombre_proveedor) {
-      document.getElementById(`${id}-nombreprov2`).value = data.nombre_proveedor;
-      mostrarHistorialProveedor(id, data.nombre_proveedor);
-    }
-    if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
-    if (data.monto) {
-      const montoInput = document.getElementById(`${id}-monto2`);
-      montoInput.value = Number(data.monto).toLocaleString("es-CL");
-    }
-    // La categoría sugerida solo se aplica si existe tal cual en el
-    // desplegable (puede estar filtrado por las cuentas permitidas del
-    // usuario) -- el campo queda igual visible y editable para que la
-    // persona la confirme o la cambie, nunca se oculta.
-    if (data.categoria_sugerida) {
-      const catSelect = document.getElementById(`${id}-categoria`);
-      if ([...catSelect.options].some((o) => o.value === data.categoria_sugerida)) {
-        catSelect.value = data.categoria_sugerida;
-        catSelect.dispatchEvent(new Event("change"));
+      // Si el PDF resultó ser una factura/boleta de honorarios, lo más
+      // probable es que corresponda la otra pestaña: esos documentos se
+      // contabilizan distinto (ver CUENTA_POR_TIPO_DOC y la exportación a
+      // Kame), así que conviene avisar antes de que se envíe mal.
+      const esDocumentoTributario = datos.tipo_documento && /Factura|Honorario/i.test(datos.tipo_documento);
+      const textoBase = esDocumentoTributario
+        ? `✔ Datos leídos del PDF. Ojo: parece ser un(a) ${datos.tipo_documento}, que normalmente va en la pestaña "Documento electrónico". Revísalo antes de enviar.`
+        : "✔ Datos leídos del PDF. Revísalos antes de enviar.";
+      statusEl.textContent = textoBase+" "+(revisionLocal?.mensaje || "");
+      statusEl.className = "ocr-status show " + (revisionLocal?.estado === "completo" ? "ok" : "err");
+
+      // Se pide a la IA solo lo que ESTE formulario puede mostrar: pedirle
+      // folio o tipo de documento acá sería gastar cuota en campos que no
+      // existen en pantalla.
+      if (valeLaPenaLlamarIA(camposAPedirOcr(datos, CAMPOS_OCR_SIN))) {
+        completarConIA({ id, file, gen, statusEl, local: datosLocales, contable, datos,
+          campos: CAMPOS_OCR_SIN, aplicar: aplicarResultadoOcrSin, textoBase });
       }
+      return;
     }
-    recalcTotal();
 
-    statusEl.textContent = "✔ Datos completados con IA. Revísalos antes de enviar.";
-    statusEl.className = "ocr-status show ok";
+    const ia = await llamarOcrRecibo(file, CAMPOS_OCR_SIN, {}, "SinDocumento");
+    if (!esGeneracionVigenteOcr(id, gen)) return; // ya hay una llamada más nueva para este ítem en curso
+    const contableIA = await resolverDatosContables(ia?.rut_proveedor, ia?.nombre_proveedor);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+    const { datos: datosIA } = fusionarLecturas(null, ia, contableIA);
+    registrarOrigenOcr(id, "ia", datosIA);
+    const revision = await aplicarResultadoOcrSin(id, datosIA, gen);
+    if(ia.previaId)dispararAgenteYEsperar(id,ia.previaId,gen,(data,g)=>aplicarResultadoOcrSin(id,data,g),statusEl);
+    if (!esGeneracionVigenteOcr(id, gen)) return;
+
+    statusEl.textContent = revision?.mensaje || "Revisa los campos pendientes.";
+    statusEl.className = "ocr-status show " + (revision?.estado === "completo" ? "ok" : "err");
   } catch (err) {
+    if (err.noReintentar) {if (esGeneracionVigenteOcr(id,gen)) {ocrBloqueado.add(id);statusEl.textContent=err.message;statusEl.className="ocr-status show err";} return;}
+    if (!esGeneracionVigenteOcr(id, gen)) return; // idem: una llamada más nueva ya se hizo cargo de este ítem
     console.error("Error en OCR:", err);
-    statusEl.textContent = `No se pudo leer el comprobante automáticamente (${err.message || "error desconocido"}). Completa los datos a mano.`;
-    statusEl.className = "ocr-status show err";
+    // Mismo respaldo que en "Documento electrónico": una foto sin IA
+    // disponible se lee acá antes de darse por vencido.
+    if (await aplicarRespaldoFoto(id, file, gen, statusEl, aplicarResultadoOcrSin, CAMPOS_OCR_SIN)) {
+      dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrSin(id, data, g), statusEl);
+      return;
+    }
+    mostrarErrorOcr(statusEl, err, () => analizarComprobanteGastoDirecto(id, file, statusEl));
+    dispararAgenteYEsperar(id, err.previaId, gen, (data, g) => aplicarResultadoOcrSin(id, data, g), statusEl);
   }
+}
+
+// Pone en "Cuenta contable" la cuenta de gasto que corresponde a la
+// categoría elegida. Se llama tanto cuando la persona cambia el desplegable
+// como cuando lo completa el OCR: asignar select.value por código NO dispara
+// el evento "change", así que sin la llamada explícita una categoría
+// sugerida por la IA dejaba la cuenta vacía.
+function sincronizarCuentaDesdeCategoria(id) {
+  const categoria = document.getElementById(`${id}-categoria`)?.value;
+  const campoCuenta = document.getElementById(`${id}-cuenta`);
+  if (!campoCuenta) return;
+  const match = CATEGORIAS_GASTO.find((c) => c.nombre === categoria);
+  // Si se vuelve a "— elegir —" se limpia: dejar la cuenta de la categoría
+  // anterior sería peor que dejarla vacía, porque ya no se corresponde con
+  // nada de lo que hay en pantalla.
+  campoCuenta.value = match ? match.cuenta : "";
 }
 
 function buildSinDocumentoFields(id) {
@@ -2473,6 +4468,13 @@ function buildSinDocumentoFields(id) {
     fieldSelectCategoria(`${id}-categoria`),
     fieldInput(`${id}-cuenta`, "Cuenta contable", "text", "4.01.03.xx"),
   ]);
+  // La cuenta sale de la categoría, siempre: CATEGORIAS_GASTO ya trae el par
+  // ("Electricidad" -> 4.01.03.06). Aun así este campo era texto libre y
+  // había que tipear el código a mano, teniendo la app el dato exacto -- una
+  // invitación a equivocarse en un número que después tiene que calzar en la
+  // exportación a Kame. Queda editable igual, para el caso raro que no
+  // corresponda a la categoría elegida.
+  row1.querySelector("select").addEventListener("change", () => sincronizarCuentaDesdeCategoria(id));
   // Aviso informativo (no una regla automática): un mismo proveedor puede
   // ser para cosas distintas cada vez (ej. una ferretería: a veces
   // materiales, a veces mantención), así que en vez de forzar la
@@ -2494,6 +4496,26 @@ function buildSinDocumentoFields(id) {
   const row3 = el("div", { class: "field-row" }, [
     fieldInput(`${id}-desc2`, "Descripción", "text"),
   ]);
+  // Datos del documento, TODOS opcionales y puramente informativos: sirven
+  // para que quien aprueba pueda contrastar el ítem contra el comprobante
+  // adjunto sin abrirlo, y el RUT además destraba la sugerencia de categoría
+  // desde el historial contable, que hasta ahora solo funcionaba para
+  // facturas porque esta pestaña no capturaba ningún RUT.
+  //
+  // Lo que NO cambian es la contabilidad: una boleta, un comprobante de
+  // transferencia o un voucher siguen yendo DIRECTO A LA CUENTA DE GASTO
+  // (4.01.03.xx, el campo "Cuenta contable" de más arriba). No generan
+  // cuenta por pagar ni ficha de proveedor, que es lo que distingue a esta
+  // pestaña de "Documento electrónico" (ver CUENTA_POR_TIPO_DOC). Tener el
+  // RUT acá no convierte al comprobante en un documento tributario.
+  const row4 = el("div", { class: "field-row" }, [
+    fieldInput(`${id}-tipodoc2`, "Tipo de documento (opcional)", "text"),
+    fieldInput(`${id}-folio2`, "N° de documento (opcional)", "text"),
+  ]);
+  const row5 = el("div", { class: "field-row" }, [
+    fieldInput(`${id}-rut2`, "RUT del proveedor (opcional)", "text"),
+    fieldInput(`${id}-fecha2`, "Fecha del documento (opcional)", "date"),
+  ]);
   const foto = fieldFile(`${id}-foto2`, "Comprobante (foto o PDF)");
   const ocrStatus = el("p", { class: "ocr-status", id: `${id}-ocr-status2` });
   foto.appendChild(ocrStatus);
@@ -2503,13 +4525,15 @@ function buildSinDocumentoFields(id) {
   box.appendChild(historialHint);
   box.appendChild(row2);
   box.appendChild(row3);
+  box.appendChild(row4);
+  box.appendChild(row5);
   box.appendChild(foto);
 
   const fotoInput2 = foto.querySelector("input[type=file]");
   fotoInput2.addEventListener("change", async () => {
     if (!validarTamanoArchivo(fotoInput2)) return;
-    await reemplazarConVersionComprimida(fotoInput2);
-    if (fotoInput2.files && fotoInput2.files[0]) analizarComprobanteGastoDirecto(id, fotoInput2.files[0], ocrStatus);
+    nuevaGeneracionOcr(id);
+    await prepararArchivoParaLectura(fotoInput2,ocrStatus,file => analizarComprobanteGastoDirecto(id,file,ocrStatus));
   });
 
   const catSelect = row1.querySelector("select");
@@ -2571,15 +4595,18 @@ async function comprimirImagenSiCorresponde(file) {
   if (!file.type || !file.type.startsWith("image/") || file.type === "image/svg+xml") return file;
   try {
     const bitmap = await createImageBitmap(file);
-    const LADO_MAXIMO = 1600;
+    const LADO_MAXIMO = 2600;
     const escala = Math.min(1, LADO_MAXIMO / Math.max(bitmap.width, bitmap.height));
     const w = Math.round(bitmap.width * escala);
     const h = Math.round(bitmap.height * escala);
     const canvas = document.createElement("canvas");
     canvas.width = w;
     canvas.height = h;
-    canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.75));
+    const contexto = canvas.getContext("2d");
+    contexto.fillStyle = "#fff"; contexto.fillRect(0,0,w,h);
+    contexto.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.94));
     if (!blob || blob.size >= file.size) return file; // no vale la pena si no achica
     return new File([blob], file.name.replace(/\.\w+$/, "") + ".jpg", { type: "image/jpeg" });
   } catch (err) {
@@ -2592,10 +4619,38 @@ async function comprimirImagenSiCorresponde(file) {
 // que tanto el OCR como submitRendicion() (que lee fotoInput.files[0] más
 // tarde) usen la misma versión liviana. DataTransfer es la única forma
 // estándar de reescribir la FileList de un input desde JS.
+function evaluarCalidadFoto(ancho,alto,contraste) {
+  const avisos=[];
+  if(Math.min(ancho,alto)<600) avisos.push("La resolución es baja: usa una foto más cercana, con el documento completo.");
+  if(contraste<12) avisos.push("La imagen tiene muy poco contraste: mejora la luz y comprueba que se lean los números.");
+  return avisos;
+}
+async function mostrarCalidadFoto(input,file) {
+  input.parentElement.querySelector(".calidad-foto")?.remove();
+  if(!file.type?.startsWith("image/")) return;
+  let bitmap;
+  try {
+    bitmap=await createImageBitmap(file);
+    const canvas=document.createElement("canvas"),escala=Math.min(1,256/Math.max(bitmap.width,bitmap.height));
+    canvas.width=Math.max(1,Math.round(bitmap.width*escala));canvas.height=Math.max(1,Math.round(bitmap.height*escala));
+    const contexto=canvas.getContext("2d");contexto.fillStyle="#fff";contexto.fillRect(0,0,canvas.width,canvas.height);contexto.drawImage(bitmap,0,0,canvas.width,canvas.height);
+    const rgba=contexto.getImageData(0,0,canvas.width,canvas.height).data;let suma=0,cuadrados=0;
+    for(let i=0;i<rgba.length;i+=4){const gris=0.299*rgba[i]+0.587*rgba[i+1]+0.114*rgba[i+2];suma+=gris;cuadrados+=gris*gris;}
+    const n=rgba.length/4,contraste=Math.sqrt(Math.max(0,cuadrados/n-(suma/n)**2));
+    const avisos=evaluarCalidadFoto(bitmap.width,bitmap.height,contraste);
+    if(input.files?.[0]!==file)return;
+    input.parentElement.querySelector(".calidad-foto")?.remove();
+    if(avisos.length)input.parentElement.appendChild(el("p",{class:"calidad-foto ocr-status show err"},avisos.join(" ")+" Evita sombras y reflejos; vuelve a adjuntar una foto mejor si el texto no es legible."));
+  } catch(error){console.warn("No se pudo revisar la calidad de la foto",error);}
+  finally {bitmap?.close();}
+}
+
 async function reemplazarConVersionComprimida(input) {
   const original = input.files && input.files[0];
   if (!original) return;
+  await mostrarCalidadFoto(input,original);
   const comprimido = await comprimirImagenSiCorresponde(original);
+  if (input.files?.[0] !== original) return;
   if (comprimido === original) return;
   const dt = new DataTransfer();
   dt.items.add(comprimido);
@@ -2632,7 +4687,16 @@ function fieldSelectCategoria(id) {
     ? CATEGORIAS_GASTO.filter((c) => cuentasPermitidas.has(c.cuenta))
     : CATEGORIAS_GASTO;
   const opciones = filtradas.length ? filtradas : CATEGORIAS_GASTO;
-  const select = el("select", { id }, opciones.map((c) => el("option", { value: c.nombre }, c.nombre)));
+  // Primera opción en blanco, a propósito. Sin ella el desplegable arranca
+  // preseleccionado en la primera categoría de la lista y submitRendicion la
+  // guarda tal cual, así que todo ítem que nadie tocó se iba con esa
+  // categoría. Peor: buscarDatosPreviosPorRut cuenta esas filas para sugerir
+  // "la categoría más usada" del proveedor, con lo cual la sugerencia
+  // terminaba convergiendo al valor por defecto y confirmándose sola.
+  const select = el("select", { id }, [
+    el("option", { value: "" }, "— elegir —"),
+    ...opciones.map((c) => el("option", { value: c.nombre }, c.nombre)),
+  ]);
   return el("div", { class: "field" }, [el("label", { for: id }, "Categoría del gasto"), select]);
 }
 
@@ -2646,6 +4710,7 @@ const MOVIMIENTOS_COLS = {
   concepto: "concepto",
   comprobante: "comprobante",
   empresa: "empresa",
+  rutEmpresa: "rut",
 };
 
 // Busca el nombre del proveedor en la contabilidad (solo lectura, en vivo,
@@ -2670,7 +4735,47 @@ async function buscarNombreProveedorPorRut(rut) {
 
 // Verificación contra contabilidad: la hace quien aprueba, desde la pantalla de detalle
 // (ver openDetalle). Actualiza el ítem en la base para dejar registrada la cuenta real.
-async function verificarDocumentoItem(item, box, empresaRendicion) {
+function compararMontoContable(item, movimientos) {
+  const cuentaProveedor = CUENTA_POR_TIPO_DOC[item.tipo_documento];
+  const lineas = movimientos.filter(m => m.cuenta_cod === cuentaProveedor);
+  const grupos = new Map();
+  for (const m of lineas) {
+    if (m.debe == null || m.haber == null || !Number.isFinite(Number(m.debe)) || !Number.isFinite(Number(m.haber))) return {estado:"sin_monto"};
+    const clave = m.comprobante || "fila:"+m.id;
+    grupos.set(clave,(grupos.get(clave)||0)+Number(m.haber)-Number(m.debe));
+  }
+  // Solo cuentan los comprobantes que dejan saldo ACREEDOR, es decir los que
+  // registran la factura. Un asiento posterior que la cancela -- el pago, o
+  // la propia rendición -- deja saldo deudor y no dice nada sobre cuánto
+  // valía el documento.
+  //
+  // Antes se tomaban todos los comprobantes por igual y bastaba que hubiera
+  // dos para devolver "ambiguo". Eso no es un caso raro: es el estado normal
+  // de toda factura ya rendida. La #80559421 tiene el comprobante 859 con la
+  // factura (haber 13.980) y el 866 con "RENDICION N° 23" cancelándola (debe
+  // 13.980), así que la verificación fallaba justo en las que completaron el
+  // proceso. Descartando los deudores queda un único origen y el monto se
+  // puede confirmar.
+  //
+  // Se conserva la detección de ambigüedad donde sí importa: si DOS
+  // comprobantes distintos abonan el mismo documento, está contabilizado dos
+  // veces y eso hay que mirarlo a mano.
+  const acreedores = [...grupos.values()].filter((saldo) => saldo > 0);
+  if (!acreedores.length) return {estado:"sin_monto"};
+  if (acreedores.length !== 1) return {estado:"ambiguo",cantidad:acreedores.length};
+  const contable = acreedores[0];
+  const rendido = Number(item.monto);
+  if (!Number.isFinite(rendido) || !Number.isInteger(contable) || contable <= 0) return {estado:"sin_monto"};
+  return {estado:contable===rendido ? "coincide" : "diferente",contable,rendido,diferencia:rendido-contable};
+}
+
+function detalleMontoVerificado(v) {
+  return v.miembros?.length > 1
+    ? "Total documento revisado: " + fmtCLP(v.monto_documento_rendido) + " en " + v.miembros.length + " gastos · Este gasto: " + fmtCLP(v.monto_rendido)
+    : "Monto revisado: " + fmtCLP(v.monto_rendido);
+}
+
+async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicion = [item]) {
   box.className = "verify-box show";
   box.textContent = "Consultando...";
 
@@ -2685,23 +4790,37 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     // El folio NO alcanza por sí solo: cada proveedor lleva su propia
     // numeración, así que dos proveedores distintos pueden compartir el
     // mismo número de folio. Para estar 100% seguros de que es EL documento
-    // correcto exigimos las tres cosas juntas: Empresa + RUT proveedor +
+    // correcto exigimos las tres cosas juntas: RUT empresa + RUT proveedor +
     // Folio. Además "documento" guarda el texto completo del documento
     // (ej. "Factura Electrónica #115277"), así que anclamos el folio al
     // final del texto, justo después de un "#", para no confundir folios
     // que son substring de otros (ej. "277" no debe matchear "#115277").
-    let query = dbContabilidad
-      .from("movimientos")
-      .select("*")
-      .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor)
-      .ilike(MOVIMIENTOS_COLS.folioDoc, `%#${item.nro_documento}`);
-    if (empresaRendicion) query = query.ilike(MOVIMIENTOS_COLS.empresa, empresaRendicion);
-    const { data, error } = await query.limit(1);
-    if (error) throw error;
+    const rutEmpresa = RUT_POR_EMPRESA[empresaRendicion];
+    if (!rutEmpresa) throw new Error("Falta identificar el RUT de la empresa de la rendición");
+    // El nombre comercial puede diferir de la razón social: NEO SPA y
+    // Neo Gym Chile SpA tienen el mismo RUT. No ampliar a otras empresas.
+    const consultar = async (rut) => {
+      let query = dbContabilidad.from("movimientos").select("*",{count:"exact"})
+        .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor)
+        .ilike(MOVIMIENTOS_COLS.folioDoc, `%#${item.nro_documento}`);
+      if (rut) query = query.eq(MOVIMIENTOS_COLS.rutEmpresa, rut);
+      const {data,error,count} = await query.limit(500);
+      if (error) throw error;
+      if (count != null && count > (data || []).length) throw new Error("Resultado contable incompleto");
+      return data || [];
+    };
+    const data = await consultar(rutEmpresa);
+    // Conservar el diagnóstico de documentos registrados en otra empresa,
+    // sin usar esos asientos para validar el monto de esta rendición.
+    const otrasEmpresas = !data.length ? [...new Set((await consultar(null)).map(m => m.empresa || "Empresa sin nombre"))] : [];
 
     const match = data && data[0];
-    const cuenta = (match && match[MOVIMIENTOS_COLS.cuentaCod]) || CUENTA_POR_TIPO_DOC[item.tipo_documento];
-    const comprobante = (match && match[MOVIMIENTOS_COLS.comprobante]) || null;
+    const grupo = window.RindeCore.grupoDocumentoContable(item,itemsRendicion);
+    const comparacionMonto = match ? compararMontoContable({...item,monto:grupo.monto},data) : null;
+    const lineaProveedor = data?.find(m => m.cuenta_cod === CUENTA_POR_TIPO_DOC[item.tipo_documento]);
+    const cuenta = CUENTA_POR_TIPO_DOC[item.tipo_documento];
+    const nombreCuentaVerificada = lineaProveedor?.[MOVIMIENTOS_COLS.cuentaNom] || nombreCuenta(cuenta) || "Nombre no disponible";
+    const comprobante = lineaProveedor?.[MOVIMIENTOS_COLS.comprobante] || null;
 
     // Escribir primero, mostrar el resultado recién si de verdad quedó
     // guardado -- antes se pintaba el ✔ aunque el update no hubiera tocado
@@ -2711,6 +4830,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
       existe_en_contabilidad: !!match,
       cuenta_contable: cuenta,
       comprobante_contable_encontrado: comprobante,
+      verificacion_contable: {empresa_revisada:empresaRendicion || null,rut_empresa:rutEmpresa,empresa_contable:lineaProveedor?.empresa || null,otras_empresas:otrasEmpresas,estado:comparacionMonto?.estado || (otrasEmpresas.length ? "empresa_distinta" : "no_encontrado"),monto_rendido:Number(item.monto),monto_documento_rendido:grupo.monto,miembros:grupo.miembros,monto_contable:comparacionMonto?.contable ?? null,diferencia:comparacionMonto?.diferencia ?? null,cuenta,nombre_cuenta:nombreCuentaVerificada,comprobante,rut_proveedor:item.rut_proveedor,tipo_documento:item.tipo_documento,nro_documento:item.nro_documento},
     });
     if (!res.ok) {
       box.className = "verify-box show err";
@@ -2719,14 +4839,17 @@ async function verificarDocumentoItem(item, box, empresaRendicion) {
     }
     item.existe_en_contabilidad = !!match;
     item.cuenta_contable = cuenta;
+    item.verificacion_contable = res.data?.[0]?.verificacion_contable || null;
 
-    box.className = "verify-box show " + (match ? "ok" : "no");
-    box.textContent = match
-      ? `✔ Registrada en contabilidad · Cuenta ${cuenta}`
-      : "✘ Todavía no aparece registrada en contabilidad.";
+    box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" ? "ok" : "err");
+    box.textContent = !match ? (otrasEmpresas.length ? "⚠ Documento registrado en otra empresa: "+otrasEmpresas.join(", ")+". No se confirmó el monto para "+empresaRendicion+"." : "✘ Todavía no aparece registrada en contabilidad. El monto no se pudo comprobar.")
+      : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · " + (grupo.miembros.length>1 ? "Suma de "+grupo.miembros.length+" gastos coincide: " : "Monto coincide: ") + fmtCLP(comparacionMonto.contable) + (grupo.miembros.length>1 ? " · Este gasto: "+fmtCLP(item.monto) : "") + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
+      : comparacionMonto.estado === "diferente" ? "⚠ Documento encontrado, pero el monto difiere. Rendido: " + fmtCLP(comparacionMonto.rendido) + ". Contabilidad: " + fmtCLP(comparacionMonto.contable) + ". Diferencia: " + fmtCLP(comparacionMonto.diferencia) + ". Si distribuiste la factura entre varios gastos, revisa la suma de esas partes."
+      : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
+      : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
   } catch (err) {
     box.className = "verify-box show err";
-    box.textContent = "No se pudo verificar (revisa los nombres de columnas de 'movimientos').";
+    box.textContent = "No se pudo verificar el documento ni el monto. Intenta nuevamente o revisa el registro en contabilidad.";
   }
 }
 
@@ -2741,13 +4864,17 @@ function recalcTotal() {
     total += parseMoneyValue(val);
   });
   document.getElementById("nr-total").textContent = fmtCLP(total);
+  window.RindeUI?.updateFormSummary();
 }
 
 async function submitRendicion() {
+  if(enviandoRendicion) return;
+  if (document.querySelector('#items-container input[data-pagina-pendiente="true"]')) {toast("Selecciona y confirma el comprobante de cada PDF antes de enviar la rendición.");return;}
   const cards = Array.from(document.querySelectorAll(".item-card"));
   if (!cards.length) { toast("Agrega al menos un ítem."); return; }
 
   const fecha = document.getElementById("nr-fecha").value;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){toast("Selecciona la fecha de la rendición.");return;}
   const tipoRendicion = document.getElementById("nr-tipo").value;
   const comentario = document.getElementById("nr-comentario").value.trim();
   const empresaRendicion = document.getElementById("nr-empresa").value;
@@ -2756,6 +4883,8 @@ async function submitRendicion() {
   const items = [];
   for (const [idx, card] of cards.entries()) {
     const id = card.id;
+    if (ocrBloqueado.has(id)) {toast(`El Ítem ${idx+1} requiere separar o cambiar el comprobante antes de enviar.`);return;}
+    if (conflictosSinConfirmar(id).length) {toast(`Confirma los campos contradictorios del Ítem ${idx+1} mirando el comprobante y escribiendo su valor.`);return;}
     const isCon = card.querySelector(`[data-tipo="ConDocumento"]`).classList.contains("active");
     if (isCon) {
       const monto = parseMoneyValue(document.getElementById(`${id}-monto`).value);
@@ -2795,6 +4924,18 @@ async function submitRendicion() {
         categoria: document.getElementById(`${id}-categoriacon`)?.value || null,
         monto,
         descripcion: document.getElementById(`${id}-desc`).value.trim(),
+        // Si el OCR en vivo nunca completó este ítem con éxito Y todavía
+        // falta algún dato que el agente pueda aportar, queda en cola para
+        // que ocr-reintento-pendientes lo siga intentando en segundo plano
+        // (ver estadoReintentoOcr más arriba).
+        ocr_reintento_estado: estadoReintentoOcr(id, [
+          document.getElementById(`${id}-nombreprov`).value.trim(),
+          rutProveedor,
+          document.getElementById(`${id}-folio`).value.trim(),
+          document.getElementById(`${id}-desc`).value.trim(),
+        ]),
+        ocr_origen: ocrOrigen.get(id) || null,
+        monto_verificado: montoSigueVerificado(id, monto),
         _fotoInput: fotoInput,
       });
     } else {
@@ -2808,25 +4949,57 @@ async function submitRendicion() {
         toast(`Falta adjuntar el comprobante del Ítem ${idx + 1}.`);
         return;
       }
+      // El RUT es opcional acá, pero si se escribió (o lo leyó el OCR de una
+      // foto, que se puede equivocar) tiene que ser válido: guardar un RUT
+      // mal formado es peor que no guardarlo, porque después se cruza contra
+      // contabilidad y no calza con nada sin que se sepa por qué.
+      const rutSinDoc = document.getElementById(`${id}-rut2`).value.trim();
+      if (rutSinDoc && !validarRut(rutSinDoc)) {
+        toast(`El RUT del proveedor del Ítem ${idx + 1} no es válido.`);
+        return;
+      }
       items.push({
         tipo_item: "SinDocumento",
         nombre_proveedor: document.getElementById(`${id}-nombreprov2`).value.trim() || null,
-        rut_proveedor: null,
-        tipo_documento: null,
-        nro_documento: null,
-        fecha_vencimiento: null,
+        // Informativos: quien aprueba los contrasta contra el adjunto sin
+        // abrirlo. NO cambian el asiento -- cuenta_contable sigue siendo la
+        // cuenta de GASTO que eligió la persona, nunca la cuenta por pagar,
+        // aunque el comprobante traiga RUT. Es la diferencia de fondo entre
+        // esta pestaña y "Documento electrónico".
+        rut_proveedor: rutSinDoc || null,
+        tipo_documento: document.getElementById(`${id}-tipodoc2`).value.trim() || null,
+        nro_documento: document.getElementById(`${id}-folio2`).value.trim() || null,
+        fecha_vencimiento: document.getElementById(`${id}-fecha2`).value || null,
         cuenta_contable: document.getElementById(`${id}-cuenta`).value.trim(),
         empresa: empresaRendicion,
         centro_costo: document.getElementById(`${id}-cc`).value.trim() || centroCostoRendicion,
         categoria: document.getElementById(`${id}-categoria`).value,
         monto,
         descripcion: document.getElementById(`${id}-desc2`).value.trim(),
+        // Igual que en ConDocumento. Ahora esta pestaña sí tiene folio, RUT
+        // y tipo, así que el agente tiene más huecos reales que llenar que
+        // solo la descripción.
+        ocr_reintento_estado: estadoReintentoOcr(id, [
+          document.getElementById(`${id}-desc2`).value.trim(),
+          document.getElementById(`${id}-nombreprov2`).value.trim(),
+          rutSinDoc,
+          document.getElementById(`${id}-folio2`).value.trim(),
+        ]),
+        ocr_origen: ocrOrigen.get(id) || null,
+        monto_verificado: montoSigueVerificado(id, monto),
         _fotoInput: fotoInput2,
       });
     }
   }
 
   if (!items.length) { toast("Ingresa el monto de al menos un ítem."); return; }
+  const duplicados = documentosDuplicados(items);
+  if (duplicados.length) {
+    actualizarAlertasDuplicados();
+    const resumen = duplicados.map((grupo) => grupo.map((i) => i + 1).join(", ")).join("; ");
+    if (!confirm("El mismo documento aparece más de una vez (ítems " + resumen + "). ¿Confirmas que es una distribución entre centros de costo y que los montos suman el total real de cada documento?")) return;
+  }
+  const hayItemsPendientesOcr = items.some((it) => it.ocr_reintento_estado === "pendiente");
 
   let solicitudFondoId = null;
   if (tipoRendicion === "FondoPorRendir") {
@@ -2835,135 +5008,50 @@ async function submitRendicion() {
   }
 
   const btn = document.getElementById("btn-guardar-rendicion");
+  enviandoRendicion = true;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Guardando...';
 
   try {
-    // Subimos los comprobantes ANTES de crear la rendición -- así, si todos
-    // fallan (red, un nombre de archivo raro, etc.), nunca se llega a
-    // insertar la cabecera y no se quema un folio en el intento. Antes se
-    // creaba la cabecera primero: cada reintento fallido dejaba una
-    // rendición fantasma en $0 Y el número de folio se perdía para siempre
-    // (una secuencia autoincremental de Postgres no reutiliza los números
-    // de filas borradas).
-    const rendicionId = crypto.randomUUID();
-    const itemsConAdjunto = [];
-    const erroresItems = [];
-    for (const [idx, item] of items.entries()) {
-      const file = item._fotoInput?.files?.[0];
-      delete item._fotoInput;
-      let adjuntoUrl = null;
-      if (file) {
-        // Un nombre de archivo con "°", tildes u otros caracteres fuera de
-        // ASCII rompe la ruta del storage y la subida falla -- ej. "Factura
-        // N°9893.pdf". Se sanea antes de armar la ruta, la persona nunca ve
-        // este nombre (solo se usa como parte interna del path).
-        const nombreSeguro = file.name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
-        // "idx" (además de Date.now()) evita que dos ítems con el mismo
-        // nombre de archivo (ej. dos fotos "foto.jpg" del celular) puedan
-        // llegar a compartir la misma ruta si alguna vez coincidiera el
-        // milisegundo -- upload() no sobreescribe en silencio (falla con
-        // 409), pero total es gratis evitarlo del todo.
-        const path = `${currentUser.id}/${rendicionId}-${idx}-${Date.now()}-${nombreSeguro}`;
-        // Timeout propio (no solo el de conTimeout) para que un archivo
-        // colgado no aborte tratar de subir el resto de los ítems -- se
-        // captura acá mismo, no se deja propagar al try/catch general de
-        // toda la función, que si no habría cortado en seco el envío
-        // completo en vez de seguir con los ítems que sí van bien.
-        let upErr = null;
-        try {
-          const resp = await conTimeout(
-            db.storage.from("comprobantes").upload(path, file),
-            45000,
-            "Se agotó el tiempo de espera subiendo el archivo (conexión muy lenta o caída)."
-          );
-          upErr = resp.error;
-        } catch (timeoutErr) {
-          upErr = timeoutErr;
-        }
-        if (upErr) {
-          console.error("Error subiendo comprobante:", upErr);
-          erroresItems.push(`Ítem ${idx + 1}: no se pudo subir el comprobante (${upErr.message}).`);
-          continue;
-        }
-        adjuntoUrl = path;
-      }
-      itemsConAdjunto.push({ item, idx, adjunto_url: adjuntoUrl });
+    const vistos = new Set();
+    for (const item of items) {
+      const clave = window.RindeCore.claveDocumento(item);
+      if (!clave || vistos.has(clave)) continue;
+      vistos.add(clave);
+      const { data, error } = await db.rpc("buscar_documento_duplicado", { p_rut: item.rut_proveedor, p_nro: item.nro_documento, p_tipo: item.tipo_documento });
+      if (error) throw new Error("No se pudo comprobar documentos duplicados. Vuelve a intentar antes de enviar.");
+      if (data?.length && !confirm("El documento " + item.nro_documento + " ya aparece en la rendición N° " + data[0].folio + ". ¿Confirmas que corresponde enviarlo nuevamente?")) return;
+    }
+    const usuarioEnvio = currentUser.id;
+    const rendicionId = envioRendicionId || (envioRendicionId = crypto.randomUUID());
+    const preparados = await window.RindeData.prepararAdjuntos(db,items,usuarioEnvio,rendicionId,adjuntosBorrador,conTimeout);
+    if(currentUser?.id!==usuarioEnvio) throw new Error("La sesión cambió durante el envío. Ingresa nuevamente.");
+    const resultado = await conTimeout(window.RindeData.guardarRendicionCompleta(db,{
+      id:rendicionId,tipo_rendicion:tipoRendicion,empresa:empresaRendicion,
+      comentario,solicitud_fondo_id:solicitudFondoId,fecha_rendicion:fecha,
+    },preparados),45000,"No se pudo confirmar el envío. Tu formulario se conserva; reintenta para comprobar si ya fue recibido.");
+    if(currentUser?.id!==usuarioEnvio) return;
+    const rendicion = resultado.rendicion;
+    if(!resultado.reutilizada) notificarAsync("notificar-aprobador", { rendicion_id: rendicion.id }, "No se pudo notificar al aprobador:");
+
+    // Si algún ítem quedó con el comprobante sin leer, no hace falta
+    // esperar hasta 5 minutos al próximo tick del cron (ver
+    // migracion_ocr_reintento.sql) -- se dispara altiro un intento
+    // inmediato, con sesión propia (el agente scopea a los ítems de este
+    // mismo usuario, ver ocr-reintento-pendientes). Fire-and-forget: si
+    // falla, el cron de todos modos lo agarra más tarde.
+    if (hayItemsPendientesOcr) {
+      notificarAsync("ocr-reintento-pendientes", {}, "No se pudo disparar el reintento inmediato de OCR:");
     }
 
-    if (!itemsConAdjunto.length) {
-      toast(`No se pudo subir ningún comprobante, así que no se creó la rendición. ${erroresItems.join(" · ")}`);
-      return;
-    }
-
-    const { data: rendicion, error: errR } = await db
-      .from("rendiciones")
-      .insert({
-        id: rendicionId,
-        empleado_id: currentUser.id,
-        empleado_nombre: currentProfile?.nombre || currentUser.email,
-        rut_empleado: currentProfile?.rut || null,
-        tipo_rendicion: tipoRendicion,
-        empresa: empresaRendicion,
-        monto_total: itemsConAdjunto.reduce((s, x) => s + x.item.monto, 0),
-        estado: "Pendiente",
-        comentario,
-        solicitud_fondo_id: solicitudFondoId,
-      })
-      .select()
-      .single();
-    if (errR) throw errR;
-
-    // Se recalcula el total según lo que REALMENTE queda guardado -- si el
-    // insert del ítem en sí falla (más raro que la subida, ej. una
-    // restricción de la base), ese ítem se descarta y el monto_total no
-    // debe incluirlo.
-    let montoRealGuardado = 0;
-    let itemsGuardados = 0;
-    for (const { item, idx, adjunto_url } of itemsConAdjunto) {
-      const { error: itemErr } = await db.from("rendicion_items").insert({ ...item, rendicion_id: rendicion.id, adjunto_url });
-      if (itemErr) {
-        console.error("Error guardando ítem:", itemErr);
-        erroresItems.push(`Ítem ${idx + 1}: no se pudo guardar (${itemErr.message}).`);
-        continue;
-      }
-      montoRealGuardado += item.monto;
-      itemsGuardados++;
-    }
-
-    if (!itemsGuardados) {
-      // El o los comprobantes sí se subieron, pero el insert del ítem en sí
-      // falló para todos -- igual limpiamos la cabecera para no dejar el
-      // folio con una rendición vacía. .select() para confirmar que el
-      // borrado realmente afectó la fila (requiere la policy
-      // "rendiciones_delete_propia_vacia") y no decirle a la persona que se
-      // borró cuando en realidad quedó ahí, bloqueada en silencio por RLS
-      // -- el mismo caso que ya nos mordió con aprobarItem antes de que
-      // existiera updateChecked().
-      const { data: borrada } = await db.from("rendiciones").delete().eq("id", rendicion.id).select();
-      const mensajeBase = `No se pudo guardar ningún ítem. ${erroresItems.join(" · ")}`;
-      toast(borrada && borrada.length
-        ? `${mensajeBase} La rendición no quedó creada.`
-        : `${mensajeBase} La rendición quedó guardada vacía -- avisa a un admin para que la revise.`);
-      return;
-    }
-
-    if (montoRealGuardado !== rendicion.monto_total) {
-      await db.from("rendiciones").update({ monto_total: montoRealGuardado }).eq("id", rendicion.id);
-    }
-
-    if (erroresItems.length) {
-      toast(`Se guardaron ${itemsGuardados} de ${items.length} ítems. Revisa la rendición y vuelve a cargar los que fallaron:\n${erroresItems.join(" · ")}`);
-    }
-
-    notificarAsync("notificar-aprobador", { rendicion_id: rendicion.id }, "No se pudo notificar al aprobador:");
-
-    toast("Rendición enviada a aprobación.");
+    toast(resultado.reutilizada ? "El envío anterior ya fue recibido. No se creó otra rendición." : "Rendición enviada completa a aprobación.");
+    adjuntosBorrador.clear();
     replaceView("view-dashboard");
     loadDashboard();
   } catch (err) {
     toast(mensajeErrorAmigable(err));
   } finally {
+    enviandoRendicion = false;
     btn.disabled = false;
     btn.textContent = "Enviar a aprobación";
   }
@@ -3050,6 +5138,78 @@ async function submitSolicitud() {
   }
 }
 
+async function prepararComprobanteEntregaFondo(id, opciones) {
+  if (!esAprobadorEfectivo(currentProfile)) throw new Error("Solo administradores y aprobadores pueden preparar este comprobante.");
+  const {data:s,error} = await db.from("solicitudes_fondos").select("*").eq("id",id).maybeSingle();
+  if (error || !s) throw new Error("No se pudo actualizar el fondo. Intenta nuevamente.");
+  const {data:perfil,error:errorPerfil} = await db.from("profiles").select("nombre, rut").eq("id",s.empleado_id).maybeSingle();
+  if (errorPerfil) throw new Error("No se pudo comprobar el RUT del empleado. Intenta nuevamente.");
+  const fondo = {...s,empleado_nombre:perfil?.nombre || s.empleado_nombre,rut_empleado:perfil?.rut || s.rut_empleado};
+  const comprobante = window.RindeCore.comprobanteEntregaFondo(fondo,opciones);
+  return {...comprobante,empresa:s.empresa,content:[CSV_HEADER,...comprobante.filas.map(row=>row.map(campoCSVSeguro).join(";"))].join("\r\n")};
+}
+
+function panelContabilizarFondo(solicitud) {
+  const panel = el("section",{class:"fondo-kame-panel","aria-label":"Contabilización de entrega de fondo"});
+  const form = el("form",{class:"fondo-kame-form",id:`fondo-kame-${solicitud.id}`,hidden:""});
+  const abrir = el("button",{class:"btn btn-primary",type:"button","aria-expanded":"false","aria-controls":form.id},"Contabilizar en Kame");
+  const fecha=el("input",{type:"date",required:"",id:"fk-fecha"});
+  const cuenta=el("input",{type:"text",required:"",id:"fk-cuenta",placeholder:"Código de la cuenta en Kame",autocomplete:"off"});
+  const banco=el("input",{type:"text",required:"",id:"fk-banco",placeholder:"Nombre del banco o cuenta de salida",maxlength:"100"});
+  const referencia=el("input",{type:"text",id:"fk-referencia",placeholder:"Número de transferencia (opcional)",maxlength:"100"});
+  const confirmado=el("input",{type:"checkbox",required:"",id:"fk-confirmado"});
+  const campos=el("div",{class:"fondo-kame-fields"});
+  [["Fecha efectiva de entrega",fecha],["Cuenta bancaria de salida · código",cuenta],["Nombre de la cuenta bancaria",banco],["Referencia de la entrega",referencia]].forEach(([label,input])=>campos.appendChild(el("div",{class:"field"},[el("label",{for:input.id},label),input])));
+  const resultado=el("div",{class:"fondo-kame-preview","aria-live":"polite"});
+  const revisar=el("button",{class:"btn btn-secondary",type:"submit"},"Revisar comprobante");
+  const descargar=el("button",{class:"btn btn-primary",type:"button",disabled:""},"Descargar archivo para Kame");
+  const estado=el("p",{class:"portal-muted",role:"status"});
+  const opciones=()=>({fecha:fecha.value,cuentaBanco:cuenta.value,nombreBanco:banco.value,referencia:referencia.value,entregaConfirmada:confirmado.checked});
+  let previo=null,ocupado=false,revision=0;
+  form.addEventListener("input",()=>{revision++;previo=null;descargar.disabled=true;resultado.replaceChildren();estado.textContent="Revisa nuevamente el comprobante después de cambiar los datos.";});
+  abrir.addEventListener("click",()=>{form.hidden=!form.hidden;abrir.setAttribute("aria-expanded",String(!form.hidden));if(!form.hidden)fecha.focus();});
+  form.append(el("h3",{},`Entrega del fondo S-${solicitud.folio}`),el("p",{class:"portal-muted"},`Prepara un egreso por ${fmtCLP(solicitud.monto_solicitado)} para importar en ${solicitud.empresa}. Usa la cuenta bancaria de esa empresa desde la que se entregó el dinero.`),campos,
+    el("label",{class:"fondo-kame-confirmacion",for:confirmado.id},[confirmado,"La entrega ya se realizó y revisé que no esté contabilizada en Kame."]),
+    el("p",{class:"portal-muted"},"La aprobación del fondo no confirma su pago. Esta descarga no registra automáticamente el asiento en Kame ni modifica el saldo del fondo."),
+    el("div",{class:"fondo-kame-actions"},[revisar,descargar]),estado,resultado);
+  const mostrar=(c)=>{
+    const tabla=el("table",{class:"items-table"});
+    tabla.appendChild(el("thead",{},el("tr",{},["Cuenta contable","Debe","Haber"].map((t,i)=>el("th",{class:i?"right":""},t)))));
+    const cuerpo=el("tbody");
+    [["1.01.11.05 · Fondo por Rendir",c.monto,0],[`${c.cuentaBanco} · ${c.nombreBanco}`,0,c.monto],["Total",c.monto,c.monto]].forEach(row=>cuerpo.appendChild(el("tr",{},row.map((v,i)=>el("td",{class:i?"monto":""},i?fmtCLP(v):v)))));
+    tabla.appendChild(cuerpo);
+    resultado.replaceChildren(el("p",{},`Empresa: ${c.empresa} · Egreso · ${fmtDate(c.fecha)}`),el("p",{class:"portal-muted"},c.glosa),el("div",{class:"table-scroll"},tabla));
+  };
+  form.addEventListener("submit",async event=>{
+    event.preventDefault();if(ocupado)return;
+    ocupado=true;revisar.disabled=true;descargar.disabled=true;previo=null;
+    const revisionInicial=revision;
+    estado.textContent="Comprobando fondo y datos del empleado…";
+    try {
+      const c=await prepararComprobanteEntregaFondo(solicitud.id,opciones());
+      if(revision!==revisionInicial)return;
+      previo=c;mostrar(c);descargar.disabled=false;estado.textContent="El comprobante está cuadrado. Revisa la cuenta bancaria antes de descargar.";
+    }catch(error){estado.textContent=error.message;resultado.replaceChildren();}
+    finally{ocupado=false;revisar.disabled=false;}
+  });
+  descargar.addEventListener("click",async()=>{
+    if(ocupado||!previo)return;
+    ocupado=true;revisar.disabled=true;descargar.disabled=true;
+    const esperado=previo.content,revisionInicial=revision;
+    try {
+      const c=await prepararComprobanteEntregaFondo(solicitud.id,opciones());
+      if(revision!==revisionInicial)return;
+      if(c.content!==esperado){previo=null;mostrar(c);estado.textContent="Los datos del fondo cambiaron. Revisa nuevamente el comprobante antes de descargar.";return;}
+      const url=URL.createObjectURL(new Blob(["\uFEFF"+c.content],{type:"text/csv;charset=utf-8"}));
+      const link=el("a",{href:url,download:c.fileName});document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+      previo=null;confirmado.checked=false;
+      estado.textContent="Archivo descargado. Impórtalo una sola vez en Kame, en la empresa indicada. Descargarlo no confirma su contabilización.";
+    }catch(error){previo=null;estado.textContent=error.message;}
+    finally{ocupado=false;revisar.disabled=false;}
+  });
+  panel.append(abrir,form);return panel;
+}
+
 async function openDetalleSolicitud(id, pushHistory = true) {
   const box0 = document.getElementById("detalle-solicitud-card");
   box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
@@ -3094,30 +5254,36 @@ async function openDetalleSolicitud(id, pushHistory = true) {
   if (s.estado === "Aprobado") {
     box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:10px" },
       `Aprobado por ${s.aprobador_nombre || "-"} el ${fmtDate(s.fecha_aprobacion)}`));
+    if (esAprobadorViewer) box.appendChild(panelContabilizarFondo(s));
 
     // Saldo: cuánto de este fondo ya se rindió (rendiciones Aprobadas
     // vinculadas a esta solicitud) y cuánto queda disponible. Si el saldo
     // es negativo, la persona gastó más de lo que se le entregó -- ese
     // exceso se contabilizó como Rendiciones por Pagar (ver
     // calcularSplitFondo), no como parte de este fondo.
-    const { data: rendidas } = await db
-      .from("rendiciones")
-      .select("id, folio, monto_total, estado")
-      .eq("solicitud_fondo_id", s.id)
-      .order("created_at", { ascending: true });
+    let rendidas = [], errorConsumo = null;
+    try { rendidas = await consultarTodas(() => db.from("rendiciones").select("id, folio, monto_total, monto_aprobado, estado",{count:"exact"}).eq("solicitud_fondo_id",s.id).order("created_at").order("id")); }
+    catch (error) {errorConsumo=error; box.appendChild(el("p",{class:"ocr-status show err"},"No se pudo comprobar el consumo del fondo. Vuelve a abrir el detalle para reintentar."));}
     const aprobadas = (rendidas || []).filter((r) => r.estado === "Aprobado");
-    const rendido = aprobadas.reduce((sum, r) => sum + Number(r.monto_total || 0), 0);
-    const saldo = Number(s.monto_solicitado) - rendido;
+    const rendido = errorConsumo ? null : resumirConsumoFondo(rendidas,s.monto_solicitado).consumido;
+    const saldo = rendido === null ? null : Number(s.monto_solicitado) - rendido;
 
-    box.appendChild(el("div", {
-      style: "margin-top:14px; padding:12px 14px; border-radius:8px; background:var(--bg-soft, rgba(120,120,120,0.06));",
-    }, [
-      el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" }, "Monto ya rendido (aprobado)"),
-      el("p", { style: "margin:0 0 10px;font-weight:700" }, fmtCLP(rendido)),
-      el("p", { style: "margin:0 0 4px;font-size:0.85rem;color:var(--ink-soft)" },
-        saldo >= 0 ? "Saldo disponible" : "Exceso rendido (va a Rendiciones por Pagar)"),
-      el("p", { style: `margin:0;font-weight:700;color:${saldo >= 0 ? "var(--success)" : "var(--danger)"}` }, fmtCLP(Math.abs(saldo))),
+    const consumption=errorConsumo?null:resumirConsumoFondo(rendidas,s.monto_solicitado),ui=window.RindeUI;
+    box.appendChild(el("div",{class:"portal-metrics"},[
+      ui.metric("Consumo aprobado",consumption?fmtCLP(consumption.aprobado):"No disponible","Gastos aceptados","positive"),
+      ui.metric("En revisión",consumption?fmtCLP(consumption.porRevisar):"No disponible","Reservado hasta su revisión","warning"),
+      ui.metric(saldo!==null&&saldo<0?"Exceso rendido":"Disponible para rendir",saldo===null?"No disponible":fmtCLP(Math.abs(saldo)),"Se excluyen gastos rechazados",saldo!==null&&saldo<0?"negative":"")
     ]));
+    if(consumption&&Number(s.monto_solicitado)>0){
+      box.appendChild(el("progress",{class:"portal-fund-progress",max:"100",value:String(Math.min(100,100*consumption.consumido/Number(s.monto_solicitado))),"aria-label":"Porcentaje del fondo rendido"}));
+      box.appendChild(el("p",{class:"portal-muted"},"El saldo reserva tanto los gastos aprobados como los que siguen en revisión."));
+    }
+    if(esPropia)box.appendChild(el("button",{class:"btn btn-primary",type:"button",onclick:async()=>{
+      if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
+      openNuevaRendicion();document.getElementById("nr-empresa").value=s.empresa;actualizarCentroCostoRendicion();
+      document.getElementById("nr-tipo").value="FondoPorRendir";document.getElementById("nr-fondo-wrap").style.display="block";
+      await cargarSolicitudesDisponibles();document.getElementById("nr-fondo").value=s.id;window.RindeUI.updateFormSummary();
+    }},"Rendir este fondo"));
 
     if (rendidas && rendidas.length) {
       box.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.9rem" }, "Rendiciones contra este fondo"));
@@ -3225,6 +5391,16 @@ async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
 // ------------------------------------------------------------
 // Detalle / aprobación
 // ------------------------------------------------------------
+function crearResumenRendicion(items) {
+  const s=resumenRendicion(items), ui=window.RindeUI;
+  return el("section",{class:"resumen-gastos","aria-label":"Resumen de montos de la rendición"},[
+    ui.metric("Monto rendido",fmtCLP(s.rendido),s.total+(s.total===1?" gasto":" gastos")),
+    ui.metric("Monto aprobado",fmtCLP(s.aprobado),s.aprobados+(s.aprobados===1?" gasto":" gastos"),"positive"),
+    ui.metric("Monto rechazado",fmtCLP(s.rechazado),s.rechazados+(s.rechazados===1?" gasto":" gastos"),"negative"),
+    ui.metric("Pendiente de revisión",fmtCLP(s.pendiente),s.pendientes+(s.pendientes===1?" gasto":" gastos"),"warning")
+  ]);
+}
+
 async function openDetalle(id, pushHistory = true) {
   const box0 = document.getElementById("detalle-card");
   box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
@@ -3239,8 +5415,8 @@ async function openDetalle(id, pushHistory = true) {
   // en paralelo en vez de esperar la primera para recién pedir la segunda.
   // historialCount es solo para saber si hay algo que mostrar -- el botón de
   // historial ni aparece si la rendición nunca tuvo un cambio registrado.
-  const [{ data: items }, { count: historialCount }, { data: montosEditados }] = await Promise.all([
-    db.from("rendicion_items").select("*").eq("rendicion_id", id),
+  const [{ data: items, error: errorItems, count: cantidadItems }, { count: historialCount }, { data: montosEditados }] = await Promise.all([
+    db.from("rendicion_items").select("*", {count:"exact"}).eq("rendicion_id", id),
     db.from("rendicion_items_historial").select("id", { count: "exact", head: true }).eq("rendicion_id", id),
     // Qué ítems tuvieron su monto editado a mano después de cargarse (por
     // OCR o a mano) -- una señal de confianza simple para quien aprueba,
@@ -3248,6 +5424,9 @@ async function openDetalle(id, pushHistory = true) {
     // resumían en ningún lado de la vista de detalle.
     db.from("rendicion_items_historial").select("item_id").eq("rendicion_id", id).eq("campo", "monto"),
   ]);
+  if (errorItems || !items || cantidadItems !== items.length) {
+    box0.textContent = "No se pudo cargar el detalle completo. Vuelve a abrir la rendición."; return;
+  }
   const itemsConMontoEditado = new Set((montosEditados || []).map((h) => h.item_id));
 
   const esAprobadorViewer = esAprobadorEfectivo(currentProfile);
@@ -3260,10 +5439,14 @@ async function openDetalle(id, pushHistory = true) {
   box.appendChild(el("div", { class: "detail-header" }, [
     el("div", {}, [
       el("h2", { style: "margin:0 0 4px" }, `N° ${r.folio ?? "-"} · ${r.comentario || `${r.empresa || "Sin empresa"} / ${r.tipo_rendicion}`}`),
-      el("p", { style: "margin:0;color:var(--ink-soft);font-size:0.88rem" }, `${r.empleado_nombre} · ${fmtDate(r.created_at)}`),
+      el("p", { style: "margin:0;color:var(--ink-soft);font-size:0.88rem" }, `${r.empleado_nombre} · ${fmtDate(r.fecha_rendicion || r.created_at)}`),
     ]),
     el("span", { class: "pill " + r.estado, style: "font-size:0.8rem" }, r.estado),
   ]));
+
+  box.appendChild(crearResumenRendicion(items));
+  const gruposDuplicados = documentosDuplicados(items.filter((it) => it.estado !== "Rechazado"));
+  if (gruposDuplicados.length) box.appendChild(el("p", { class: "ocr-status show err" }, "⚠ Hay documentos repetidos en esta rendición. Comprueba que correspondan a una distribución del gasto y que no se esté rindiendo dos veces la factura."));
 
   // Si esta rendición justifica un fondo entregado por adelantado, se
   // muestra el vínculo con su solicitud (folio real, no el uuid) para
@@ -3287,13 +5470,16 @@ async function openDetalle(id, pushHistory = true) {
   if (esAprobadorViewer) columnas.push("Cuenta Contable");
   columnas.push("Centro de Costo", "Descripción", "Monto", "Estado");
 
-  const tabla = el("table", { class: "items-table" });
+  const tabla = el("table", { class: "items-table revision-gastos" });
   const thead = el("thead", {}, [el("tr", {}, columnas.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]);
-  const tbody = el("tbody");
   tabla.appendChild(thead);
-  tabla.appendChild(tbody);
 
+  const visor=window.RindeUI.createPreview(items,tabla,iterarImagenesAdjunto,nombreCuenta,verComprobante,esAprobadorViewer);
   (items || []).forEach((it) => {
+    const tbody = el("tbody", { class: "revision-gasto" });
+    tbody.dataset.estado = it.estado || "Pendiente";
+    tbody.dataset.busqueda = [it.nombre_proveedor,it.categoria,it.rut_proveedor,it.nro_documento,it.descripcion,it.centro_costo].filter(Boolean).join(" ").toLocaleLowerCase("es");
+    tabla.appendChild(tbody);
     const esCon = it.tipo_item === "ConDocumento";
 
     const celdas = [
@@ -3343,13 +5529,13 @@ async function openDetalle(id, pushHistory = true) {
     // achica a el ancho de una sola columna en vez de todas).
     const accionesCell = el("div", { class: "acciones-cell" });
     if (it.adjunto_url) {
-      accionesCell.appendChild(el("button", { class: "btn btn-sm", type: "button", onclick: () => verComprobante(it) }, "Ver"));
+      accionesCell.appendChild(el("button", { class: "btn btn-sm", type: "button", onclick: () => visor.select(it,tbody,true) }, "Ver comprobante"));
     }
     if (puedeEditarItems) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-sm", type: "button",
         onclick: () => {
-          filaExtra.style.display = "table-row";
+          filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
           iniciarEdicionItem(it, extraCell, r, esAprobadorViewer);
         },
       }, "Editar"));
@@ -3362,11 +5548,11 @@ async function openDetalle(id, pushHistory = true) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-sm", type: "button",
         onclick: () => {
-          filaExtra.style.display = "table-row";
+          filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
           const verifyBox = el("div", { class: "verify-box show" }, "Consultando...");
           extraCell.innerHTML = "";
           extraCell.appendChild(verifyBox);
-          verificarDocumentoItem(it, verifyBox, r.empresa);
+          verificarDocumentoItem(it, verifyBox, r.empresa, items);
         },
       }, "Verificar"));
     }
@@ -3392,7 +5578,7 @@ async function openDetalle(id, pushHistory = true) {
       accionesCell.appendChild(el("button", {
         class: "btn btn-danger btn-sm", type: "button",
         onclick: () => {
-          filaExtra.style.display = "table-row";
+          filaExtra.style.display = ""; // deja que el CSS decida (ver comentario en openAdminUsuarios)
           extraCell.innerHTML = "";
           const motivoInput = el("textarea", {
             rows: "2", placeholder: "Motivo del rechazo de este ítem (se le avisa por correo al empleado)...",
@@ -3416,17 +5602,91 @@ async function openDetalle(id, pushHistory = true) {
         },
       }, "Rechazar ítem"));
     }
-    tbody.appendChild(el("tr", {}, celdas));
+    tbody.appendChild(el("tr", { class: "revision-datos" }, celdas));
     tbody.appendChild(el("tr", { class: "acciones-row" }, [el("td", { colspan: String(columnas.length) }, [accionesCell])]));
     tbody.appendChild(filaExtra);
+
+    // Resultado del "agente" que reintenta el OCR en segundo plano (ver
+    // migracion_ocr_reintento.sql): nunca pisa lo ya guardado, es solo una
+    // sugerencia para que quien revisa el ítem decida si vale la pena
+    // aplicarla a mano (vía "Editar"). Los tres estados se muestran, incluido
+    // "agotado": antes ese caso no renderizaba nada, así que el aviso
+    // "🔄 la IA sigue intentando" simplemente desaparecía de la pantalla y
+    // quien revisaba quedaba sin desenlace -- sin saber si había terminado
+    // bien, si seguía corriendo o si el ítem se había caído de la cola.
+    // OJO: el display:block de .ocr-status va en un <div> ADENTRO del <td>,
+    // no en el <td> mismo -- mismo motivo que acciones-cell más arriba:
+    // ponerle un display distinto de table-cell directo a una celda con
+    // colspan hace que algunos navegadores dejen de sumarle el ancho de las
+    // columnas que abarca (ya nos mordió con el panel "Editar perfil" de
+    // Usuarios, mismo patrón).
+    if (it.verificacion_contable) {
+      const v=it.verificacion_contable;
+      const caducada=v.empresa_revisada!==r.empresa || (v.miembros && JSON.stringify(v.miembros)!==JSON.stringify(window.RindeCore.grupoDocumentoContable(it,items).miembros));
+      tbody.appendChild(el("tr",{},[el("td",{colspan:String(columnas.length)},[el("div",{class:"verify-box show "+(v.estado==="coincide" && !caducada?"ok":"err")},"Verificación: "+(caducada?"caducada; cambió la distribución del documento":v.estado)+" · "+detalleMontoVerificado(v)+" · Cuenta "+(v.cuenta||"-")+" · "+(v.nombre_cuenta||"-")+" · "+(v.verificado_en?fmtDate(v.verificado_en):""))])]));
+    }
+    if (it.ocr_reintento_estado === "pendiente") {
+      tbody.appendChild(el("tr", {}, [
+        el("td", { colspan: String(columnas.length) }, [
+          el("div", { class: "ocr-status show" },
+            "La IA reintentará los campos pendientes de este comprobante. Tus datos guardados se conservan."),
+        ]),
+      ]));
+    }
+    if (it.ocr_reintento_resultado) {
+      const s = it.ocr_reintento_resultado;
+      const partes = [
+        s.nombre_proveedor && `Proveedor: ${s.nombre_proveedor}`,
+        s.rut_proveedor && `RUT: ${s.rut_proveedor}`,
+        s.nro_documento && `N° documento: ${s.nro_documento}`,
+        s.monto && `Monto: ${fmtCLP(s.monto)}`,
+      ].filter(Boolean).join(" · ");
+      tbody.appendChild(el("tr", {}, [
+        el("td", { colspan: String(columnas.length) }, [
+          el("div", { class: "ocr-status show " + (s.revision_estado === "completo" ? "ok" : "err") },
+            s.requiere_separacion ? s.aviso_documento : `Lectura ${s.revision_estado || "por revisar"}: ${partes || "sin datos nuevos"}. ${s.campos_pendientes?.length ? "Pendiente: "+s.campos_pendientes.join(", ")+". " : ""}Revisa la evidencia y aplica las correcciones con "Editar".`),
+        ]),
+      ]));
+    } else if (it.ocr_reintento_estado === "agotado") {
+      tbody.appendChild(el("tr", {}, [
+        el("td", { colspan: String(columnas.length) }, [
+          el("div", { class: "ocr-status show" },
+            "La IA no pudo leer este comprobante ni siquiera reintentando en segundo plano. Los datos del ítem son los que cargó la persona a mano: revísalos contra el comprobante adjunto."),
+        ]),
+      ]));
+    }
   });
 
-  box.appendChild(el("div", { class: "table-scroll" }, [tabla]));
+  const filtrosRevision = el("div", { class: "revision-filtros" });
+  const estadosRevision = el("div", { class: "revision-estados", role: "group", "aria-label": "Filtrar gastos por estado" });
+  const buscarRevision = el("input", { type: "search", placeholder: "Buscar proveedor, folio o descripción…", "aria-label": "Buscar gastos", class: "revision-buscar" });
+  const resultadoRevision = el("span", { class: "revision-resultado", role: "status", "aria-live": "polite" });
+  let estadoRevision = "Todos";
+  const botonesRevision = [];
+  function filtrarRevision() {
+    const texto = buscarRevision.value.trim().toLocaleLowerCase("es");
+    let visibles = 0;
+    Array.from(tabla.tBodies).forEach(grupo => {
+      const mostrar = (estadoRevision === "Todos" || grupo.dataset.estado === estadoRevision) && grupo.dataset.busqueda.includes(texto);
+      grupo.hidden = !mostrar;
+      if (mostrar) visibles++;
+    });
+    botonesRevision.forEach(({boton,estado}) => boton.setAttribute("aria-pressed", String(estado === estadoRevision)));
+    resultadoRevision.textContent = visibles + " de " + items.length + " gastos";
+  }
+  ["Todos","Pendiente","Aprobado","Rechazado"].forEach(estado => {
+    const cantidad = estado === "Todos" ? items.length : items.filter(it => (it.estado || "Pendiente") === estado).length;
+    const boton = el("button", { type: "button", class: "btn btn-sm", "aria-pressed": String(estado === "Todos"), onclick: () => {estadoRevision = estado; filtrarRevision();} }, estado + " · " + cantidad);
+    botonesRevision.push({boton,estado});
+    estadosRevision.appendChild(boton);
+  });
+  buscarRevision.addEventListener("input", filtrarRevision);
+  filtrosRevision.append(estadosRevision,buscarRevision,resultadoRevision);
+  box.appendChild(el("div",{class:"portal-review-workspace"},[el("div",{},[filtrosRevision,el("div", { class: "revision-contenedor" }, [tabla])]),visor.element]));
+  visor.first();
+  filtrarRevision();
 
-  box.appendChild(el("div", { class: "totals-bar" }, [
-    el("span", {}, "Total"),
-    el("span", { class: "amount" }, fmtCLP(r.monto_total)),
-  ]));
+
 
   if (r.estado === "Aprobado") {
     box.appendChild(el("p", { style: "color:var(--ink-soft);font-size:0.85rem;margin-top:10px" },
@@ -3613,37 +5873,14 @@ async function aprobarTodosPendientes(rendicion, items) {
 // a Aprobado (con el monto recalculado); si todos fueron rechazados, pasa
 // a Rechazado.
 async function finalizarAprobacionRendicion(rendicion, items) {
-  const aprobados = items.filter((it) => it.estado === "Aprobado");
-  const rechazados = items.filter((it) => it.estado === "Rechazado");
-  const estado = aprobados.length > 0 ? "Aprobado" : "Rechazado";
-  const montoTotal = aprobados.reduce((s, it) => s + Number(it.monto || 0), 0);
-
-  const cambios = {
-    estado,
-    monto_total: montoTotal,
-    aprobador_id: currentUser.id,
-    aprobador_nombre: currentProfile?.nombre || currentUser.email,
-    fecha_aprobacion: new Date().toISOString(),
-  };
-  if (estado === "Rechazado") {
-    cambios.motivo_rechazo = rechazados.map((it) => it.motivo_rechazo).filter(Boolean).join(" | ") || "Todos los ítems fueron rechazados.";
-  }
-
-  const res = await updateChecked("rendiciones", rendicion.id, cambios);
-  if (!res.ok) {
-    toast(res.mensaje);
-    if (/ya fue procesad/i.test(res.mensaje)) openDetalle(rendicion.id, false);
-    return;
-  }
-
-  toast(estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
-  Object.assign(rendicion, cambios);
-
+  const duplicados = documentosDuplicados(items.filter((it) => it.estado !== "Rechazado"));
+  if (duplicados.length && !confirm("Hay documentos repetidos dentro de esta rendición. Verifica la distribución de montos antes de aprobar. ¿Continuar?")) return;
+  const { data, error } = await db.rpc("finalizar_rendicion", { p_id: rendicion.id });
+  if (error || !data) { toast(mensajeErrorAmigable(error || new Error("No se pudo finalizar."))); await openDetalle(rendicion.id, false); return; }
+  Object.assign(rendicion, data.rendicion);
+  toast(rendicion.estado === "Aprobado" ? "Rendición aprobada." : "Rendición rechazada.");
   notificarAsync("notificar-estado-rendicion", { rendicion_id: rendicion.id }, "No se pudo notificar al empleado:");
-
-  if (estado === "Aprobado") {
-    await descargarCSV(rendicion, aprobados);
-  }
+  if (rendicion.estado === "Aprobado") await descargarCSV(rendicion, data.items);
   replaceView("view-dashboard");
   loadDashboard();
 }
@@ -3659,18 +5896,6 @@ async function verComprobante(it) {
 // Deja registro en rendicion_items_historial de quién cambió qué y desde
 // qué valor a cuál. Importante sobre todo para la cuenta contable (Centro
 // de Costo) y el monto, que son los campos que afectan la contabilidad.
-async function registrarCambio(item, rendicionId, campo, valorAnterior, valorNuevo) {
-  if (String(valorAnterior ?? "") === String(valorNuevo ?? "")) return;
-  await db.from("rendicion_items_historial").insert({
-    item_id: item.id,
-    rendicion_id: rendicionId,
-    usuario_id: currentUser.id,
-    usuario_nombre: currentProfile?.nombre || currentUser.email,
-    campo,
-    valor_anterior: valorAnterior === null || valorAnterior === undefined ? null : String(valorAnterior),
-    valor_nuevo: valorNuevo === null || valorNuevo === undefined ? null : String(valorNuevo),
-  });
-}
 
 // Nombres de campo legibles para el historial (ver mostrarHistorialRendicion).
 const NOMBRE_CAMPO_HISTORIAL = {
@@ -3809,7 +6034,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   const toggle = puedeCambiarTipo
     ? el("div", { class: "toggle-group", role: "tablist" }, [
         el("button", { type: "button", "data-tipo": "ConDocumento", "aria-pressed": "false" }, "Documento electrónico"),
-        el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Boleta"),
+        el("button", { type: "button", "data-tipo": "SinDocumento", "aria-pressed": "false" }, "Comprobante/Boleta"),
       ])
     : null;
   const camposTipo = el("div");
@@ -3981,12 +6206,8 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov2`).value.trim();
           cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`).value;
           cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
-          // Sale de "Documento electrónico": estos campos ya no aplican y no
-          // deben quedar reflejando un tipo de documento que ya no es este ítem.
-          cambios.rut_proveedor = null;
-          cambios.tipo_documento = null;
-          cambios.nro_documento = null;
-          cambios.fecha_vencimiento = null;
+          // RUT, folio y fecha siguen identificando el comprobante original.
+          // Cambiar categoría o tratamiento contable no elimina esa evidencia.
           cambios.existe_en_contabilidad = null;
           cambios.comprobante_contable_encontrado = null;
         }
@@ -3994,23 +6215,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
         const res = await updateChecked("rendicion_items", it.id, cambios);
         if (!res.ok) { toast(res.mensaje); return; }
 
-        // Solo se audita lo que realmente formaba parte del formulario editado
-        // (p.ej. un empleado no puede tocar cuenta_contable, así que no debe
-        // quedar un registro falso de "cambio" en ese campo).
-        await Promise.all(
-          Object.keys(cambios).map((campo) => registrarCambio(it, rendicion.id, campo, it[campo], cambios[campo]))
-        );
 
-        if (cambios.monto !== it.monto) {
-          // Excluir Rechazado: un aprobador puede editar el monto de un
-          // ítem mientras revisa uno por uno, antes de "Finalizar
-          // aprobación" -- si ya rechazó otro ítem de la misma rendición,
-          // sumarlo acá infla el Total mostrado (y el stat de Pendientes
-          // del dashboard) con plata que nunca va a quedar aprobada.
-          const { data: todos } = await db.from("rendicion_items").select("monto, estado").eq("rendicion_id", rendicion.id);
-          const nuevoTotal = (todos || []).filter((x) => x.estado !== "Rechazado").reduce((s, x) => s + Number(x.monto), 0);
-          await db.from("rendiciones").update({ monto_total: nuevoTotal }).eq("id", rendicion.id);
-        }
 
         toast("Ítem actualizado.");
         openDetalle(rendicion.id, false);
@@ -4034,7 +6239,7 @@ const CSV_HEADER = [
 ].join(";");
 
 function csvRow(fields) {
-  return fields.map((f) => (f === null || f === undefined ? "" : String(f))).join(";");
+  return fields.map(campoCSV).join(";");
 }
 
 // Arma las filas (sin encabezado) de UNA rendición: una línea por ítem más
@@ -4053,8 +6258,15 @@ function csvRow(fields) {
 // de lo que se le había entregado, el excedente aparte contra "Rendiciones
 // por Pagar" -- como si esa parte fuera un reembolso normal de bolsillo.
 function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null) {
-  const fecha = fmtDateSlash(rendicion.created_at) || rendicion.created_at;
-  const glosa = `RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}`.replace(/\s+/g, " ").trim();
+  const fecha = fmtDateSlash(rendicion.fecha_rendicion || rendicion.created_at) || rendicion.created_at;
+  const fondoFolio = split?.fondoFolio ?? rendicion.solicitudes_fondos?.folio;
+  const referenciaFondo = rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondoFolio != null ? " · FONDO S-" + fondoFolio : "";
+  const glosa = (`RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}` + referenciaFondo).replace(/\s+/g, " ").trim();
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && !split) throw new Error("Falta comprobar la distribución del fondo; no se generó el CSV.");
+  const aprobados = (items || []).filter(it => it.estado === "Aprobado");
+  const debe = aprobados.reduce((s,it)=>s+Number(it.monto || 0),0);
+  const haber = split ? Number(split.dentroDelFondo)+Number(split.excedente) : Number(rendicion.monto_total);
+  if(!Number.isFinite(debe) || !Number.isFinite(haber) || debe !== haber) throw new Error("Los gastos aprobados y la contrapartida no coinciden. Actualiza la rendición antes de generar el CSV.");
   const rows = [];
 
   // "Comentario Linea" va con el mismo texto en todas las líneas de la
@@ -4096,6 +6308,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
     fecha, "", "", "",
   ]);
 
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && !split) throw new Error("Falta comprobar la distribución del fondo; no se generó el CSV.");
   if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && split) {
     if (split.dentroDelFondo > 0) rows.push(filaContrapartida(CUENTA_CONTRAPARTIDA.FondoPorRendir.cuenta, split.dentroDelFondo));
     if (split.excedente > 0) rows.push(filaContrapartida(CUENTA_CONTRAPARTIDA.Reembolso.cuenta, split.excedente));
@@ -4115,32 +6328,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
 // historial de rendiciones Aprobadas de la(s) solicitud(es) involucradas,
 // no solo sobre las que se están procesando en este momento.
 async function calcularSplitFondo(rendicionesFondo) {
-  const splitPorId = new Map();
-  const solicitudIds = [...new Set((rendicionesFondo || []).map((r) => r.solicitud_fondo_id).filter(Boolean))];
-  if (!solicitudIds.length) return splitPorId;
-
-  const { data: solicitudes } = await db.from("solicitudes_fondos").select("id, monto_solicitado").in("id", solicitudIds);
-  const solicitudPorId = new Map((solicitudes || []).map((s) => [s.id, s]));
-
-  const { data: historial } = await db
-    .from("rendiciones")
-    .select("id, solicitud_fondo_id, monto_total")
-    .in("solicitud_fondo_id", solicitudIds)
-    .eq("estado", "Aprobado")
-    .order("fecha_aprobacion", { ascending: true });
-
-  const consumido = new Map();
-  (historial || []).forEach((r) => {
-    const solicitud = solicitudPorId.get(r.solicitud_fondo_id);
-    if (!solicitud) return;
-    const antes = consumido.get(r.solicitud_fondo_id) || 0;
-    const saldoAntes = Math.max(0, Number(solicitud.monto_solicitado) - antes);
-    const dentroDelFondo = Math.min(Number(r.monto_total), saldoAntes);
-    const excedente = Math.max(0, Number(r.monto_total) - saldoAntes);
-    splitPorId.set(r.id, { dentroDelFondo, excedente });
-    consumido.set(r.solicitud_fondo_id, antes + Number(r.monto_total));
-  });
-  return splitPorId;
+  return window.RindeData.distribuirFondosCsv(db,rendicionesFondo);
 }
 
 function construirCSV(rendicion, items, split = null) {
@@ -4158,9 +6346,16 @@ function construirCSV(rendicion, items, split = null) {
 // el perfil ACTUAL, cada vez que se genera un comprobante.
 async function conDatosActualesDeEmpleado(rendicion) {
   const { data: perfil } = await db.from("profiles").select("nombre, rut").eq("id", rendicion.empleado_id).maybeSingle();
-  if (!perfil) return rendicion;
+  let fondo = rendicion.solicitudes_fondos;
+  if (rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondo?.folio == null) {
+    const {data,error} = await db.from("solicitudes_fondos").select("folio").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
+    if (error || !data || data.folio == null) throw new Error("No se pudo identificar el fondo del comprobante. Intenta nuevamente.");
+    fondo=data;
+  }
+  if (!perfil) return {...rendicion,solicitudes_fondos:fondo};
   return {
     ...rendicion,
+    solicitudes_fondos:fondo,
     rut_empleado: perfil.rut || rendicion.rut_empleado,
     empleado_nombre: perfil.nombre || rendicion.empleado_nombre,
   };
@@ -4198,8 +6393,8 @@ async function descargarCSV(rendicion, items) {
 // para un informe que se ve en pantalla o se imprime esa resolución sobra,
 // y sin reescalar el PDF de una rendición con un par de fotos pesaba
 // varios MB (uno de prueba real llegó a 7+ MB con solo 2 fotos).
-const PDF_IMG_MAX_DIM = 1400;
-const PDF_IMG_CALIDAD = 0.72;
+const PDF_IMG_MAX_DIM = 2200;
+const PDF_IMG_CALIDAD = 0.9;
 
 function canvasAJpegRedimensionado(canvasOrigen) {
   let { width, height } = canvasOrigen;
@@ -4214,37 +6409,30 @@ function canvasAJpegRedimensionado(canvasOrigen) {
   return chico.toDataURL("image/jpeg", PDF_IMG_CALIDAD);
 }
 
-async function obtenerImagenDeAdjunto(path) {
-  try {
-    const { data: signed, error } = await db.storage.from("comprobantes").createSignedUrl(path, 120);
-    if (error || !signed?.signedUrl) return null;
-    const resp = await fetch(signed.signedUrl);
-    const blob = await resp.blob();
-
-    if (blob.type === "application/pdf" || path.toLowerCase().endsWith(".pdf")) {
-      const buf = await blob.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-      const page = await pdf.getPage(1);
-      const viewport = page.getViewport({ scale: 2 });
-      const canvas = document.createElement("canvas");
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-      return canvasAJpegRedimensionado(canvas);
-    }
-
-    // Foto normal (jpg/png del celular): la pasamos por un canvas igual,
-    // así se reescala/comprime como cualquier otro adjunto en vez de
-    // meterse íntegra al PDF.
-    const bitmap = await createImageBitmap(blob);
-    const canvas = document.createElement("canvas");
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.getContext("2d").drawImage(bitmap, 0, 0);
-    return canvasAJpegRedimensionado(canvas);
-  } catch (err) {
-    console.error("No se pudo preparar el adjunto para el PDF:", err);
-    return null;
+async function* iterarImagenesAdjunto(path) {
+  const {data:signed,error}=await db.storage.from("comprobantes").createSignedUrl(path,120);
+  if(error || !signed?.signedUrl)throw new Error("No se pudo acceder al adjunto");
+  const resp=await fetch(signed.signedUrl);if(!resp.ok)throw new Error("No se pudo descargar el adjunto");
+  const blob=await resp.blob();
+  if(blob.type === "application/pdf" || path.toLowerCase().endsWith(".pdf")){
+    const pdfjs=await cargarPdfJs();const pdf=await window.RindeData.abrirPdfSeguro(pdfjs,await blob.arrayBuffer()).promise;
+    try{
+      for(let n=1;n<=pdf.numPages;n++){
+        const page=await pdf.getPage(n);const viewport=page.getViewport({scale:1});
+        const v=page.getViewport({scale:Math.min(3,2200/Math.max(viewport.width,viewport.height))});
+        const canvas=document.createElement("canvas");canvas.width=Math.ceil(v.width);canvas.height=Math.ceil(v.height);
+        await page.render({canvasContext:canvas.getContext("2d"),viewport:v}).promise;
+        yield {imagen:canvasAJpegRedimensionado(canvas),pagina:n,total:pdf.numPages};
+        page.cleanup();canvas.width=canvas.height=0;
+      }
+    }finally{await pdf.destroy();}
+  }else{
+    const bitmap=await createImageBitmap(blob);
+    try{
+      const canvas=document.createElement("canvas");canvas.width=bitmap.width;canvas.height=bitmap.height;
+      const ctx=canvas.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,canvas.width,canvas.height);ctx.drawImage(bitmap,0,0);
+      yield {imagen:canvasAJpegRedimensionado(canvas),pagina:1,total:1};
+    }finally{bitmap.close();}
   }
 }
 
@@ -4257,57 +6445,74 @@ async function generarInformePDF(rendicion, items) {
   try {
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF();
+    doc.setProperties({title:"Informe de rendición N° "+(rendicion.folio ?? "-"),author:"RindeWellness",subject:"Rendición y comprobantes adjuntos"});
+    const corteInforme=new Intl.DateTimeFormat("es-CL",{timeZone:"America/Santiago",dateStyle:"medium",timeStyle:"short"}).format(new Date());
 
-    doc.setFontSize(15);
-    doc.text(`RindeWellness · Informe de rendición N° ${rendicion.folio ?? "-"}`, 14, 16);
-    doc.setFontSize(10);
-    doc.setTextColor(90);
-    let y = 24;
-    const linea = (label, valor) => {
-      doc.setTextColor(90);
-      doc.text(`${label}:`, 14, y);
-      doc.setTextColor(20);
-      doc.text(String(valor ?? "-"), 55, y);
-      y += 6;
+    const ancho = doc.internal.pageSize.getWidth();
+    const margen = 14, util = ancho - margen*2;
+    const tinta = [33,54,66], tenue = [117,135,145], verde = [22,127,118];
+    doc.setFont("helvetica","bold");doc.setFontSize(19);doc.setTextColor(...verde);
+    doc.text("GW",margen,18);doc.setTextColor(...tinta);doc.setFontSize(14);doc.text("RindeWellness",30,18);
+    doc.setFontSize(20);doc.text("Informe de rendición N° " + (rendicion.folio ?? "-"),margen,33);
+    doc.setDrawColor(226,233,237);doc.line(margen,41,ancho-margen,41);
+    let y = 51;
+    const linea = (texto,negrita=false) => {
+      doc.setFont("helvetica",negrita?"bold":"normal");doc.setFontSize(negrita?11:9);doc.setTextColor(...(negrita?tinta:tenue));
+      const partes=doc.splitTextToSize(String(texto || "-"),util);
+      if(y+partes.length*5>230){doc.addPage();y=20;}
+      doc.text(partes,margen,y);y+=partes.length*5+3;
     };
-    linea("Empleado", rendicion.empleado_nombre);
-    linea("RUT", rendicion.rut_empleado);
-    linea("Empresa", rendicion.empresa);
-    linea("Fecha", fmtDate(rendicion.created_at));
-    linea("Tipo", rendicion.tipo_rendicion === "FondoPorRendir" ? "Rendición de fondo por rendir" : "Reembolso");
-    linea("Estado", rendicion.estado);
-    if (rendicion.comentario) linea("Comentario", rendicion.comentario);
-    if (rendicion.estado === "Aprobado") {
-      linea("Aprobado por", rendicion.aprobador_nombre);
-      linea("Fecha aprobación", fmtDate(rendicion.fecha_aprobacion));
+    linea(rendicion.empleado_nombre,true);
+    linea("RUT: " + (rendicion.rut_empleado || "-") + " · " + (rendicion.empresa || "-"));
+    linea("Fecha: " + fmtDate(rendicion.fecha_rendicion || rendicion.created_at) + " · " + (rendicion.tipo_rendicion === "FondoPorRendir" ? "Fondo por rendir" : "Reembolso") + " · Estado: " + rendicion.estado);
+    if(rendicion.comentario)linea("Motivo: " + rendicion.comentario);
+    if(rendicion.estado === "Aprobado")linea("Aprobado por " + (rendicion.aprobador_nombre || "-") + " · " + fmtDate(rendicion.fecha_aprobacion));
+    if(rendicion.estado === "Rechazado")linea("Rechazado por " + (rendicion.aprobador_nombre || "-") + ". " + (rendicion.motivo_rechazo || "Sin motivo registrado"));
+    const resumen = resumenRendicion(items || []);
+    if(y+36>245){doc.addPage();y=20;}
+    const anchoMetrica=(util-9)/4;
+    const metricas=[["RENDIDO",resumen.rendido,resumen.total,tinta],["APROBADO",resumen.aprobado,resumen.aprobados,verde],["RECHAZADO",resumen.rechazado,resumen.rechazados,[195,93,74]],["PENDIENTE",resumen.pendiente,resumen.pendientes,[165,121,41]]];
+    metricas.forEach(([titulo,monto,cantidad,color],i)=>{
+      const x=margen+i*(anchoMetrica+3);doc.setFillColor(243,247,248);doc.roundedRect(x,y,anchoMetrica,29,3,3,"F");
+      doc.setFont("helvetica","bold");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(titulo,x+4,y+7);
+      const importe=fmtCLP(monto);doc.setFontSize(importe.length>12?11:14);doc.setTextColor(...color);doc.text(importe,x+4,y+17);
+      doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(...tenue);doc.text(cantidad+(cantidad===1?" gasto":" gastos"),x+4,y+24);
+    });
+    y+=38;
+    linea("Corte del informe: "+corteInforme);
+    const cantidadAdjuntos=(items || []).filter(it=>it.adjunto_url).length;
+    linea("Respaldos: "+cantidadAdjuntos+" de "+resumen.total+" gastos con archivo adjunto."+(cantidadAdjuntos<resumen.total?" Hay gastos sin adjunto.":""));
+    if(resumen.rechazados)linea("Los gastos rechazados se conservan en este informe y no forman parte del monto aprobado ni del consumo del fondo.");
+    if(rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id){
+      const {data:fondo,error:errorFondo}=await db.from("solicitudes_fondos").select("id,folio,monto_solicitado").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
+      if(!errorFondo && fondo){
+        const consumo=await cargarConsumoFondos([fondo]);const filas=consumo.get(fondo.id);
+        const saldo=filas?resumirConsumoFondo(filas,fondo.monto_solicitado):null;
+        if(y+45>245){doc.addPage();y=20;}
+        doc.setFillColor(237,245,241);doc.roundedRect(margen,y,util,39,3,3,"F");
+        doc.setFont("helvetica","bold");doc.setFontSize(9);doc.setTextColor(...verde);
+        doc.text("FONDO S-"+fondo.folio+" · Monto del fondo: "+fmtCLP(fondo.monto_solicitado),margen+5,y+9);
+        doc.setTextColor(...tinta);doc.text(saldo?"Consumido total: "+fmtCLP(saldo.consumido)+" · "+(saldo.saldo<0?"Exceso: "+fmtCLP(-saldo.saldo):"Disponible: "+fmtCLP(saldo.saldo)):"Consumo y saldo no disponibles",margen+5,y+18);
+        doc.setFont("helvetica","normal");doc.setFontSize(8);
+        if(saldo)doc.text("Aprobado: "+fmtCLP(saldo.aprobado)+" · Por revisar: "+fmtCLP(saldo.porRevisar),margen+5,y+25);
+        doc.setFontSize(6.5);doc.text("Consumo: aprobados y pendientes de todas las rendiciones del fondo; excluye rechazados.",margen+5,y+33);y+=47;
+      }else linea("Fondo asociado: no se pudo consultar su referencia y saldo.");
     }
-    if (rendicion.estado === "Rechazado") {
-      linea("Rechazado por", rendicion.aprobador_nombre);
-      linea("Motivo", rendicion.motivo_rechazo || "No se dejó un motivo.");
-    }
-    linea("Monto total", fmtCLP(rendicion.monto_total));
-    y += 4;
-
+    doc.setFont("helvetica","bold");doc.setFontSize(12);doc.setTextColor(...tinta);doc.text("Detalle de gastos",margen,y);y+=6;
     doc.autoTable({
-      startY: y,
-      head: [["#", "Tipo", "Proveedor / Categoría", "RUT", "Documento", "C. Costo", "Descripción", "Monto", "Estado"]],
-      body: (items || []).map((it, i) => {
-        const esCon = it.tipo_item === "ConDocumento";
-        return [
-          i + 1,
-          tipoItemLabel(it.tipo_item),
-          [it.categoria, it.nombre_proveedor].filter(Boolean).join(" · ") || "-",
-          esCon ? (it.rut_proveedor || "-") : "-",
-          esCon ? `${it.tipo_documento || "-"}${it.nro_documento ? " #" + it.nro_documento : ""}` : "-",
-          it.centro_costo || "-",
-          it.descripcion || "-",
-          fmtCLP(it.monto),
-          it.estado || "Pendiente",
-        ];
-      }),
-      styles: { fontSize: 8, cellPadding: 2 },
-      headStyles: { fillColor: [21, 156, 142] },
-      columnStyles: { 7: { halign: "right" } },
+      startY:y,margin:{left:margen,right:margen,top:18,bottom:19},
+      head:[["Gasto / proveedor","Documento","Descripción / centro de costo / cuenta","Monto","Estado"]],
+      body:(items || []).map((it,i)=>[
+        (i+1)+". "+(it.nombre_proveedor || it.categoria || "Sin proveedor")+"\n"+[it.categoria,it.rut_proveedor,tipoItemLabel(it.tipo_item)].filter(Boolean).join(" · "),
+        (it.tipo_documento || "Comprobante")+(it.nro_documento?" #"+it.nro_documento:"")+(it.fecha_vencimiento?"\n"+fmtDate(it.fecha_vencimiento):""),
+        [it.centro_costo,it.descripcion,it.cuenta_contable ? it.cuenta_contable+" · "+(nombreCuenta(it.cuenta_contable)||"Nombre de cuenta no disponible") : null].filter(Boolean).join("\n") || "-",
+        fmtCLP(it.monto),(it.estado || "Pendiente")+(it.motivo_rechazo?"\n"+it.motivo_rechazo:"")
+      ]),
+      theme:"striped",styles:{font:"helvetica",fontSize:8,cellPadding:3,textColor:tinta,lineColor:[226,233,237]},
+      headStyles:{fillColor:verde,textColor:[255,255,255],fontSize:7.5,fontStyle:"bold"},
+      alternateRowStyles:{fillColor:[244,247,248]},rowPageBreak:"avoid",
+      columnStyles:{0:{cellWidth:53},1:{cellWidth:37},2:{cellWidth:45},3:{cellWidth:23,halign:"right",fontStyle:"bold"},4:{cellWidth:24}},
+      didParseCell:datos=>{if(datos.section==="body" && datos.column.index===4 && String(datos.cell.raw).startsWith("Rechazado"))datos.cell.styles.textColor=[195,93,74];}
     });
 
     // Una página por cada comprobante adjunto, para que el informe quede
@@ -4318,26 +6523,36 @@ async function generarInformePDF(rendicion, items) {
     const itemsConAdjunto = (items || [])
       .map((it, indiceOriginal) => ({ it, indiceOriginal }))
       .filter(({ it }) => it.adjunto_url);
-    const imagenes = await Promise.all(itemsConAdjunto.map(({ it }) => obtenerImagenDeAdjunto(it.adjunto_url)));
-    for (const [i, { it, indiceOriginal }] of itemsConAdjunto.entries()) {
-      const img = imagenes[i];
-      if (!img) continue;
-      doc.addPage();
-      doc.setFontSize(11);
-      doc.setTextColor(20);
-      const titulo = `Comprobante · Ítem ${indiceOriginal + 1}${it.nombre_proveedor ? " · " + it.nombre_proveedor : it.categoria ? " · " + it.categoria : ""}`;
-      doc.text(titulo, 14, 16);
-      const propiedades = doc.getImageProperties(img);
-      const pageWidth = doc.internal.pageSize.getWidth() - 20;
-      const pageHeight = doc.internal.pageSize.getHeight() - 30;
-      let w = pageWidth;
-      let h = (propiedades.height * w) / propiedades.width;
-      if (h > pageHeight) {
-        h = pageHeight;
-        w = (propiedades.width * h) / propiedades.height;
+    const itemsSinAdjunto=(items || []).map((it,i)=>({it,i})).filter(({it})=>!it.adjunto_url);
+    if(itemsSinAdjunto.length){doc.addPage();doc.setFont('helvetica','bold');doc.setFontSize(16);doc.setTextColor(...tinta);doc.text('Gastos sin comprobante adjunto',margen,23);doc.setFont('helvetica','normal');doc.setFontSize(9);doc.text('Este informe contiene gastos sin respaldo documental adjunto.',margen,32);doc.autoTable({startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[['Gasto','Proveedor / descripción','Monto CLP','Estado']],body:itemsSinAdjunto.map(({it,i})=>[i+1,[it.nombre_proveedor,it.descripcion].filter(Boolean).join('\n')||'-',fmtCLP(it.monto),it.estado||'Pendiente']),styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:'right'},3:{cellWidth:35}}});}
+    let adjuntosFallidos=0;
+    const adjuntosPorRuta=new Map();
+    for(const dato of itemsConAdjunto){if(!adjuntosPorRuta.has(dato.it.adjunto_url))adjuntosPorRuta.set(dato.it.adjunto_url,[]);adjuntosPorRuta.get(dato.it.adjunto_url).push(dato);}
+    if(itemsConAdjunto.length){doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(16);doc.setTextColor(...tinta);doc.text("Anexo de comprobantes",margen,23);doc.setFont("helvetica","normal");doc.setFontSize(9);doc.text("Imágenes originales y todas las páginas de cada PDF, en orden de gasto.",margen,32);doc.autoTable({startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[["Gasto(s)","Proveedor / documento","Monto CLP","Estado"]],body:[...adjuntosPorRuta.values()].map(grupo=>[grupo.map(x=>x.indiceOriginal+1).join(", "),(grupo[0].it.nombre_proveedor || "Comprobante")+"\n"+(grupo[0].it.tipo_documento || "")+(grupo[0].it.nro_documento?" #"+grupo[0].it.nro_documento:""),fmtCLP(grupo.reduce((s,x)=>s+Number(x.it.monto||0),0)),[...new Set(grupo.map(x=>x.it.estado || "Pendiente"))].join(" / ")]),theme:"striped",styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:"right"},3:{cellWidth:35}}});}
+    for(const grupoAdjunto of adjuntosPorRuta.values()){
+      const {it,indiceOriginal}=grupoAdjunto[0];
+      const numeroGastos=grupoAdjunto.map(x=>x.indiceOriginal+1).join(", ");
+      try{
+        for await (const {imagen,pagina,total} of iterarImagenesAdjunto(it.adjunto_url)){
+          doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(11);doc.setTextColor(33,54,66);
+          const titulo="Comprobante · Gasto(s) "+numeroGastos+" · Página "+pagina+" de "+total;
+          doc.text(titulo,14,16);doc.setFont("helvetica","normal");doc.setFontSize(8);
+          const subtitulo=doc.splitTextToSize((it.nombre_proveedor || it.categoria || "")+" · "+fmtCLP(it.monto)+" · "+(it.estado || "Pendiente"),182).slice(0,2); doc.text(subtitulo,14,22);
+          const inicioImagen=27+subtitulo.length*3;
+          const propiedades=doc.getImageProperties(imagen);
+          const limiteW=doc.internal.pageSize.getWidth()-28,limiteH=doc.internal.pageSize.getHeight()-inicioImagen-18;
+          const escala=Math.min(limiteW/propiedades.width,limiteH/propiedades.height);
+          const w=propiedades.width*escala,h=propiedades.height*escala;
+          doc.addImage(imagen,"JPEG",(ancho-w)/2,inicioImagen,w,h);
+        }
+      }catch(error){
+        adjuntosFallidos++;doc.addPage();doc.setTextColor(195,93,74);doc.setFontSize(12);
+        doc.text("Adjunto no disponible · Gasto "+(indiceOriginal+1),14,22);doc.setTextColor(33,54,66);doc.setFontSize(10);
+        doc.text(doc.splitTextToSize("No se pudo incorporar el comprobante de "+(it.nombre_proveedor || it.categoria || "este gasto")+". Este informe tiene respaldo incompleto; vuelve a generarlo cuando el archivo esté disponible.",182),14,34);
       }
-      doc.addImage(img, "JPEG", 10, 24, w, h);
     }
+
+    for(let pagina=1;pagina<=doc.getNumberOfPages();pagina++){doc.setPage(pagina);doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(117,135,145);doc.text("Grupo Wellness · Montos en CLP",14,doc.internal.pageSize.getHeight()-9);doc.text("Página "+pagina+" de "+doc.getNumberOfPages(),ancho-14,doc.internal.pageSize.getHeight()-9,{align:"right"});}
 
     // Nombre de archivo con quién rinde, para poder identificarlo de un
     // vistazo entre varios PDFs descargados (ej. "informe_rendicion_1_nataly_alvarez.pdf").
@@ -4345,7 +6560,8 @@ async function generarInformePDF(rendicion, items) {
       .normalize("NFD").replace(/[̀-ͯ]/g, "") // saca tildes
       .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     doc.save(`informe_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}${nombreArchivo ? "_" + nombreArchivo : ""}.pdf`);
-    toast("PDF generado.");
+    const sinAdjunto=resumen.total-cantidadAdjuntos;
+    toast(adjuntosFallidos || sinAdjunto ? "PDF generado: "+adjuntosFallidos+" archivo(s) no disponibles y "+sinAdjunto+" gasto(s) sin adjunto. Revisa las advertencias del informe." : "PDF generado con todos los comprobantes adjuntos.");
   } catch (err) {
     console.error("Error generando el PDF:", err);
     toast("No se pudo generar el PDF: " + (err.message || ""));
@@ -4377,13 +6593,7 @@ async function generarComprobantesPorRango(desde, hasta) {
   statusEl.className = "ocr-status show";
   statusEl.textContent = "Generando comprobantes...";
   try {
-    const { data: rendiciones, error: errR } = await db
-      .from("rendiciones")
-      .select("*")
-      .eq("estado", "Aprobado")
-      .gte("fecha_aprobacion", `${desde}T00:00:00`)
-      .lte("fecha_aprobacion", `${hasta}T23:59:59`);
-    if (errR) throw errR;
+    const rendiciones = await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).eq("estado","Aprobado").gte("fecha_aprobacion",`${desde}T00:00:00`).lte("fecha_aprobacion",`${hasta}T23:59:59`).order("fecha_aprobacion").order("id"));
 
     if (!rendiciones || !rendiciones.length) {
       statusEl.textContent = "No hay rendiciones aprobadas en ese rango de fechas.";
@@ -4392,11 +6602,8 @@ async function generarComprobantesPorRango(desde, hasta) {
     }
 
     const ids = rendiciones.map((r) => r.id);
-    const { data: items, error: errI } = await db
-      .from("rendicion_items")
-      .select("*")
-      .in("rendicion_id", ids);
-    if (errI) throw errI;
+    const items=[];
+    for(let inicio=0;inicio<ids.length;inicio+=100) items.push(...await consultarTodas(() => db.from("rendicion_items").select("*",{count:"exact"}).in("rendicion_id",ids.slice(inicio,inicio+100)).order("id")));
 
     // Igual que en el comprobante individual: usamos el RUT/nombre ACTUAL
     // del perfil de cada empleado, no el que haya quedado guardado en la
@@ -4463,103 +6670,31 @@ async function generarComprobantesPorRango(desde, hasta) {
 // Reporte general (no es el comprobante para Kame): un .xlsx con todas las
 // rendiciones, en dos hojas -- Resumen (una fila por rendición) y Detalle
 // (una fila por ítem) -- que se descarga directo al PC de quien lo pide.
+let excelJsCargando = null;
+function cargarExcelJs() {
+  if(window.ExcelJS)return Promise.resolve(window.ExcelJS);
+  if(excelJsCargando)return excelJsCargando;
+  excelJsCargando=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');script.src='assets/vendor/exceljs-4.4.0.min.js';
+    const timer=setTimeout(()=>{script.remove();reject(new Error('El generador de Excel tardó demasiado. Intenta nuevamente.'));},30000);
+    script.onload=()=>{clearTimeout(timer);window.ExcelJS?resolve(window.ExcelJS):reject(new Error('No se pudo iniciar el generador de Excel.'));};
+    script.onerror=()=>{clearTimeout(timer);script.remove();reject(new Error('No se pudo cargar el generador de Excel.'));};
+    document.head.appendChild(script);
+  });excelJsCargando.catch(()=>{excelJsCargando=null;});return excelJsCargando;
+}
 async function exportarExcel() {
-  toast("Generando Excel...");
+  toast('Generando Excel...');
   try {
-    const { data: rendiciones, error: errR } = await db
-      .from("rendiciones")
-      .select("*, solicitudes_fondos(folio)")
-      .order("folio", { ascending: true });
-    if (errR) throw errR;
-
-    const { data: items, error: errI } = await db
-      .from("rendicion_items")
-      .select("*, rendiciones(folio, empleado_nombre, rut_empleado, empresa)")
-      .order("rendicion_id");
-    if (errI) throw errI;
-
-    const { data: solicitudes, error: errS } = await db
-      .from("solicitudes_fondos")
-      .select("*")
-      .order("folio", { ascending: true });
-    if (errS) throw errS;
-
-    const { data: rendicionesFondoAprobadas } = await db
-      .from("rendiciones")
-      .select("solicitud_fondo_id, monto_total")
-      .eq("tipo_rendicion", "FondoPorRendir")
-      .eq("estado", "Aprobado")
-      .not("solicitud_fondo_id", "is", null);
-    const rendidoPorSolicitud = {};
-    (rendicionesFondoAprobadas || []).forEach((r) => {
-      rendidoPorSolicitud[r.solicitud_fondo_id] = (rendidoPorSolicitud[r.solicitud_fondo_id] || 0) + Number(r.monto_total || 0);
-    });
-
-    const resumen = (rendiciones || []).map((r) => ({
-      "Folio": r.folio ?? "",
-      "Fecha": fmtDate(r.created_at),
-      "Empleado": r.empleado_nombre,
-      "RUT Empleado": r.rut_empleado || "",
-      "Empresa": r.empresa || "",
-      "Tipo": r.tipo_rendicion,
-      "Fondo Asociado": r.solicitudes_fondos?.folio ? `S-${r.solicitudes_fondos.folio}` : "",
-      "Comentario": r.comentario || "",
-      "Monto Total": Number(r.monto_total || 0),
-      "Estado": r.estado,
-      "Aprobador": r.aprobador_nombre || "",
-      "Fecha Aprobación": r.fecha_aprobacion ? fmtDate(r.fecha_aprobacion) : "",
-    }));
-
-    const solicitudesSheet = (solicitudes || []).map((s) => {
-      const rendido = rendidoPorSolicitud[s.id] || 0;
-      return {
-        "Folio": s.folio ? `S-${s.folio}` : "",
-        "Fecha": fmtDate(s.created_at),
-        "Empleado": s.empleado_nombre,
-        "RUT Empleado": s.rut_empleado || "",
-        "Empresa": s.empresa || "",
-        "Centro de Costo": s.centro_costo || "",
-        "Monto Solicitado": Number(s.monto_solicitado || 0),
-        "Motivo": s.motivo || "",
-        "Fecha Necesaria": s.fecha_necesaria ? fmtDate(s.fecha_necesaria) : "",
-        "Estado": s.estado,
-        "Monto Rendido": rendido,
-        "Saldo Disponible": s.estado === "Aprobado" ? Math.max(0, Number(s.monto_solicitado || 0) - rendido) : "",
-        "Aprobador": s.aprobador_nombre || "",
-        "Fecha Aprobación": s.fecha_aprobacion ? fmtDate(s.fecha_aprobacion) : "",
-        "Motivo Rechazo": s.motivo_rechazo || "",
-      };
-    });
-
-    const detalle = (items || []).map((it) => ({
-      "Folio Rendición": it.rendiciones?.folio ?? "",
-      "Empleado": it.rendiciones?.empleado_nombre || "",
-      "RUT Empleado": it.rendiciones?.rut_empleado || "",
-      "Empresa": it.empresa || it.rendiciones?.empresa || "",
-      "Centro de Costo": it.centro_costo || "",
-      "Tipo Ítem": it.tipo_item,
-      "Proveedor": it.nombre_proveedor || "",
-      "RUT Proveedor": it.rut_proveedor || "",
-      "Tipo Documento": it.tipo_documento || "",
-      "N° Documento": it.nro_documento || "",
-      "Fecha Vencimiento": it.fecha_vencimiento ? fmtDate(it.fecha_vencimiento) : "",
-      "Categoría": it.categoria || "",
-      "Cuenta Contable": it.cuenta_contable || "",
-      "Nombre Cuenta": nombreCuenta(it.cuenta_contable),
-      "Monto": Number(it.monto || 0),
-      "Descripción": it.descripcion || "",
-    }));
-
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(resumen), "Resumen");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(detalle), "Detalle");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(solicitudesSheet), "Solicitudes Fondos");
-
-    const fecha = new Date().toISOString().slice(0, 10);
-    XLSX.writeFile(wb, `rendiciones_${fecha}.xlsx`);
-    toast("Excel descargado.");
-  } catch (err) {
-    console.error("Error exportando a Excel:", err);
-    toast("No se pudo generar el Excel: " + (err.message || ""));
-  }
+    const rendiciones=await consultarTodas(() => db.from('rendiciones').select('*, solicitudes_fondos(folio)',{count:'exact'}).order('folio').order('id'));
+    const ids=rendiciones.map(r=>r.id),items=[];
+    for(let i=0;i<ids.length;i+=100)items.push(...await consultarTodas(() => db.from('rendicion_items').select('*',{count:'exact'}).in('rendicion_id',ids.slice(i,i+100)).order('rendicion_id').order('id')));
+    const solicitudes=await consultarTodas(() => db.from('solicitudes_fondos').select('*',{count:'exact'}).order('folio').order('id'));
+    const datos=window.RindeReportes.preparar(rendiciones,items,solicitudes,nombreCuenta);
+    const corte=new Date(),ExcelJS=await cargarExcelJs();
+    const libro=window.RindeReportes.crearLibro(ExcelJS,datos,corte);
+    const buffer=await libro.xlsx.writeBuffer();
+    const blob=new Blob([buffer],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='rendiciones_'+corte.toISOString().slice(0,10)+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);
+    toast('Excel descargado: informe ejecutivo, resumen, detalle y fondos.');
+  }catch(err){console.error('Error exportando a Excel:',err);toast('No se pudo generar el Excel: '+(err.message||''));}
 }

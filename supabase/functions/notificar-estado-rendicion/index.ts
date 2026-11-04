@@ -38,6 +38,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { logEvent, contarEventosRecientes } from "../_shared/logging.ts";
 import { esAprobadorEfectivo } from "../_shared/auth.ts";
+import { emailsDePerfiles, leerTodas } from "../_shared/data.ts";
 import { construirEmailHTML } from "../_shared/email.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -147,6 +148,7 @@ Deno.serve(async (req: Request) => {
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   let callerId: string | null = null;
   let rendicionId: string | null = null;
+  let solicitudId: string | null = null;
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
 
@@ -158,17 +160,18 @@ Deno.serve(async (req: Request) => {
 
     const { tipo, rendicion_id } = await req.json();
     if (!rendicion_id) throw new Error("Falta rendicion_id.");
-    rendicionId = rendicion_id;
     const esSolicitud = tipo === "solicitud";
+    if (esSolicitud) solicitudId = rendicion_id; else rendicionId = rendicion_id;
 
     // El botón "Reenviar notificación por correo" (app.js) permite reenviar
     // a mano, así que acá el límite es más laxo que en notificar-aprobador
     // (que se dispara solo, automático, al crear algo nuevo) -- pero igual
     // debe existir un tope contra un script que lo golpee en loop.
-    const recientesPorUsuario = await contarEventosRecientes(admin, "notificar_estado_ok", { usuarioId: callerId }, 60);
-    if (recientesPorUsuario >= 30) {
-      throw new Error("Demasiados avisos enviados en la última hora. Espera un poco.");
-    }
+    const { data: permitido, error: errorCupo } = await admin.rpc("reservar_cupo_notificacion", {
+      p_usuario: callerId, p_operacion: "notificar_estado", p_entidad: rendicion_id,
+    });
+    if (errorCupo) throw errorCupo;
+    if (!permitido) throw new Error("Demasiados avisos o ya se avisó hace un momento. Espera antes de reenviar.");
 
     const tabla = esSolicitud ? "solicitudes_fondos" : "rendiciones";
     const { data: row, error: errRow } = await admin.from(tabla).select("*").eq("id", rendicion_id).maybeSingle();
@@ -188,6 +191,7 @@ Deno.serve(async (req: Request) => {
     const empresa = row.empresa;
     const monto_total = esSolicitud ? row.monto_solicitado : row.monto_total;
     const estado = row.estado;
+    if (!["Aprobado", "Rechazado"].includes(estado)) throw new Error("La rendición/solicitud todavía está pendiente; no se puede notificar un resultado.");
     const motivo_rechazo = row.motivo_rechazo;
     const aprobador_nombre = row.aprobador_nombre;
 
@@ -252,19 +256,15 @@ Deno.serve(async (req: Request) => {
     // vez), para que el resto del equipo vea el resultado sin tener que
     // entrar a la app -- mismo destinatario que ya usa notificar-aprobador
     // para avisar de algo nuevo pendiente.
-    const { data: perfilesTodos, error: errPerfilesTodos } = await admin
-      .from("profiles")
-      .select("id, rol, delegado_activo, delegado_hasta")
-      .or("rol.in.(aprobador,admin),delegado_activo.eq.true");
-    if (errPerfilesTodos) throw errPerfilesTodos;
+    const perfilesTodos = await leerTodas(() => admin.from("profiles")
+      .select("id, nombre, rol, activo, delegado_activo, delegado_hasta", { count: "exact" })
+      .eq("activo", true).or("rol.in.(aprobador,admin),delegado_activo.eq.true").order("id"));
     const ahoraMs = Date.now();
     const aprobadoresProfiles = (perfilesTodos || []).filter((p) =>
       ["aprobador", "admin"].includes(p.rol) ||
       (p.delegado_activo && (!p.delegado_hasta || new Date(p.delegado_hasta).getTime() > ahoraMs))
     );
-    const { data: usersData, error: errUsersData } = await admin.auth.admin.listUsers();
-    if (errUsersData) throw errUsersData;
-    const emailPorId = new Map((usersData?.users || []).map((u) => [u.id, u.email]));
+    const emailPorId = await emailsDePerfiles(admin, aprobadoresProfiles);
     const ccEmails = [...new Set(
       (aprobadoresProfiles || [])
         .map((p) => emailPorId.get(p.id))
@@ -274,14 +274,14 @@ Deno.serve(async (req: Request) => {
     const { resp, data } = await enviarConFallback([destinatario], asunto, html, ccEmails);
     if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
 
-    await logEvent(admin, "notificar_estado_ok", { usuarioId: callerId, rendicionId });
+    await logEvent(admin, "notificar_estado_ok", { usuarioId: callerId, rendicionId, solicitudId });
     return new Response(JSON.stringify({ ok: true, enviados: 1 }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
     const mensaje = String(err instanceof Error ? err.message : err);
     if (!/No autenticado|Sesión inválida|desactivada|Demasiados avisos/i.test(mensaje)) {
-      await logEvent(admin, "notificar_estado_fail", { usuarioId: callerId, rendicionId, detalle: mensaje });
+      await logEvent(admin, "notificar_estado_fail", { usuarioId: callerId, rendicionId, solicitudId, detalle: mensaje });
     }
     return new Response(JSON.stringify({ error: mensaje }), {
       status: 400,

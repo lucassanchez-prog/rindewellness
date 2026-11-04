@@ -1,16 +1,16 @@
 <!doctype html>
-<html lang="es">
+<html lang="es" data-theme="dark">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="theme-color" content="#046bd2" />
+<meta name="theme-color" content="#10191f" />
 <title>RindeWellness</title>
 <link rel="manifest" href="manifest.json" />
 <link rel="icon" href="assets/logo-gw.png" />
 <link rel="apple-touch-icon" href="assets/logo-gw.png" />
-<link rel="stylesheet" href="styles.css?v=2" />
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link rel="stylesheet" href="styles.css?v=12" />
+<link rel="stylesheet" href="portal-ui.css?v=101" />
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
@@ -33,14 +33,37 @@
 </head>
 <body>
 
-  <!-- LOGIN -->
-  <div id="view-login" class="view active">
+  <section id="view-inicio-sesion" class="view active" aria-labelledby="inicio-sesion-titulo">
+    <div class="session-loading-card">
+      <img src="assets/logo-gw.png" alt="Grupo Wellness" width="48" height="48" />
+      <h1 id="inicio-sesion-titulo">RindeWellness</h1>
+      <p id="inicio-sesion-status" role="status" aria-live="polite">Cargando tu espacio…</p>
+      <button id="btn-reintentar-inicio" class="btn btn-primary" type="button" hidden>Reintentar</button>
+      <noscript>Activa JavaScript en tu navegador para ingresar a RindeWellness.</noscript>
+    </div>
+  </section>
+
+  <!-- LOGIN: se muestra después de comprobar la sesión guardada. -->
+  <div id="view-login" class="view">
     <button class="btn btn-ghost theme-toggle" id="btn-theme-toggle-login" title="Cambiar tema" type="button">🌙</button>
     <div class="login-wrap">
+      <section class="login-presentacion" aria-label="RindeWellness">
+        <div class="login-marca"><img src="assets/logo-gw.png" alt="Grupo Wellness" /><span>RindeWellness</span></div>
+        <span class="login-eyebrow">GRUPO WELLNESS</span>
+        <h2>Tus gastos,<br>en un solo lugar.</h2>
+        <p>Carga tus comprobantes, completa los datos y sigue la revisión de cada gasto.</p>
+        <div class="login-beneficios">
+          <div><span>01</span><strong>Carga el comprobante</strong><p>Adjunta una foto o un documento.</p></div>
+          <div><span>02</span><strong>Revisa los datos</strong><p>Confirma la lectura y completa lo que falta.</p></div>
+          <div><span>03</span><strong>Sigue tu rendición</strong><p>Consulta los montos aprobados y rechazados.</p></div>
+        </div>
+      </section>
+
       <div class="login-card">
         <img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" />
-        <h1>RindeWellness</h1>
-        <p class="sub">Plataforma de <strong>Grupo Wellness</strong></p>
+        <span class="login-eyebrow">BIENVENIDO</span>
+        <h1>Ingresa a tu cuenta</h1>
+        <p class="sub">Continúa con tus rendiciones de <strong>Grupo Wellness</strong></p>
 
         <form id="form-login">
           <div class="field">
@@ -140,16 +163,20 @@
   <!-- APP SHELL (topbar + views) -->
   <div id="app-shell" style="display:none">
     <div class="topbar">
-      <div class="brand"><img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" /> RindeWellness</div>
+      <a class="brand" id="portal-brand" href="#inicio"><img class="dot" src="assets/logo-gw.png" alt="Grupo Wellness" /> RindeWellness</a>
       <div class="user">
         <span id="user-name"></span>
         <button class="btn btn-ghost" id="btn-admin-usuarios" style="display:none">Usuarios</button>
-        <button class="btn btn-ghost" id="btn-theme-toggle" title="Cambiar tema" type="button">🌙</button>
+        <button class="btn btn-ghost theme-toggle" id="btn-theme-toggle" title="Cambiar tema" type="button">🌙</button>
         <button class="btn btn-ghost" id="btn-logout">Salir</button>
       </div>
     </div>
 
-    <div class="app-shell">
+    <div class="portal-shell">
+    <button type="button" id="portal-menu-toggle" class="portal-menu-toggle" aria-expanded="false" aria-controls="portal-nav">Menú · Inicio</button>
+    <nav class="portal-nav" id="portal-nav" aria-label="Módulos principales"></nav>
+    <main class="app-shell">
+      <section id="view-inicio" class="view"><div class="hero-row"><div><h1>Tu espacio de trabajo</h1><p>Lo pendiente, los fondos y tus últimos movimientos.</p></div><div class="portal-export-actions"><a class="btn btn-secondary" href="#nueva-solicitud" data-portal-route="nueva-solicitud">Solicitar fondos</a><a class="btn btn-primary" href="#nueva" data-portal-route="nueva">+ Nueva rendición</a></div></div><div id="portal-home-content"><p role="status">Cargando tus rendiciones…</p></div></section>
 
       <!-- DASHBOARD -->
       <div id="view-dashboard" class="view">
@@ -185,7 +212,8 @@
           <p class="ocr-status" id="rango-status"></p>
         </div>
 
-        <div class="stat-row" id="stat-row"></div>
+        <p id="dashboard-carga-status" class="ocr-status show" role="status" aria-live="polite" hidden></p>
+        <div class="stat-row" id="stat-row"></div><div id="portal-fund-stats" class="portal-metrics"></div>
 
         <div class="filter-bar" id="filter-bar">
           <div class="field">
@@ -202,6 +230,10 @@
             <select id="filtro-empresa">
               <option value="">Todas</option>
             </select>
+          </div>
+          <div class="field" id="campo-filtro-empleado" style="display:none">
+            <label for="filtro-empleado">Empleado</label>
+            <input type="search" id="filtro-empleado" placeholder="Buscar por nombre del empleado…" />
           </div>
           <div class="field">
             <label for="filtro-texto">Buscar</label>
@@ -328,7 +360,7 @@
           <div style="display:flex; gap:10px; flex-wrap:wrap;">
             <button class="btn btn-secondary" id="btn-recordatorios" type="button">Enviar recordatorios ahora</button>
             <button class="btn btn-secondary" id="btn-limpiar-storage" type="button">Limpiar archivos huérfanos</button>
-            <button class="btn btn-secondary" id="btn-ir-plantillas" type="button">Plantillas de perfil</button>
+            <button hidden id="btn-ir-plantillas" type="button">Plantillas de perfil</button>
           </div>
         </div>
         <div class="filter-bar" id="filter-bar-usuarios">
@@ -367,7 +399,7 @@
             </div>
           </div>
         </div>
-        <div id="reportes-contenido"></div>
+        <div id="portal-report-summary" class="portal-metrics"></div><div id="reportes-contenido"></div>
       </div>
 
       <!-- ADMINISTRACION DE PLANTILLAS DE PERFIL -->
@@ -380,13 +412,25 @@
         <div class="card-list" id="list-plantillas"></div>
       </div>
 
+    </main>
     </div>
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="config.js"></script>
-  <script src="pure.js"></script>
-  <script src="app.js?v=39"></script>
+  <!-- OJO: subir estos ?v= en CADA cambio de pure.js/app.js. Existen solo
+       para invalidar el caché del navegador; si no se tocan, alguien con la
+       app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
+       2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
+       el navegador seguía sirviendo la versión anterior. -->
+  <script src="pure.js?v=101"></script>
+  <script src="data-access.js?v=101"></script>
+  <script src="reportes-exportacion.js?v=101"></script>
+  <script src="lector-local.js?v=101"></script>
+  <script src="foto-comprobante.js?v=101"></script>
+  <script src="revision-comprobante.js?v=101"></script>
+  <script src="portal-ui.js?v=101"></script>
+  <script src="app.js?v=101"></script>
 </body>
 </html>

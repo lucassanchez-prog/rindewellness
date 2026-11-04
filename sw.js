@@ -11,8 +11,8 @@
 // "cache-first" alguien podía quedar viendo una versión vieja de la app
 // indefinidamente sin darse cuenta -- justo el problema de caché que ya
 // nos mordió varias veces con index.html/styles.css durante el desarrollo.
-const CACHE_NAME = "rindewellness-shell-v1";
-const SHELL_FILES = ["/", "/index.html", "/styles.css", "/pure.js", "/config.js", "/manifest.json", "/assets/logo-gw.png"];
+const CACHE_NAME = "rindewellness-shell-v101";
+const SHELL_FILES = ["/", "/index.html", "/styles.css?v=12", "/pure.js?v=101", "/app.js?v=101", "/data-access.js?v=101", "/reportes-exportacion.js?v=101", "/lector-local.js?v=101", "/foto-comprobante.js?v=101", "/revision-comprobante.js?v=101", "/portal-ui.js?v=101", "/portal-ui.css?v=101", "/config.js", "/manifest.json", "/assets/logo-gw.png", "/assets/fondo-login.jpg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -40,11 +40,11 @@ self.addEventListener("fetch", (event) => {
     fetch(event.request)
       .then((resp) => {
         const copia = resp.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copia)).catch(() => {});
+        if (resp.ok) caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copia)).catch(() => {});
         return resp;
       })
       .catch(() =>
-        caches.match(event.request).then((cacheado) => cacheado || caches.match("/index.html"))
+        caches.match(event.request).then((cacheado) => cacheado || (event.request.mode === "navigate" ? caches.match("/index.html") : Response.error()))
       )
   );
 });

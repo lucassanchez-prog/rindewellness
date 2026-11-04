@@ -116,7 +116,12 @@ button {
 .btn-secondary:hover { border-color: var(--blue); color: var(--blue); }
 .btn-danger { background: var(--danger-bg); color: var(--danger); }
 .btn-success { background: var(--success-bg); color: var(--success); }
-.btn-ghost { background: transparent; color: var(--ink-soft); padding: 6px 10px; }
+/* border:1px (heredaba border:none de .btn) -- sin ningún borde ni fondo,
+   un botón "ghost" era indistinguible del texto normal de alrededor; ahora
+   se ve tenue pero reconocible como botón en cualquier parte donde se use
+   (Usuarios/Salir en el topbar, Cancelar, Dividir ítem, etc.). */
+.btn-ghost { background: transparent; color: var(--ink-soft); padding: 6px 10px; border: 1px solid var(--line); }
+.btn-ghost:hover { border-color: var(--blue); color: var(--blue); }
 .btn-block { width: 100%; }
 .btn[disabled] { opacity: 0.55; cursor: not-allowed; }
 
@@ -151,8 +156,10 @@ button {
   display: flex; align-items: center; gap: 12px;
   font-size: 0.85rem; color: rgba(255,255,255,0.9);
 }
-.topbar .user .btn-ghost { color: white; }
-.topbar .user .btn-ghost:hover { background: rgba(255,255,255,0.15); }
+/* border-color propio: el gris de var(--line) (pensado para fondos claros/
+   oscuros neutros) casi no se ve contra el gradiente de color del topbar. */
+.topbar .user .btn-ghost { color: white; border-color: rgba(255,255,255,0.5); }
+.topbar .user .btn-ghost:hover { background: rgba(255,255,255,0.15); border-color: white; }
 
 .app-shell {
   max-width: 1400px;
@@ -298,7 +305,12 @@ button {
   padding: 3px 0;
 }
 .cuenta-check input { width: auto; flex-shrink: 0; margin-top: 3px; }
-.cuenta-check span { white-space: normal; word-break: break-word; }
+/* flex:1 -- sin esto, el span (con flex-grow:0 por defecto) se encoge hasta
+   su "mínimo automático" en vez de tomar el espacio disponible, y como
+   word-break:break-word permite un mínimo de una sola letra, terminaba
+   partiendo el texto letra por letra en vertical dentro de columnas
+   angostas (ver .field-row). */
+.cuenta-check span { flex: 1; min-width: 0; white-space: normal; word-break: break-word; }
 .cuenta-check.oculto { display: none; }
 
 .pill {
@@ -330,7 +342,12 @@ button {
 
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .field label { font-size: 0.82rem; font-weight: 600; color: var(--ink-soft); }
-.field input, .field select, .field textarea {
+/* :not([type=checkbox|radio]) -- sin esto, esta regla (misma especificidad
+   que ".cuenta-check input", pero declarada después en el archivo, así que
+   gana el empate) forzaba cualquier checkbox/radio dentro de un .field a
+   ancho 100%, dejándole 0px de espacio a su <span> de al lado -- causaba
+   que el texto de la etiqueta se partiera letra por letra en vertical. */
+.field input:not([type="checkbox"]):not([type="radio"]), .field select, .field textarea {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 10px 12px;
@@ -345,7 +362,14 @@ button {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px rgba(4, 107, 210, 0.12);
 }
-.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+/* minmax(0, 1fr) en vez de 1fr: una columna "1fr" sola no puede achicarse
+   más allá del contenido mínimo de lo que tiene adentro -- con texto largo
+   sin salto natural (ej. la etiqueta de "Delegado temporal", que además
+   tiene word-break:break-word), ese mínimo termina siendo el ancho de una
+   sola letra, y la columna entera colapsa a eso, partiendo el texto letra
+   por letra en vertical. minmax(0, 1fr) le permite a la columna encogerse
+   normalmente en vez de quedar atada al contenido. */
+.field-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
 
 .password-field { position: relative; }
 .password-field input { width: 100%; padding-right: 44px; }
@@ -633,6 +657,17 @@ button {
   border-radius: 10px;
   padding: 0;
 }
+/* El botón de tema del topbar (una vez logueado) es uno más de los que ya
+   están en el flujo normal de ".user" (junto a "Usuarios"/"Salir") -- el
+   position:fixed de arriba es solo para cuando el botón está SOLO en una
+   pantalla (login, recuperar contraseña), donde no hay ningún topbar que lo
+   contenga. Sin este reset, el mismo botón quedaba flotando fijo en la
+   esquina de la ventana en vez de junto a "Salir", tapándolo.
+*/
+.topbar .theme-toggle {
+  position: static;
+  box-shadow: none;
+}
 
 .spinner {
   width: 16px; height: 16px; border-radius: 50%;
@@ -713,3 +748,152 @@ button {
 
   .detail-header { flex-direction: column; }
 }
+
+/* Montos presentados y decisiones de aprobación, visibles en móvil. */
+.resumen-gastos { margin:20px 0 24px; }
+.resumen-gastos-total { display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-bottom:18px; }
+.resumen-gastos-total span { color:var(--ink-soft);font-size:.9rem; }
+.resumen-gastos-total strong { color:var(--blue);font-size:clamp(1.6rem,4vw,2.3rem); }
+.resumen-gastos-grid { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px; }
+.resumen-gastos-tarjeta { padding:22px;border:1px solid var(--line);border-radius:14px;background:var(--card); }
+.resumen-gastos-tarjeta h3 { margin:0 0 8px;font-size:1rem; }
+.resumen-gastos-tarjeta p { margin:0 0 16px;color:var(--ink-soft); }
+.resumen-gastos-monto { display:block;font-size:clamp(1.2rem,3vw,1.8rem); }
+.resumen-gastos-tarjeta.aprobados .resumen-gastos-monto { color:#25834a; }
+.resumen-gastos-tarjeta.rechazados .resumen-gastos-monto { color:#bd362c; }
+.resumen-gastos-pendientes { color:var(--ink-soft);font-size:.9rem; }
+.ocr-verificacion { padding:12px 14px;margin-top:12px;border:1px solid var(--line);border-radius:10px;font-size:.85rem; }
+.ocr-verificacion summary { cursor:pointer;font-weight:600; }
+.ocr-verificacion p { margin:10px 0;overflow-wrap:anywhere; }
+@media(max-width:480px) { .resumen-gastos-grid {grid-template-columns:1fr;} .resumen-gastos-tarjeta {padding:18px;} }
+
+/* Nueva portada: mantiene los formularios y sus identificadores. */
+#view-login .login-wrap { display:grid;grid-template-columns:minmax(0,1.4fr) minmax(340px,.85fr);align-items:center;gap:7vw;padding:64px max(6vw,24px);background:radial-gradient(ellipse at top left,rgba(43,115,123,.17),transparent 65%),var(--paper); }
+.login-presentacion { max-width:650px; }
+.login-marca {display:flex;align-items:center;gap:12px;font-size:1.3rem;font-weight:800;margin-bottom:64px;}
+.login-marca img {width:42px;height:42px;object-fit:contain;}
+.login-eyebrow {display:block;color:var(--teal-dark);font-size:.72rem;letter-spacing:.16em;font-weight:800;margin-bottom:16px;}
+.login-presentacion h2 {font-size:clamp(2.4rem,4.5vw,4.4rem);line-height:1.08;letter-spacing:-.04em;margin:0 0 24px;color:var(--ink);}
+.login-presentacion>p {max-width:510px;font-size:1.08rem;line-height:1.65;color:var(--ink-soft);}
+.login-beneficios {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;margin-top:46px;}
+.login-beneficios span {display:block;color:var(--teal);font-size:.8rem;font-weight:800;margin-bottom:10px;}
+.login-beneficios strong {display:block;font-size:.88rem;line-height:1.4;}
+.login-beneficios p {font-size:.8rem;line-height:1.5;color:var(--ink-soft);margin:8px 0 0;}
+#view-login .login-card {width:100%;max-width:440px;padding:38px;border-radius:22px;border:1px solid var(--line);box-shadow:0 22px 70px rgba(10,35,55,.12);justify-self:end;}
+#view-login .login-card .dot {width:44px;margin-bottom:28px;}
+#view-login .login-card h1 {font-size:1.7rem;letter-spacing:-.03em;margin-bottom:12px;}
+#view-login .login-card .sub {line-height:1.6;margin-bottom:30px;}
+#view-login .login-card input {min-height:48px;border-radius:10px;}
+#view-login #btn-login-submit {min-height:48px;border-radius:10px;margin-top:12px;}
+@media(max-width:900px) {#view-login .login-wrap {grid-template-columns:1fr;padding:36px 24px;gap:32px;} .login-marca {margin-bottom:28px;} .login-beneficios {display:none;} .login-presentacion h2 {font-size:2.5rem;} #view-login .login-card {justify-self:center;} .login-presentacion {justify-self:center;width:100%;max-width:440px;} }
+@media(max-width:480px) {#view-login .login-wrap {padding:48px 18px 24px;} #view-login .login-card {padding:26px 22px;} .login-presentacion h2 {font-size:2rem;} .login-presentacion>p {font-size:.95rem;} }
+
+/* Conserva la fotografía original y mejora la legibilidad de la portada. */
+#view-login .login-wrap {background:linear-gradient(90deg,rgba(9,25,34,.88) 0%,rgba(9,25,34,.67) 48%,rgba(9,25,34,.47) 100%),url("assets/fondo-login.jpg") center/cover no-repeat;}
+#view-login .login-presentacion {color:#f4fafb;}
+#view-login .login-presentacion h2 {color:#f4fafb;text-shadow:0 2px 18px rgba(0,0,0,.2);}
+#view-login .login-presentacion>p,#view-login .login-beneficios p {color:#d7e7eb;}
+#view-login .login-presentacion .login-eyebrow,#view-login .login-beneficios span {color:#8dd9cb;}
+/* Acciones consistentes: tamaño, contraste, foco y jerarquía visual. */
+.btn {min-height:42px;border-radius:11px;font-size:.88rem;font-weight:650;letter-spacing:.005em;transition:background .18s,border-color .18s,box-shadow .18s,transform .12s;}
+.btn:hover:not(:disabled) {transform:translateY(-1px);box-shadow:0 4px 12px rgba(10,30,45,.12);}
+.btn:active:not(:disabled) {transform:translateY(0);}
+.btn-primary {background:linear-gradient(120deg,#217b85,#2473c7);box-shadow:0 4px 12px rgba(26,109,153,.2);}
+.btn-primary:hover {background:linear-gradient(120deg,#196a73,#1d64b1);}
+.btn-secondary {background:var(--card);border-color:var(--line);box-shadow:0 2px 4px rgba(0,0,0,.03);}
+.btn-success {background:#186b49;color:#fff;border:1px solid #359369;}
+.btn-success:hover {background:#207d56;}
+.btn-danger {background:#6b3036;color:#fff;border:1px solid #a44d55;}
+.btn-danger:hover {background:#803b42;}
+.btn-success::before {content:'✓';font-size:1rem;font-weight:800;}
+.btn-danger::before {content:'×';font-size:1.2rem;line-height:1;}
+#btn-reportes::before {content:'▥';font-size:1rem;}
+#btn-exportar-excel::before {content:'↓';font-size:1.1rem;}
+#btn-comprobante-rango::before {content:'▤';font-size:1rem;}
+.btn-sm {min-height:36px;padding:8px 13px;font-size:.8rem;}
+.acciones-cell {gap:9px;}
+.acciones-cell .btn:not(.btn-success):not(.btn-danger) {background:var(--card);color:var(--ink);border:1px solid var(--line);}
+.acciones-cell .btn:not(.btn-success):not(.btn-danger):hover {border-color:var(--teal);color:var(--teal-dark);}
+.acciones-cell .btn-success {margin-left:10px;}
+/* Dashboard: filtros contenidos, cifras visibles y pestañas tipo selector. */
+.hero-row {align-items:center;margin-bottom:26px;gap:22px;}
+.hero-row h1 {font-size:1.85rem;letter-spacing:-.025em;}
+.hero-row p {line-height:1.6;margin-top:6px;}
+.stat-row {gap:18px;margin-bottom:24px;}
+.stat-card {padding:22px 24px;border-radius:16px;position:relative;overflow:hidden;}
+.stat-card::before {content:'';position:absolute;top:0;left:0;bottom:0;width:4px;background:var(--line);}
+.stat-card.blue::before {background:var(--blue);}
+.stat-card.teal::before {background:var(--teal);}
+.stat-card .label {font-size:.74rem;letter-spacing:.025em;margin-bottom:12px;}
+.stat-card .value {font-size:1.9rem;letter-spacing:-.02em;}
+.filter-bar {padding:18px 20px;background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:20px;gap:18px;}
+.filter-bar label {font-size:.78rem;font-weight:650;margin-bottom:8px;}
+.filter-bar input,.filter-bar select {min-height:45px;border-radius:9px;}
+.tabs {border:1px solid var(--line);border-radius:12px;background:var(--card);padding:5px;gap:5px;margin-bottom:22px;}
+.tab-btn {border:0;border-radius:8px;padding:11px 17px;color:var(--ink-soft);transition:background .15s,color .15s;}
+.tab-btn.active {background:var(--blue);color:#fff;border-bottom:0;}
+.tab-btn:hover:not(.active) {background:var(--paper-top);color:var(--ink);}
+.items-table {border-radius:14px;overflow:hidden;}
+.items-table th {padding:15px 14px;font-size:.72rem;letter-spacing:.025em;}
+.items-table td {padding:17px 14px;font-size:.83rem;line-height:1.5;}
+.items-table tbody tr.row-clickable:hover {background:var(--paper-top);}
+.items-table td.monto {font-size:.9rem;font-variant-numeric:tabular-nums;}
+.items-table tr.acciones-row td {padding:11px 14px 15px;border-top:0;}
+.detail-header h2 {letter-spacing:-.025em;}
+.resumen-gastos-tarjeta.aprobados {border-top:3px solid #359369;}
+.resumen-gastos-tarjeta.rechazados {border-top:3px solid #c2574f;}
+.resumen-gastos-tarjeta.aprobados .resumen-gastos-monto {color:var(--success);}
+.resumen-gastos-tarjeta.rechazados .resumen-gastos-monto {color:var(--danger);}
+@media(max-width:640px) {.btn-sm {min-height:44px;} .acciones-cell .btn-success {margin-left:0;} .hero-row h1 {font-size:1.5rem;} .filter-bar {padding:16px;} .tab-btn {padding:10px 12px;font-size:.8rem;} .stat-card {padding:18px;} }
+@media(prefers-reduced-motion:reduce) {.btn {transition:none;} .btn:hover:not(:disabled) {transform:none;} }
+
+/* Revisión de rendiciones: cada grupo mantiene sus acciones y editor. */
+.revision-filtros{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:22px 0 18px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:14px}
+.revision-estados{display:flex;gap:6px;flex-wrap:wrap}.revision-estados button[aria-pressed="true"]{background:var(--blue);color:#fff;border-color:var(--blue)}
+.revision-buscar{flex:1;min-width:230px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink);font:inherit}.revision-resultado{font-size:.8rem;color:var(--ink-soft)}
+.revision-contenedor .revision-gastos{display:block;border:0;overflow:visible;background:transparent}.revision-gastos thead{display:none}
+.revision-gastos .revision-gasto{display:block;border:1px solid var(--line);border-radius:14px;margin-bottom:16px;background:var(--card);overflow:hidden}
+.revision-gastos .revision-gasto[hidden]{display:none!important}
+.revision-gastos .revision-datos{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px 24px;padding:22px 24px;border:0;margin:0;background:transparent}
+.revision-gastos .revision-datos td{display:block;padding:0;border:0;width:auto!important;min-width:0;font-size:.88rem;text-align:left;grid-column:span 3}
+.revision-gastos .revision-datos td::before{content:attr(data-label);display:block;margin-bottom:7px;font-size:.65rem;font-weight:650;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-soft)}
+.revision-gastos .revision-datos td[data-label="Proveedor / Categoría"]{grid-column:1 / span 6;grid-row:1;font-size:1rem;font-weight:650}
+.revision-gastos .revision-datos td[data-label="Monto"]{grid-column:7 / span 3;grid-row:1;font-size:1.35rem;text-align:right;align-self:start}
+.revision-gastos .revision-datos td[data-label="Estado"]{grid-column:10 / span 3;grid-row:1;text-align:right}
+.revision-gastos .revision-datos td[data-label="Descripción"]{grid-column:span 6}
+.revision-gastos tr.acciones-row{display:block;margin:0;padding:0;border:0;border-radius:0;background:transparent}
+.revision-gastos tr.acciones-row td{display:block;border:0;border-top:1px solid var(--line);padding:14px 24px;background:var(--paper-top)}
+.revision-gastos .acciones-cell{gap:10px}.revision-gastos .acciones-cell .btn-success{margin-left:auto}
+.revision-gastos .item-extra-row{width:100%;margin:0!important;padding:0!important;border:0!important}.revision-gastos .item-extra-row td{padding:20px 24px;border-top:1px solid var(--line)}
+.revision-gastos tr:not(.revision-datos):not(.acciones-row):not(.item-extra-row){display:block;border:0;margin:0;border-radius:0;padding:0}.revision-gastos tr:not(.revision-datos):not(.acciones-row)>td{display:block;width:auto;border-bottom:0}
+@media(max-width:700px){.revision-gastos .revision-datos{padding:18px;gap:16px;grid-template-columns:repeat(2,minmax(0,1fr))}.revision-gastos .revision-datos td{grid-column:span 1}.revision-gastos .revision-datos td[data-label="Proveedor / Categoría"]{grid-column:1 / -1;grid-row:1}.revision-gastos .revision-datos td[data-label="Monto"]{grid-column:1;grid-row:2;text-align:left}.revision-gastos .revision-datos td[data-label="Estado"]{grid-column:2;grid-row:2}.revision-gastos .revision-datos td[data-label="Descripción"]{grid-column:1 / -1}.revision-gastos tr.acciones-row td{padding:14px 18px}.revision-gastos .acciones-cell .btn-success{margin-left:0}.revision-gastos .acciones-cell .btn{flex:1 1 auto}.revision-buscar{min-width:0;width:100%;flex-basis:100%}.revision-gastos .item-extra-row td{padding:18px}}
+
+@media(min-width:901px){.filter-bar:has(#campo-filtro-empleado:not([style*="display:none"]):not([style*="display: none"])){grid-template-columns:repeat(4,minmax(0,1fr));}}
+@media(min-width:701px){.fondos-scroll{overflow-x:auto}.fondos-tabla{min-width:1200px}.fondos-tabla td.monto{white-space:nowrap}}
+
+.selector-pagina-ocr{padding:16px;border:1px solid var(--line);border-radius:12px;margin-top:12px;background:var(--paper)}.selector-pagina-ocr p{font-size:.84rem;color:var(--ink-soft)}.selector-pagina-ocr img{display:block;max-width:100%;max-height:420px;object-fit:contain;margin:16px auto;border-radius:6px}.selector-pagina-ocr select{width:100%;padding:12px}.selector-pagina-ocr button{width:100%}
+
+/* Un estado oculto no debe mostrarse por las reglas visuales del OCR. */
+#dashboard-carga-status[hidden]{display:none!important}
+.revision-comprobante { margin-top:18px; border:1px solid var(--line); border-radius:14px; padding:16px; }
+.revision-cabecera, .revision-controles { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.revision-cuerpo { display:grid; grid-template-columns:minmax(0,1.2fr) minmax(220px,1fr); gap:18px; margin-top:16px; }
+.revision-controles { justify-content:flex-start; margin-bottom:12px; }
+.revision-controles .btn, .revision-cabecera .btn { font-size:12px; min-height:36px; padding:7px 10px; }
+.revision-visor { min-width:0; }
+.revision-imagen { position:relative; line-height:0; width:100%; background:#fff; border-radius:8px; overflow:hidden; }
+.revision-imagen img { display:block; width:100%; height:auto; }
+.revision-caja { position:absolute; border:3px solid #159c91; background:#20b8a421; pointer-events:none; box-sizing:border-box; }
+.revision-nota, .revision-evidencia { font-size:12px; line-height:1.5; color:var(--ink-soft); overflow-wrap:anywhere; }
+.revision-campos { min-width:0; }
+.revision-fragmento { margin-top:12px; font-size:12px; }
+.revision-fragmento canvas { display:block; max-width:100%; max-height:160px; background:#fff; margin-top:8px; border:1px solid var(--line); object-fit:contain; }
+.revision-campo { margin-bottom:10px; border:1px solid var(--line); border-radius:10px; padding:12px; }
+.revision-campo.seleccionado { border-color:#20b8a4; box-shadow:0 0 0 1px #20b8a4; }
+.revision-seleccionar { display:grid; grid-template-columns:1fr auto; gap:6px; width:100%; text-align:left; background:none; border:0; color:inherit; font:inherit; cursor:pointer; padding:0; }
+.revision-seleccionar:focus-visible { outline:2px solid #20b8a4; outline-offset:4px; }
+.revision-valor { overflow-wrap:anywhere; font-weight:600; grid-column:1/-1; }
+.revision-estado { font-size:11px; color:var(--ink-soft); grid-row:1; grid-column:2; }
+.revision-campo [hidden], .revision-comprobante [hidden] { display:none !important; }
+@media(max-width:760px) { .revision-cuerpo { grid-template-columns:1fr; } .revision-comprobante { padding:12px; } }
+@media(max-width:640px) { .stat-row .stat-card:last-child { grid-column:1/-1; } .stat-card .value { overflow-wrap:anywhere; } }
