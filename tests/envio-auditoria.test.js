@@ -63,7 +63,7 @@ function contextoEnvio(fallar){
     document:{querySelector:()=>null,querySelectorAll:()=>cards,getElementById:id=>elementos.get(id)},ocrBloqueado:new Set(),ocrOrigen:new Map(),
     conflictosSinConfirmar:()=>[],parseMoneyValue:Number,validarRut:()=>true,estadoReintentoOcr:()=>null,montoSigueVerificado:()=>false,documentosDuplicados:()=>[],
     window:{RindeCore:{claveDocumento:()=>null},RindeData:data},conTimeout:esperar,toast:m=>mensajes.push(m),mensajeErrorAmigable:e=>e.message,
-    notificarAsync:name=>notificaciones.push(name),replaceView(){},loadDashboard(){}});
+    notificarAsync:name=>notificaciones.push(name),replaceView(){},loadDashboard(){},borrarBorradorRendicion(){}});
   vm.runInContext(app.slice(app.indexOf('async function submitRendicion()'),app.indexOf('// Solicitudes de fondos por rendir')),ctx);
   return {ctx,elementos,mensajes,rpc,notificaciones};
 }

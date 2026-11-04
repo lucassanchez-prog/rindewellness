@@ -2147,6 +2147,25 @@ function wireNuevaRendicion() {
     document.getElementById("nr-fondo-wrap").style.display = esFondo ? "block" : "none";
     if (esFondo) cargarSolicitudesDisponibles();
   });
+
+  // Borrador automático (ver "Borrador de la rendición en curso"): se guarda
+  // medio segundo después del último cambio, y al instante si la página se
+  // oculta o se cierra (en el celular beforeunload no siempre se dispara).
+  const vistaNueva = document.getElementById("view-nueva");
+  vistaNueva.addEventListener("input", programarGuardadoBorrador);
+  vistaNueva.addEventListener("change", programarGuardadoBorrador);
+  new MutationObserver(programarGuardadoBorrador).observe(document.getElementById("items-container"), { childList: true });
+  window.addEventListener("pagehide", guardarBorradorRendicion);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") guardarBorradorRendicion(); });
+  // Lo escrito se recupera, pero un archivo adjunto no: solo en ese caso el
+  // navegador pregunta antes de dejar salir.
+  window.addEventListener("beforeunload", (event) => {
+    guardarBorradorRendicion();
+    if (!enviandoRendicion && vistaNueva.classList.contains("active") && formularioTieneArchivos()) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
 }
 
 // Llena el desplegable "Fondo asociado" de Nueva rendición con las
@@ -2211,8 +2230,155 @@ function actualizarCentroCostoRendicion() {
   });
 }
 
-function openNuevaRendicion(pushHistory = true) {
+// ------------------------------------------------------------
+// Borrador de la rendición en curso
+// ------------------------------------------------------------
+// Guarda en este navegador (separado por usuario) lo que se va escribiendo en
+// "Nueva rendición", para que recargar, cerrar la pestaña o un corte de
+// conexión no lo pierdan. Los archivos adjuntos NO se guardan: un
+// <input type=file> no se puede rellenar por código, así que quien recupera
+// el borrador tiene que volver a adjuntarlos (el aviso lo dice).
+const CLAVE_BORRADOR_RENDICION = "rw-borrador-rendicion:";
+const VIGENCIA_BORRADOR_MS = 30 * 24 * 60 * 60 * 1000;
+let restaurandoBorrador = false;
+let temporizadorBorrador = null;
+
+function claveBorradorRendicion() {
+  return currentUser?.id ? CLAVE_BORRADOR_RENDICION + currentUser.id : null;
+}
+
+// Devuelve null si el formulario está en blanco: los desplegables siempre
+// traen un valor por defecto, así que solo cuentan los campos de texto.
+function capturarBorradorRendicion() {
+  const valor = (id) => document.getElementById(id)?.value ?? "";
+  const comentario = valor("nr-comentario");
+  let conContenido = !!comentario.trim();
+  const items = [...document.querySelectorAll("#items-container .item-card")].map((card) => {
+    const campos = {};
+    card.querySelectorAll("input, select, textarea").forEach((campo) => {
+      if (!campo.id || !campo.id.startsWith(card.id + "-")) return;
+      if (campo.type === "file" || campo.type === "hidden" || campo.dataset.paginaPendiente) return;
+      campos[campo.id.slice(card.id.length + 1)] = campo.value;
+      if (campo.tagName !== "SELECT" && campo.value.trim()) conContenido = true;
+    });
+    return { tipo: card.querySelector(".toggle-group .active")?.dataset.tipo || "ConDocumento", campos };
+  });
+  if (!conContenido) return null;
+  return {
+    version: 1, guardado: new Date().toISOString(),
+    fecha: valor("nr-fecha"), tipo: valor("nr-tipo"), fondo: valor("nr-fondo"),
+    empresa: valor("nr-empresa"), cc: valor("nr-cc"), comentario, items,
+  };
+}
+
+function guardarBorradorRendicion() {
+  clearTimeout(temporizadorBorrador);
+  temporizadorBorrador = null;
+  const clave = claveBorradorRendicion();
+  if (!clave || restaurandoBorrador || enviandoRendicion) return;
+  if (!document.getElementById("view-nueva")?.classList.contains("active")) return;
+  try {
+    const borrador = capturarBorradorRendicion();
+    if (borrador) localStorage.setItem(clave, JSON.stringify(borrador));
+    else localStorage.removeItem(clave);
+  } catch { /* sin almacenamiento (modo privado o lleno): se sigue sin borrador */ }
+}
+
+function programarGuardadoBorrador() {
+  clearTimeout(temporizadorBorrador);
+  temporizadorBorrador = setTimeout(guardarBorradorRendicion, 500);
+}
+
+function leerBorradorRendicion() {
+  const clave = claveBorradorRendicion();
+  if (!clave) return null;
+  try {
+    const borrador = JSON.parse(localStorage.getItem(clave) || "null");
+    if (!borrador || borrador.version !== 1 || !Array.isArray(borrador.items)) return null;
+    if (Date.now() - new Date(borrador.guardado).getTime() > VIGENCIA_BORRADOR_MS) { localStorage.removeItem(clave); return null; }
+    return borrador;
+  } catch { return null; }
+}
+
+function borrarBorradorRendicion() {
+  clearTimeout(temporizadorBorrador);
+  temporizadorBorrador = null;
+  try { const clave = claveBorradorRendicion(); if (clave) localStorage.removeItem(clave); } catch { /* nada que borrar */ }
+}
+
+function formularioTieneArchivos() {
+  return [...document.querySelectorAll('#items-container input[type="file"]')].some((i) => i.files && i.files.length);
+}
+
+async function restaurarBorradorRendicion(borrador) {
+  restaurandoBorrador = true;
+  try {
+    const poner = (id, valor) => { const campo = document.getElementById(id); if (campo && valor != null && valor !== "") campo.value = valor; };
+    poner("nr-fecha", borrador.fecha);
+    if (EMPRESAS.includes(borrador.empresa)) poner("nr-empresa", borrador.empresa);
+    actualizarCentroCostoRendicion();
+    poner("nr-cc", borrador.cc);
+    const esFondo = borrador.tipo === "FondoPorRendir";
+    poner("nr-tipo", esFondo ? "FondoPorRendir" : "Reembolso");
+    document.getElementById("nr-fondo-wrap").style.display = esFondo ? "block" : "none";
+    poner("nr-comentario", borrador.comentario);
+
+    document.getElementById("items-container").innerHTML = "";
+    itemSeq = 0;
+    (borrador.items.length ? borrador.items : [{ tipo: "ConDocumento", campos: {} }]).forEach((guardado) => {
+      addItemRow();
+      const card = document.getElementById("item-" + itemSeq);
+      if (guardado.tipo === "SinDocumento") card.querySelector('[data-tipo="SinDocumento"]').click();
+      const entradas = Object.entries(guardado.campos || {});
+      // Primero los desplegables: elegir una categoría puede mostrar otros campos.
+      for (const sonDesplegables of [true, false]) {
+        entradas.forEach(([sufijo, valor]) => {
+          const campo = document.getElementById(`${card.id}-${sufijo}`);
+          if (!campo || (campo.tagName === "SELECT") !== sonDesplegables) return;
+          if (sonDesplegables && ![...campo.options].some((o) => o.value === valor)) return;
+          campo.value = valor;
+          if (sonDesplegables) campo.dispatchEvent(new Event("change"));
+        });
+      }
+    });
+    recalcTotal();
+    actualizarAlertasDuplicados();
+    mostrarAvisoBorrador(borrador);
+    if (esFondo) {
+      await cargarSolicitudesDisponibles();
+      const selFondo = document.getElementById("nr-fondo");
+      if (borrador.fondo && [...selFondo.options].some((o) => o.value === borrador.fondo)) selFondo.value = borrador.fondo;
+    }
+    window.RindeUI?.updateFormSummary();
+  } finally {
+    restaurandoBorrador = false;
+    programarGuardadoBorrador();
+  }
+}
+
+function quitarAvisoBorrador() {
+  document.getElementById("nr-aviso-borrador")?.remove();
+}
+
+function mostrarAvisoBorrador(borrador) {
+  quitarAvisoBorrador();
+  const cuando = new Date(borrador.guardado).toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
+  const descartar = el("button", { class: "btn btn-secondary btn-sm", type: "button" }, "Empezar de cero");
+  descartar.addEventListener("click", () => {
+    if (!confirm("¿Descartar el borrador y empezar una rendición en blanco?")) return;
+    borrarBorradorRendicion();
+    openNuevaRendicion(false, { sinBorrador: true });
+  });
+  const aviso = el("div", { class: "card", id: "nr-aviso-borrador", style: "margin-bottom:18px;border:1px solid var(--warn);" }, [
+    el("p", { style: "margin:0 0 8px;font-size:0.9rem;" }, `Recuperamos tu borrador (guardado el ${cuando}). Los comprobantes no se guardan: vuelve a adjuntar el de cada ítem antes de enviar.`),
+    descartar,
+  ]);
+  document.querySelector("#view-nueva .hero-row")?.after(aviso);
+}
+
+function openNuevaRendicion(pushHistory = true, opciones = {}) {
   if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
+  quitarAvisoBorrador();
   envioRendicionId = crypto.randomUUID();
   adjuntosBorrador.clear();
   document.getElementById("nr-fecha").value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
@@ -2243,7 +2409,9 @@ function openNuevaRendicion(pushHistory = true) {
   ocrOrigen.clear();
   ocrMonto.clear();
   addItemRow();
+  const borrador = opciones.sinBorrador ? null : leerBorradorRendicion();
   if (pushHistory) pushView("view-nueva"); else show("view-nueva");
+  if (borrador) restaurarBorradorRendicion(borrador).catch((err) => console.error("No se pudo restaurar el borrador:", err));
 }
 
 // Después de quitar un ítem, "Ítem 1, Ítem 3" (saltándose el 2) da la
@@ -5158,6 +5326,7 @@ async function submitRendicion() {
 
     toast(resultado.reutilizada ? "El envío anterior ya fue recibido. No se creó otra rendición." : "Rendición enviada completa a aprobación.");
     adjuntosBorrador.clear();
+    borrarBorradorRendicion();
     replaceView("view-dashboard");
     loadDashboard();
   } catch (err) {
@@ -5392,7 +5561,8 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     }
     if(esPropia)box.appendChild(el("button",{class:"btn btn-primary",type:"button",onclick:async()=>{
       if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
-      openNuevaRendicion();document.getElementById("nr-empresa").value=s.empresa;actualizarCentroCostoRendicion();
+      if(leerBorradorRendicion()&&!confirm("Tienes una rendición sin enviar guardada. Si continúas, se reemplaza por esta. ¿Continuar?"))return;
+      openNuevaRendicion(true,{sinBorrador:true});document.getElementById("nr-empresa").value=s.empresa;actualizarCentroCostoRendicion();
       document.getElementById("nr-tipo").value="FondoPorRendir";document.getElementById("nr-fondo-wrap").style.display="block";
       await cargarSolicitudesDisponibles();document.getElementById("nr-fondo").value=s.id;window.RindeUI.updateFormSummary();
     }},"Rendir este fondo"));
