@@ -101,3 +101,14 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .fondo-kame-preview p { overflow-wrap:anywhere; }
 .fondo-kame-preview table { min-width:520px; }
 @media(max-width:640px) { .fondo-kame-fields { grid-template-columns:1fr; } .fondo-kame-form { padding:16px; } .fondo-kame-actions .btn { width:100%; } }
+
+/* Borradores */
+.portal-nav .portal-badge{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;margin-left:8px;padding:0 6px;border-radius:10px;background:var(--warn-bg);color:var(--warn);font-size:12px;font-weight:700;line-height:1}
+.borrador-card{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:14px}
+.borrador-info{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1 1 280px}
+.borrador-info strong{font-size:16px;overflow-wrap:anywhere}
+.borrador-meta{color:var(--ink-soft);font-size:13px}
+.borrador-caduca{font-size:12px;font-weight:600;padding:5px 10px;border-radius:6px;background:var(--paper-top);color:var(--ink-soft);white-space:nowrap}
+.borrador-caduca.por-vencer{background:var(--warn-bg);color:var(--warn)}
+.borrador-acciones{display:flex;gap:10px}
+@media(max-width:640px){.borrador-acciones{width:100%}.borrador-acciones .btn{flex:1 1 auto;min-height:44px}}

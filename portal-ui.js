@@ -20,7 +20,7 @@
     const nav = document.getElementById('portal-nav');
     const menu=document.getElementById('portal-menu-toggle');
     menu.addEventListener('click',()=>{const open=nav.classList.toggle('is-open');menu.setAttribute('aria-expanded',String(open));});
-    const routes = [['inicio','Inicio'],['dashboard','Rendiciones'],['fondos','Fondos'],['reportes','Reportes'],['admin','Usuarios y plantillas']];
+    const routes = [['inicio','Inicio'],['dashboard','Rendiciones'],['fondos','Fondos'],['borradores','Borradores'],['reportes','Reportes'],['admin','Usuarios y plantillas']];
     for (const [route, label] of routes) nav.append(node('a',{href:'#'+route,'data-route':route,onclick:e=>{e.preventDefault();navigate(route);}},label));
     nav.append(node('p',{},'Crear y revisar'),link('Solicitar fondos','nueva-solicitud'),link('Nueva rendición','nueva'));
     for (const [id, selected] of [['view-admin','admin'],['view-plantillas','plantillas']]) {
@@ -38,6 +38,14 @@
     for (const a of document.querySelectorAll('#portal-nav [data-route]')) a.hidden = ['admin','plantillas','reportes'].includes(a.dataset.route) && p?.rol !== 'admin';
     updateFormSummary();
   }
+  // Contador junto al nombre de una entrada del menú (ej. "Borradores (2)"). Va en
+  // un <span> aparte para no alterar el texto que "show" usa en el botón del menú móvil.
+  function setBadge(route, count) {
+    const link = document.querySelector('#portal-nav [data-route="'+route+'"]');
+    if (!link) return;
+    link.querySelector('.portal-badge')?.remove();
+    if (count > 0) link.append(node('span',{class:'portal-badge','aria-label':count+(count===1?' borrador':' borradores')},String(count)));
+  }
   function show(view, section) {
     if (destroyPreview && view !== 'view-detalle') {destroyPreview();destroyPreview=null;}
     const route = view==='view-dashboard' ? (section==='fondos'?'fondos':'dashboard') : view.replace('view-','');
@@ -48,7 +56,7 @@
     }
     const nav=document.getElementById('portal-nav'),menu=document.getElementById('portal-menu-toggle');
     const active=nav.querySelector('.active');
-    menu.textContent='Menú · '+(active?.textContent||'RindeWellness');
+    menu.textContent='Menú · '+(active?.firstChild?.textContent||active?.textContent||'RindeWellness');
     const wasOpen=nav.classList.contains('is-open');nav.classList.remove('is-open');menu.setAttribute('aria-expanded','false');
     if(wasOpen){const title=document.getElementById(view)?.querySelector('h1,h2');if(title){title.tabIndex=-1;title.focus({preventScroll:true});}}
     updateFormSummary();
@@ -143,5 +151,5 @@
     destroyPreview=()=>{generation++;if(generator)void generator.return();generator=null;pages=[];stage.replaceChildren();};
     return {element:aside,select,first:()=>{if(items.length)void select(items[0],table.tBodies[0]);else stage.textContent='Esta rendición no tiene gastos.';}};
   }
-  window.RindeUI={init,setProfile,show,renderHome,updateFormSummary,createPreview,metric,node,heading};
+  window.RindeUI={init,setProfile,setBadge,show,renderHome,updateFormSummary,createPreview,metric,node,heading};
 })();

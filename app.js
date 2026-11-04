@@ -149,6 +149,9 @@ const CATEGORIAS_GASTO = [
 // Utilidades
 // ------------------------------------------------------------
 function show(viewId) {
+  // Al salir del formulario de nueva rendición se guarda lo último escrito, sin
+  // esperar a los 500 ms del autoguardado.
+  if (viewId !== "view-nueva") guardarBorradorRendicion();
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   document.getElementById(viewId).classList.add("active");
   window.RindeUI?.show(viewId, document.getElementById("view-dashboard").dataset.section);
@@ -164,6 +167,7 @@ function hashDeVista(viewId, params) {
   if (viewId === "view-dashboard" && params?.section === "fondos") return "fondos";
   if (viewId === "view-detalle" && params?.id) return `detalle/${params.id}`;
   if (viewId === "view-detalle-solicitud" && params?.id) return `detalle-solicitud/${params.id}`;
+  if (viewId === "view-nueva" && params?.borradorId) return `nueva/${params.borradorId}`;
   return viewId.replace("view-", "");
 }
 function estadoDesdeHash() {
@@ -175,7 +179,8 @@ function estadoDesdeHash() {
   if (base === "admin") return { viewId: "view-admin", params: {} };
   if (base === "plantillas") return { viewId: "view-plantillas", params: {} };
   if (base === "reportes") return { viewId: "view-reportes", params: {} };
-  if (base === "nueva") return { viewId: "view-nueva", params: {} };
+  if (base === "nueva") return { viewId: "view-nueva", params: param ? { borradorId: param } : {} };
+  if (base === "borradores") return { viewId: "view-borradores", params: {} };
   if (base === "nueva-solicitud") return { viewId: "view-nueva-solicitud", params: {} };
   return { viewId: "view-dashboard", params: {} };
 }
@@ -199,7 +204,8 @@ function renderRoute(state) {
   if (viewId === "view-admin") { openAdminUsuarios(false); return; }
   if (viewId === "view-plantillas") { openAdminPlantillas(false); return; }
   if (viewId === "view-reportes") { openReportes(false); return; }
-  if (viewId === "view-nueva") { openNuevaRendicion(false); return; }
+  if (viewId === "view-nueva") { openNuevaRendicion(false, { borradorId: params.borradorId }); return; }
+  if (viewId === "view-borradores") { openBorradores(false); return; }
   if (viewId === "view-nueva-solicitud") { openNuevaSolicitud(false); return; }
   configurarSeccionDashboard(params.section || "rendiciones");
   show("view-dashboard");
@@ -593,6 +599,7 @@ async function onLoggedIn(user) {
   if(!profile){currentProfile=null;document.getElementById("app-shell").style.display="none";show("view-login");return;}
   currentProfile = profile;
   window.RindeUI?.setProfile(profile);
+  actualizarContadorBorradores();
 
   document.getElementById("user-name").textContent = `${profile?.nombre || user.email} · ${profile?.rol || "empleado"}`;
   document.getElementById("app-shell").style.display = "block";
@@ -665,7 +672,7 @@ async function cargarCuentasPermitidas() {
 // Dashboard
 // ------------------------------------------------------------
 function navegarPortal(route) {
-  const allowed=["inicio","dashboard","fondos","reportes","admin","plantillas","nueva","nueva-solicitud"];
+  const allowed=["inicio","dashboard","fondos","borradores","reportes","admin","plantillas","nueva","nueva-solicitud"];
   if(!allowed.includes(route))return;
   if(location.hash==="#"+route)return;
   const state=route==="fondos"?{viewId:"view-dashboard",params:{section:"fondos"}}:{viewId:"view-"+route,params:{}};
@@ -2231,20 +2238,26 @@ function actualizarCentroCostoRendicion() {
 }
 
 // ------------------------------------------------------------
-// Borrador de la rendición en curso
+// Borradores de rendición
 // ------------------------------------------------------------
-// Guarda en este navegador (separado por usuario) lo que se va escribiendo en
-// "Nueva rendición", para que recargar, cerrar la pestaña o un corte de
-// conexión no lo pierdan. Los archivos adjuntos NO se guardan: un
-// <input type=file> no se puede rellenar por código, así que quien recupera
-// el borrador tiene que volver a adjuntarlos (el aviso lo dice).
-const CLAVE_BORRADOR_RENDICION = "rw-borrador-rendicion:";
-const VIGENCIA_BORRADOR_MS = 30 * 24 * 60 * 60 * 1000;
+// Lo que se escribe en "Nueva rendición" se guarda solo, en este navegador y
+// separado por usuario, como un borrador: recargar, cerrar la pestaña o un
+// corte de conexión no lo pierden, y todos quedan listados en "Borradores".
+// Cada uno caduca una semana después de su última edición (ver borradores.js).
+// Los archivos adjuntos NO se guardan: un <input type=file> no se puede
+// rellenar por código, así que al retomar un borrador hay que volver a
+// adjuntarlos (el aviso lo dice).
 let restaurandoBorrador = false;
 let temporizadorBorrador = null;
+let borradorActualId = null;
 
-function claveBorradorRendicion() {
-  return currentUser?.id ? CLAVE_BORRADOR_RENDICION + currentUser.id : null;
+function almacenBorradores() {
+  try { return window.RindeBorradores.crearAlmacen({ storage: window.localStorage }); } catch { return null; }
+}
+
+function actualizarContadorBorradores() {
+  const almacen = almacenBorradores();
+  window.RindeUI?.setBadge("borradores", almacen && currentUser?.id ? almacen.contar(currentUser.id) : 0);
 }
 
 // Devuelve null si el formulario está en blanco: los desplegables siempre
@@ -2265,23 +2278,36 @@ function capturarBorradorRendicion() {
   });
   if (!conContenido) return null;
   return {
-    version: 1, guardado: new Date().toISOString(),
     fecha: valor("nr-fecha"), tipo: valor("nr-tipo"), fondo: valor("nr-fondo"),
     empresa: valor("nr-empresa"), cc: valor("nr-cc"), comentario, items,
   };
 }
 
+// Deja el id del borrador en la URL (#nueva/<id>), para que recargar vuelva a
+// este mismo borrador y no a un formulario en blanco.
+function fijarBorradorEnUrl() {
+  const hash = "#nueva/" + borradorActualId;
+  if (location.hash === hash) return;
+  history.replaceState({ viewId: "view-nueva", params: { borradorId: borradorActualId }, portalDepth: history.state?.portalDepth || 0 }, "", hash);
+}
+
 function guardarBorradorRendicion() {
   clearTimeout(temporizadorBorrador);
   temporizadorBorrador = null;
-  const clave = claveBorradorRendicion();
-  if (!clave || restaurandoBorrador || enviandoRendicion) return;
+  const usuarioId = currentUser?.id;
+  if (!usuarioId || !borradorActualId || restaurandoBorrador || enviandoRendicion) return;
   if (!document.getElementById("view-nueva")?.classList.contains("active")) return;
-  try {
-    const borrador = capturarBorradorRendicion();
-    if (borrador) localStorage.setItem(clave, JSON.stringify(borrador));
-    else localStorage.removeItem(clave);
-  } catch { /* sin almacenamiento (modo privado o lleno): se sigue sin borrador */ }
+  const almacen = almacenBorradores();
+  if (!almacen) return;
+  const datos = capturarBorradorRendicion();
+  if (datos) {
+    // Solo una edición de verdad renueva la semana de vigencia: abrir un borrador, o
+    // un evento sin cambios (foco, restauración), no debe alargarle la vida.
+    const previa = almacen.obtener(usuarioId, borradorActualId);
+    if ((previa && JSON.stringify(previa.datos) === JSON.stringify(datos)) || almacen.guardar(usuarioId, borradorActualId, datos)) fijarBorradorEnUrl();
+  }
+  else almacen.eliminar(usuarioId, borradorActualId);
+  actualizarContadorBorradores();
 }
 
 function programarGuardadoBorrador() {
@@ -2289,28 +2315,29 @@ function programarGuardadoBorrador() {
   temporizadorBorrador = setTimeout(guardarBorradorRendicion, 500);
 }
 
-function leerBorradorRendicion() {
-  const clave = claveBorradorRendicion();
-  if (!clave) return null;
-  try {
-    const borrador = JSON.parse(localStorage.getItem(clave) || "null");
-    if (!borrador || borrador.version !== 1 || !Array.isArray(borrador.items)) return null;
-    if (Date.now() - new Date(borrador.guardado).getTime() > VIGENCIA_BORRADOR_MS) { localStorage.removeItem(clave); return null; }
-    return borrador;
-  } catch { return null; }
+// Devuelve la entrada completa (con sus fechas) o null si no existe o caducó.
+function leerBorradorRendicion(id) {
+  const almacen = almacenBorradores();
+  return almacen && currentUser?.id && id ? almacen.obtener(currentUser.id, id) : null;
 }
 
 function borrarBorradorRendicion() {
   clearTimeout(temporizadorBorrador);
   temporizadorBorrador = null;
-  try { const clave = claveBorradorRendicion(); if (clave) localStorage.removeItem(clave); } catch { /* nada que borrar */ }
+  const almacen = almacenBorradores();
+  if (almacen && currentUser?.id && borradorActualId) almacen.eliminar(currentUser.id, borradorActualId);
+  // El formulario sigue lleno hasta que se abra otro: sin esto, el guardado al salir de la
+  // pantalla (ver show) volvería a crear el borrador que se acaba de enviar o descartar.
+  borradorActualId = null;
+  actualizarContadorBorradores();
 }
 
 function formularioTieneArchivos() {
   return [...document.querySelectorAll('#items-container input[type="file"]')].some((i) => i.files && i.files.length);
 }
 
-async function restaurarBorradorRendicion(borrador) {
+async function restaurarBorradorRendicion(entrada) {
+  const borrador = entrada.datos;
   restaurandoBorrador = true;
   try {
     const poner = (id, valor) => { const campo = document.getElementById(id); if (campo && valor != null && valor !== "") campo.value = valor; };
@@ -2343,7 +2370,7 @@ async function restaurarBorradorRendicion(borrador) {
     });
     recalcTotal();
     actualizarAlertasDuplicados();
-    mostrarAvisoBorrador(borrador);
+    mostrarAvisoBorrador(entrada);
     if (esFondo) {
       await cargarSolicitudesDisponibles();
       const selFondo = document.getElementById("nr-fondo");
@@ -2360,25 +2387,74 @@ function quitarAvisoBorrador() {
   document.getElementById("nr-aviso-borrador")?.remove();
 }
 
-function mostrarAvisoBorrador(borrador) {
+function mostrarAvisoBorrador(entrada) {
   quitarAvisoBorrador();
-  const cuando = new Date(borrador.guardado).toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
-  const descartar = el("button", { class: "btn btn-secondary btn-sm", type: "button" }, "Empezar de cero");
+  const cuando = new Date(entrada.actualizado).toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
+  const descartar = el("button", { class: "btn btn-secondary btn-sm", type: "button" }, "Descartar este borrador");
   descartar.addEventListener("click", () => {
-    if (!confirm("¿Descartar el borrador y empezar una rendición en blanco?")) return;
+    if (!confirm("¿Descartar este borrador y empezar una rendición en blanco?")) return;
     borrarBorradorRendicion();
-    openNuevaRendicion(false, { sinBorrador: true });
+    openNuevaRendicion(false);
   });
   const aviso = el("div", { class: "card", id: "nr-aviso-borrador", style: "margin-bottom:18px;border:1px solid var(--warn);" }, [
-    el("p", { style: "margin:0 0 8px;font-size:0.9rem;" }, `Recuperamos tu borrador (guardado el ${cuando}). Los comprobantes no se guardan: vuelve a adjuntar el de cada ítem antes de enviar.`),
+    el("p", { style: "margin:0 0 8px;font-size:0.9rem;" }, `Retomaste un borrador (última edición: ${cuando}). Los comprobantes no se guardan: vuelve a adjuntar el de cada ítem antes de enviar.`),
     descartar,
   ]);
   document.querySelector("#view-nueva .hero-row")?.after(aviso);
 }
 
+// Lista de borradores guardados: retomar uno o eliminarlo.
+function openBorradores(pushHistory = true) {
+  guardarBorradorRendicion();
+  renderListaBorradores();
+  if (pushHistory) pushView("view-borradores"); else show("view-borradores");
+}
+
+function renderListaBorradores() {
+  const caja = document.getElementById("borradores-lista");
+  const almacen = almacenBorradores();
+  const entradas = almacen && currentUser?.id ? almacen.listar(currentUser.id) : [];
+  caja.replaceChildren();
+  actualizarContadorBorradores();
+  if (!entradas.length) {
+    caja.append(el("div", { class: "empty-state" }, "No tienes borradores. Lo que empieces a escribir en una nueva rendición se guarda aquí solo."));
+    return;
+  }
+  for (const entrada of entradas) {
+    const d = window.RindeBorradores.describir(entrada);
+    const caduca = d.diasRestantes <= 1 ? "Caduca en menos de 24 horas" : `Caduca en ${d.diasRestantes} días`;
+    const cuando = new Date(d.actualizado).toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
+    const continuar = el("button", { class: "btn btn-primary btn-sm", type: "button" }, "Continuar");
+    continuar.addEventListener("click", () => openNuevaRendicion(true, { borradorId: d.id }));
+    const eliminar = el("button", { class: "btn btn-secondary btn-sm", type: "button" }, "Eliminar");
+    eliminar.addEventListener("click", () => {
+      if (!confirm(`¿Eliminar el borrador "${d.titulo}"? No se puede deshacer.`)) return;
+      almacen.eliminar(currentUser.id, d.id);
+      if (d.id === borradorActualId) borradorActualId = null;
+      renderListaBorradores();
+      toast("Borrador eliminado.");
+    });
+    caja.append(el("div", { class: "card borrador-card" }, [
+      el("div", { class: "borrador-info" }, [
+        el("strong", {}, d.titulo),
+        el("span", { class: "borrador-meta" }, `${d.empresa} · ${d.gastos} ${d.gastos === 1 ? "gasto" : "gastos"} · ${fmtCLP(d.total)}`),
+        el("small", { class: "borrador-meta" }, `Última edición: ${cuando}`),
+      ]),
+      el("span", { class: "borrador-caduca" + (d.porVencer ? " por-vencer" : "") }, caduca),
+      el("div", { class: "borrador-acciones" }, [continuar, eliminar]),
+    ]));
+  }
+}
+
 function openNuevaRendicion(pushHistory = true, opciones = {}) {
   if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
+  guardarBorradorRendicion(); // si había un formulario abierto, queda guardado antes de reemplazarlo
   quitarAvisoBorrador();
+  // Con "borradorId" (desde la lista o al recargar) se retoma ese borrador; sin él,
+  // es una rendición nueva con su propio borrador, que solo se guarda si se escribe algo.
+  const entrada = opciones.borradorId ? leerBorradorRendicion(opciones.borradorId) : null;
+  if (opciones.borradorId && !entrada) toast("Ese borrador ya no existe o caducó (duran una semana sin cambios).");
+  borradorActualId = entrada ? entrada.id : crypto.randomUUID();
   envioRendicionId = crypto.randomUUID();
   adjuntosBorrador.clear();
   document.getElementById("nr-fecha").value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
@@ -2409,9 +2485,13 @@ function openNuevaRendicion(pushHistory = true, opciones = {}) {
   ocrOrigen.clear();
   ocrMonto.clear();
   addItemRow();
-  const borrador = opciones.sinBorrador ? null : leerBorradorRendicion();
-  if (pushHistory) pushView("view-nueva"); else show("view-nueva");
-  if (borrador) restaurarBorradorRendicion(borrador).catch((err) => console.error("No se pudo restaurar el borrador:", err));
+  if (pushHistory) pushView("view-nueva", entrada ? { borradorId: entrada.id } : {});
+  else {
+    show("view-nueva");
+    // Si pedía un borrador que ya no existe, la URL no puede seguir apuntando a él.
+    if (!entrada && location.hash.startsWith("#nueva/")) history.replaceState({ viewId: "view-nueva", params: {}, portalDepth: history.state?.portalDepth || 0 }, "", "#nueva");
+  }
+  if (entrada) restaurarBorradorRendicion(entrada).catch((err) => console.error("No se pudo restaurar el borrador:", err));
 }
 
 // Después de quitar un ítem, "Ítem 1, Ítem 3" (saltándose el 2) da la
@@ -5561,8 +5641,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     }
     if(esPropia)box.appendChild(el("button",{class:"btn btn-primary",type:"button",onclick:async()=>{
       if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
-      if(leerBorradorRendicion()&&!confirm("Tienes una rendición sin enviar guardada. Si continúas, se reemplaza por esta. ¿Continuar?"))return;
-      openNuevaRendicion(true,{sinBorrador:true});document.getElementById("nr-empresa").value=s.empresa;actualizarCentroCostoRendicion();
+      openNuevaRendicion();document.getElementById("nr-empresa").value=s.empresa;actualizarCentroCostoRendicion();
       document.getElementById("nr-tipo").value="FondoPorRendir";document.getElementById("nr-fondo-wrap").style.display="block";
       await cargarSolicitudesDisponibles();document.getElementById("nr-fondo").value=s.id;window.RindeUI.updateFormSummary();
     }},"Rendir este fondo"));
