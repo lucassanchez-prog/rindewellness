@@ -23,7 +23,7 @@ let cuentasPermitidas = null;
 
 const EMPRESAS = [
   "Grupo Wellness SpA", "Dmoov SpA", "Dmoov Zona Sur SpA", "Dmoov PT Zona Sur SpA",
-  "Tactiq SpA", "Neo Gym Chile SpA", "Neo App SpA", "RFA SpA",
+  "Tactiq SpA", "Neo Gym Chile SpA", "Neo App SpA",
   "Centros Deportivos SpA", "Dmoov Corp SpA",
 ];
 const RUT_POR_EMPRESA = {
@@ -34,7 +34,7 @@ const RUT_POR_EMPRESA = {
   "Tactiq SpA": "77.902.057-6",
   "Neo Gym Chile SpA": "76.717.692-9",
   "Neo App SpA": "78.236.354-9",
-  "RFA SpA": "78.210.251-6",
+  "RFA SpA": "78.210.251-6", // fuera de EMPRESAS, pero su RUT sigue contando como RUT propio
   "Centros Deportivos SpA": "76.717.693-7",
   "Dmoov Corp SpA": "77.406.474-5",
 };
@@ -51,7 +51,6 @@ const CENTROS_COSTO_POR_EMPRESA = {
   "Tactiq SpA": ["Casa Matriz"],
   "Neo Gym Chile SpA": ["Casa Matriz", "NEO APP", "NEO GYM", "NEO LA FLORIDA", "NEO INDEPENDENCIA", "NEO PLAZA OESTE", "NEO MALL PLAZA NORTE", "NEO MALL PLAZA SUR", "MALL PLAZA ALAMEDA"],
   "Neo App SpA": ["Casa Matriz", "NEO APP"],
-  "RFA SpA": ["Casa Matriz"],
   "Centros Deportivos SpA": ["Casa Matriz"],
 };
 
