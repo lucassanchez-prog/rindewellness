@@ -1500,12 +1500,17 @@ async function openAdminUsuarios(pushHistory = true) {
   // Salud del sistema: cuántos fallos de OCR/correo dejó registrados
   // system_events en los últimos 7 días -- sin esto, nadie tenía ningún
   // motivo para pensar en ir a mirar esa tabla directamente en Supabase.
-  db.from("system_events")
-    .select("tipo, detalle")
-    .gte("created_at", new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
-    .like("tipo", "%_fail")
-    .then(({ data: eventos, error: errEventos }) => {
-      if (errEventos || !eventos || !eventos.length) return;
+  const desdeSalud = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  Promise.all([
+    db.from("system_events").select("tipo, detalle").gte("created_at", desdeSalud).like("tipo", "%_fail"),
+    db.from("system_events").select("metadata").eq("tipo", "ocr_resultado").gte("created_at", desdeSalud),
+    db.from("system_events").select("metadata").eq("tipo", "ocr_reintento_run").neq("metadata->>procesados", "0").gte("created_at", desdeSalud),
+  ])
+    .then(([fallos, enVivo, delBot]) => {
+      const eventos = fallos.error ? [] : (fallos.data || []);
+      const lecturas = contarLecturasPorProveedor(enVivo.error ? [] : enVivo.data, delBot.error ? [] : delBot.data);
+      const nombresProveedor = Object.keys(lecturas.total);
+      if (!eventos.length && !nombresProveedor.length) return;
       const porTipo = {};
       eventos.forEach((e) => {
         const grupo = porTipo[e.tipo] || (porTipo[e.tipo] = { n: 0, causas: {} });
@@ -1517,9 +1522,13 @@ async function openAdminUsuarios(pushHistory = true) {
         const principal = Object.entries(causas).sort((a, b) => b[1] - a[1])[0];
         return `${tipo} (${n})` + (principal ? ` · causa más frecuente (${principal[1]}): ${principal[0].slice(0, 160)}` : "");
       });
+      if (nombresProveedor.length) {
+        const detalle = nombresProveedor.sort((a, b) => lecturas.total[b] - lecturas.total[a]).map((p) => `${p} ${lecturas.total[p]}`).join(" · ");
+        lineas.push(`Lecturas con IA: ${detalle}` + (lecturas.delBot ? ` (${lecturas.delBot} las hizo el bot de reintentos)` : ""));
+      }
       list.insertBefore(
-        el("div", { class: "card", style: "border:1px solid var(--warn);margin-bottom:16px;" }, [
-          el("p", { style: "margin:0 0 4px;font-size:0.85rem;font-weight:600;" }, "⚠ Salud del sistema (últimos 7 días)"),
+        el("div", { class: "card", style: "border:1px solid " + (eventos.length ? "var(--warn)" : "var(--border, #2c3a44)") + ";margin-bottom:16px;" }, [
+          el("p", { style: "margin:0 0 4px;font-size:0.85rem;font-weight:600;" }, (eventos.length ? "⚠ " : "") + "Salud del sistema (últimos 7 días)"),
           ...lineas.map((linea) => el("p", { style: "margin:0;font-size:0.85rem;" }, linea)),
         ]),
         list.firstChild
@@ -1835,6 +1844,23 @@ function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = 
 // la vez desde la columna "Perfil" en Usuarios, en vez de marcarles las
 // cuentas una por una.
 // ------------------------------------------------------------
+// Cuántas lecturas con IA hizo cada proveedor (gemini, groq), sumando las de en
+// vivo (ocr-recibo guarda "proveedor" en cada ocr_resultado) y las del bot de
+// reintentos (cada ocr_reintento_run guarda "proveedores" con su conteo).
+function contarLecturasPorProveedor(eventosEnVivo, eventosBot) {
+  const total = {};
+  let delBot = 0;
+  const sumar = (proveedor, n) => { total[proveedor] = (total[proveedor] || 0) + n; };
+  (eventosEnVivo || []).forEach((e) => { if (e.metadata?.proveedor) sumar(e.metadata.proveedor, 1); });
+  (eventosBot || []).forEach((e) => {
+    Object.entries(e.metadata?.proveedores || {}).forEach(([proveedor, n]) => {
+      const cantidad = Number(n) || 0;
+      if (cantidad > 0) { sumar(proveedor, cantidad); delBot += cantidad; }
+    });
+  });
+  return { total, delBot };
+}
+
 // Registra un fondo por rendir que Finanzas ya entregó fuera de la app: queda
 // Aprobado a nombre de quien lo registra y deja un evento de auditoría. La
 // función de base de datos exige rol admin y no deja registrarse uno mismo.

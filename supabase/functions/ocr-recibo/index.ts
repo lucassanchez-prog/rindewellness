@@ -221,7 +221,7 @@ Deno.serve(async (req: Request) => {
       await logEvent(admin, "ocr_vacio", { usuarioId: userId });
     }
 
-    await logEvent(admin,"ocr_resultado",{usuarioId:userId,metadata:{estado:(resultado as any).revision_estado,campos_pendientes:(resultado as any).campos_pendientes || []}});
+    await logEvent(admin,"ocr_resultado",{usuarioId:userId,metadata:{estado:(resultado as any).revision_estado,campos_pendientes:(resultado as any).campos_pendientes || [],proveedor:resultado.proveedor_lectura ?? null}});
     if ((resultado as any).revision_estado === "completo" || resultado.requiere_separacion) {
       const {error: errorGuardar} = await admin.from("ocr_lecturas_cache").upsert({usuario_id:userId,contenido_hash:hashLectura,version:4,resultado,created_at:new Date().toISOString()},{onConflict:"usuario_id,contenido_hash,version"});
       if (errorGuardar) console.error("No se pudo guardar caché OCR:",errorGuardar.message);

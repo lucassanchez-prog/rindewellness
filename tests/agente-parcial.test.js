@@ -14,3 +14,18 @@ test('el agente conserva la lectura parcial y reintenta solo los huecos con pres
  await c.procesarPendiente(admin,'rendicion_items','i','u/foto',1,col,null,'u','reserva');
  assert.equal(estados[1].ocr_reintento_estado,'listo');assert.equal(estados[1].ocr_reintento_resultado.nombre_proveedor,'Comercio');assert.equal(estados[1].ocr_reintento_resultado.fecha,'2026-10-01');assert(!enfoques[1].camposFaltantes.includes('nombre_proveedor'));
 });
+test('el agente informa qué proveedor leyó cada comprobante, y nada si falló',async()=>{
+ const {revisarCompletitud,estadoTrasIntento}=await import(pathToFileURL(path.join(__dirname,'../supabase/functions/_shared/estado-lectura.ts')));
+ const {fusionarIntentosOcr}=await import(pathToFileURL(path.join(__dirname,'../supabase/functions/_shared/fusion-lectura.ts')));
+ const admin={storage:{from:()=>({download:async()=>({data:new Blob(['foto'],{type:'image/jpeg'}),error:null})})},from:()=>{const q={select:()=>q,eq:()=>q,maybeSingle:async()=>({data:{tipo_item:'SinDocumento',monto:12000},error:null}),update:()=>q,then:resolve=>resolve({data:[{id:'i'}],error:null})};return q;}};
+ const col={estado:'ocr_reintento_estado',resultado:'ocr_reintento_resultado',intentos:'ocr_reintento_intentos',ultimo:'ocr_reintento_ultimo'};
+ const correr=async(lectura)=>{
+  const c=vm.createContext({console:{error(){}},Blob,Date,Object,Error,MAX_INTENTOS:2,revisarCompletitud,estadoTrasIntento,fusionarIntentosOcr,PRESUPUESTO_SEGUNDO_PLANO:{},rutaPropia:()=>true,arrayBufferToBase64:()=> 'Zm90bw==',mimeTypeDesdeNombre:()=> 'image/jpeg',tieneDatosUtiles:()=>true,demoraTransitoriaOcr:()=>null,leerComprobante:lectura});
+  const a=fuente.indexOf('const CAMPOS_OCR ='),b=fuente.indexOf('const COL_ITEMS',a);vm.runInContext(stripTypeScriptTypes(fuente.slice(a,b)),c);
+  return c.procesarPendiente(admin,'rendicion_items','i','u/foto',0,col,null,'u','reserva');
+ };
+ assert.equal(await correr(async()=>({tipo_documento:'Voucher',nombre_proveedor:'Comercio',proveedor_lectura:'groq'})),'groq');
+ assert.equal(await correr(async()=>({tipo_documento:'Voucher',nombre_proveedor:'Comercio',proveedor_lectura:'gemini'})),'gemini');
+ assert.equal(await correr(async()=>({tipo_documento:'Voucher',nombre_proveedor:'Comercio'})),'desconocido');
+ assert.equal(await correr(async()=>{throw new Error('cuota');}),null);
+});

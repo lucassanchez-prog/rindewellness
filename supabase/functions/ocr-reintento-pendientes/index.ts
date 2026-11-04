@@ -188,7 +188,7 @@ async function procesarPendiente(
   datosParciales: Record<string, unknown> | null,
   usuarioId: string,
   token: string,
-): Promise<boolean> {
+): Promise<string | null> {
   const guardar = async (cambios: Record<string, unknown>) => {
     const { data, error } = await admin.from(tabla)
       .update({ ocr_lease_token: null, ocr_lease_hasta: null, ...cambios })
@@ -210,7 +210,7 @@ async function procesarPendiente(
         [col.ultimo]: new Date().toISOString(),
       });
       console.error(`${tabla}: comprobante no encontrado para ${id}, se agota sin reintentar.`);
-      return false;
+      return null;
     }
     const base64 = arrayBufferToBase64(await archivo.arrayBuffer());
     const mimeType = archivo.type || mimeTypeDesdeNombre(storagePath);
@@ -252,7 +252,7 @@ async function procesarPendiente(
       [col.intentos]: intentosPrevios + 1,
       [col.ultimo]: new Date().toISOString(),
     });
-    return true;
+    return resultado.proveedor_lectura ?? "desconocido";
   } catch (err) {
     const demora = demoraTransitoriaOcr(err);
     const intentos = intentosPrevios + (demora ? 0 : 1);
@@ -263,7 +263,7 @@ async function procesarPendiente(
       [col.ultimo]: new Date().toISOString(),
     });
     console.error(`${tabla}: ${id} falló (intento ${intentos}):`, err);
-    return false;
+    return null;
   }
 }
 
@@ -291,6 +291,7 @@ Deno.serve(async (req: Request) => {
     const inicioCorrida = Date.now();
     let procesados = 0;
     let exitosos = 0;
+    const proveedores: Record<string, number> = {};
     const { data: trabajos, error: errReserva } = await admin.rpc("reservar_trabajos_ocr", {
       p_usuario: auth.modo === "usuario" ? auth.usuarioId : null, p_lote: 1,
     });
@@ -305,15 +306,19 @@ Deno.serve(async (req: Request) => {
       }
       procesados++;
       const columnas = trabajo.tabla === "ocr_previos" ? COL_PREVIOS : COL_ITEMS;
-      if (await procesarPendiente(admin, trabajo.tabla, trabajo.id, trabajo.path, trabajo.intentos || 0,
-        columnas, trabajo.parciales || null, trabajo.usuario_id, trabajo.token)) exitosos++;
+      const proveedor = await procesarPendiente(admin, trabajo.tabla, trabajo.id, trabajo.path, trabajo.intentos || 0,
+        columnas, trabajo.parciales || null, trabajo.usuario_id, trabajo.token);
+      if (proveedor) {
+        exitosos++;
+        proveedores[proveedor] = (proveedores[proveedor] || 0) + 1;
+      }
     }
 
     // Un solo evento por corrida (no uno por comprobante) -- corre cada 5
     // min sin que nadie lo esté mirando; un resumen agregado alcanza para
     // el registro y para el auto-frenado de arriba, y no infla
     // system_events con docenas de filas por hora.
-    await logEvent(admin, "ocr_reintento_run", { metadata: { procesados, exitosos } });
+    await logEvent(admin, "ocr_reintento_run", { metadata: { procesados, exitosos, proveedores } });
     return new Response(JSON.stringify({ ok: true, procesados, exitosos }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
