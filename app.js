@@ -1390,7 +1390,12 @@ async function openAdminUsuarios(pushHistory = true) {
     btnRecordatorios.textContent = "Enviando...";
     const { data, error } = await db.functions.invoke("recordatorios-pendientes", {});
     if (error || !data?.ok) {
-      toast("No se pudo enviar: " + (error?.message || data?.error || "revisa los logs de la función en Supabase."));
+      let mensaje = error?.message;
+      try {
+        const cuerpo = await error?.context?.json();
+        if (cuerpo?.error) mensaje = cuerpo.error;
+      } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
+      toast("No se pudo enviar: " + (mensaje || data?.error || "revisa los logs de la función en Supabase."));
     } else if (data.total_pendientes) {
       toast(`Recordatorio enviado a ${data.enviados} persona(s) sobre ${data.total_pendientes} pendiente(s).`);
     } else {
@@ -1408,7 +1413,12 @@ async function openAdminUsuarios(pushHistory = true) {
     btnLimpiarStorage.textContent = "Limpiando...";
     const { data, error } = await db.functions.invoke("limpiar-storage-huerfano", {});
     if (error || !data?.ok) {
-      toast("No se pudo limpiar: " + (error?.message || data?.error || "revisa los logs de la función en Supabase."));
+      let mensaje = error?.message;
+      try {
+        const cuerpo = await error?.context?.json();
+        if (cuerpo?.error) mensaje = cuerpo.error;
+      } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
+      toast("No se pudo limpiar: " + (mensaje || data?.error || "revisa los logs de la función en Supabase."));
     } else {
       toast(data.borrados ? `Se borraron ${data.borrados} archivo(s) huérfano(s).` : (data.nota || "No había archivos huérfanos."));
     }
@@ -3502,7 +3512,12 @@ async function openDetalle(id, pushHistory = true) {
       btnReenviar.textContent = "Enviando...";
       const { data, error } = await db.functions.invoke("notificar-estado-rendicion", { body: { rendicion_id: r.id } });
       if (error || !data?.ok) {
-        toast("No se pudo enviar: " + (error?.message || "revisa los logs de la función en Supabase."));
+        let mensaje = error?.message;
+        try {
+          const cuerpo = await error?.context?.json();
+          if (cuerpo?.error) mensaje = cuerpo.error;
+        } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
+        toast("No se pudo enviar: " + (mensaje || data?.error || "revisa los logs de la función en Supabase."));
       } else {
         toast("Notificación reenviada.");
       }
