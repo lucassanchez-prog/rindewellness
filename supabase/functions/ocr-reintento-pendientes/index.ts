@@ -61,7 +61,7 @@ import { demoraTransitoriaOcr } from "../_shared/reintentos-ocr.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { rutaPropia } from "../_shared/data.ts";
 import { logEvent } from "../_shared/logging.ts";
-import { leerComprobante, tieneDatosUtiles, PRESUPUESTO_SEGUNDO_PLANO } from "../_shared/gemini-ocr.ts";
+import { leerComprobante, tieneDatosUtiles, proveedoresDisponibles, PRESUPUESTO_SEGUNDO_PLANO } from "../_shared/gemini-ocr.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -276,6 +276,19 @@ Deno.serve(async (req: Request) => {
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
   try {
     const auth = await autorizar(req);
+
+    // Si TODOS los proveedores de IA están en enfriamiento (Gemini sin cupo y
+    // Groq en su límite gratuito), una corrida solo reservaría un comprobante
+    // para devolverlo sin leer, y aplazaría cada uno otra hora. Se salta
+    // entera y se retoma sola cuando el primero se libere. A diferencia del
+    // auto-frenado de abajo, que reacciona a fallos pasados, esto mira el
+    // estado actual, así que vale para el cron y para el disparo de un usuario.
+    const disponibilidad = await proveedoresDisponibles(admin);
+    if (!disponibilidad.disponible) {
+      return new Response(JSON.stringify({ ok: true, procesados: 0, exitosos: 0, nota: "Pausado: todos los proveedores de IA están sin cupo" + (disponibilidad.hasta ? ` hasta ${disponibilidad.hasta}` : "") + "." }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     // El auto-frenado por caída generalizada es cosa del cron (que insiste
     // sobre TODOS los pendientes de TODOS los usuarios cada 5 min) -- un

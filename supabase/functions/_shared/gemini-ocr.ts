@@ -33,16 +33,24 @@ const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 // blog posts/changelog público de Google ya falló DOS veces el mismo día:
 // "gemini-2.5-flash" resultó dado de baja para esta cuenta ("no longer
 // available to new users"), y "gemini-3.1-pro" directamente nunca existió
-// como ID (el real es "gemini-3.1-pro-preview", que es OTRO modelo). Esta
-// lista SÍ está verificada -- se confirmó contra la API real de Google
-// (GET /v1beta/models con esta misma GEMINI_API_KEY). Todos "flash" --
-// rápidos/baratos, apropiados para esta extracción estructurada -- salvo el
-// último, "gemini-flash-latest", que es un ALIAS que Google mantiene
-// apuntando al flash vigente en cada momento (nunca hay que actualizarlo a
-// mano cuando Google lance un modelo nuevo), como último recurso antes de
-// rendirse. Configurable por si Google vuelve a cambiar la disponibilidad
-// de alguno, para ajustar el conjunto sin esperar un redeploy del código.
-const GEMINI_MODELOS_BASE = (Deno.env.get("GEMINI_MODELS_ORDEN") || "gemini-3.6-flash,gemini-3.5-flash,gemini-3.7-flash,gemini-flash-latest")
+// como ID (el real es "gemini-3.1-pro-preview", que es OTRO modelo).
+//
+// Revisión del 2026-11-04 contra la página oficial de modelos de Google:
+// "gemini-3.6-flash" figura en Deprecations ("se apagará pronto") y el flash
+// vigente es "gemini-3.8-flash". "gemini-3.5-flash-lite" es el modelo más
+// barato y de mayor volumen: su cupo diario gratuito es bastante mayor que el
+// de los "flash" (cifra a confirmar en AI Studio > límites), y por eso va
+// segundo: cuando el flash agota su cupo, es el que sigue leyendo. Ninguno de
+// los dos nuevos se probó todavía con la API key de ESTE proyecto: si alguno
+// no existe, responde "not found", se salta solo y queda en enfriamiento
+// (ver esModeloNoDisponible). Por eso los dos antiguos NO se quitaron: van al
+// final como último recurso (cada modelo trae su propio cupo diario), y
+// cuando Google los apague pasan a "not found" y se enfrían solos. Sacarlos
+// de la lista es seguro una vez confirmado que los nuevos responden. El
+// intermedio, "gemini-flash-latest", es un ALIAS que Google mantiene
+// apuntando al flash vigente. Si el secret GEMINI_MODELS_ORDEN está definido
+// en Supabase, MANDA sobre esta lista.
+const GEMINI_MODELOS_BASE = (Deno.env.get("GEMINI_MODELS_ORDEN") || "gemini-3.8-flash,gemini-3.5-flash-lite,gemini-3.5-flash,gemini-flash-latest,gemini-3.7-flash,gemini-3.6-flash")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
@@ -89,16 +97,36 @@ function calcularEnfriamiento(mensaje: string): number {
   return ENFRIAMIENTO_POR_DEFECTO_MS;
 }
 
-async function registrarIntentoModelo(admin: AdminClient | null, modelo: string, exito: boolean, mensajeError?: string) {
+// Un modelo que no existe (o ya se apagó) responde siempre lo mismo, así que
+// insistir en cada lectura solo suma una llamada fallida por delante. Se lo
+// deja en enfriamiento un buen rato, igual que a uno sin cuota.
+const esModeloNoDisponible = (mensaje: string) =>
+  /is not found|not supported for|no longer available|has been shut ?down|deprecated/i.test(mensaje);
+const ENFRIAMIENTO_MODELO_NO_DISPONIBLE_MS = 6 * 60 * 60 * 1000;
+
+// El respaldo Groq comparte la tabla de enfriamientos con los modelos de
+// Gemini, con "groq" como nombre. ordenarModelosPorRendimiento solo mira los
+// de GEMINI_MODELOS_BASE, así que no se mezclan.
+const PROVEEDOR_GROQ = "groq";
+// Plan gratuito de Groq para este modelo (docs oficiales, 2026-11-04): 8.000
+// tokens/minuto y 200.000 tokens/día, así que lo que se agota primero son los
+// tokens, no las solicitudes. Su 429 trae "retry-after" en segundos, que es lo
+// que se usa; este valor solo rige si esa cabecera no viene.
+const ENFRIAMIENTO_GROQ_POR_DEFECTO_MS = 5 * 60 * 1000;
+const esLimiteGroq = (error: unknown) => /límite gratuito|agotó su cuota/i.test(error instanceof Error ? error.message : String(error));
+
+async function registrarIntentoModelo(admin: AdminClient | null, modelo: string, exito: boolean, mensajeError?: string, enfriamientoMs?: number) {
   if (!admin) return;
   try {
     const ahora = new Date();
-    // Si el fallo fue por cuota, se anota hasta cuándo no vale la pena
-    // volver a llamarlo -- ver ordenarModelosPorRendimiento, que directamente
-    // lo saca de la lista hasta esa hora.
-    const enfriamiento = !exito && mensajeError && esErrorDeCuota(mensajeError)
-      ? new Date(ahora.getTime() + calcularEnfriamiento(mensajeError)).toISOString()
-      : null;
+    // Si el fallo fue por cuota (o el modelo no existe), se anota hasta cuándo
+    // no vale la pena volver a llamarlo -- ver ordenarModelosPorRendimiento,
+    // que directamente lo saca de la lista hasta esa hora. "enfriamientoMs"
+    // explícito lo usa Groq, cuyos mensajes no son los de Google.
+    const msEnfriamiento = exito || !mensajeError ? null
+      : enfriamientoMs ?? (esErrorDeCuota(mensajeError) ? calcularEnfriamiento(mensajeError)
+        : esModeloNoDisponible(mensajeError) ? ENFRIAMIENTO_MODELO_NO_DISPONIBLE_MS : null);
+    const enfriamiento = msEnfriamiento === null ? null : new Date(ahora.getTime() + msEnfriamiento).toISOString();
     // Vía RPC y no con select + upsert desde acá, por dos motivos que la
     // versión anterior tenía mal:
     //  - Los contadores se leían y se volvían a escribir en dos pasos, así
@@ -685,8 +713,43 @@ export function tieneDatosUtiles(resultado: ResultadoOcr): boolean {
     || resultado.monto_discrepante === true;
 }
 
+const configGroq=()=>Object.fromEntries(['GROQ_OCR_ENABLED','GROQ_OCR_CONSENT','GROQ_PLAN','GROQ_API_KEY'].map(k=>[k,Deno.env.get(k)]));
+
+// Hasta cuándo (ms) Groq está en enfriamiento, o null si se puede llamar. Si
+// no se puede consultar, se asume que sí (falla abierto).
+async function groqEnEnfriamiento(admin:AdminClient|null):Promise<number|null>{
+  if(!admin)return null;
+  try{
+    const {data,error}=await admin.from("gemini_modelo_stats").select("disponible_desde").eq("modelo",PROVEEDOR_GROQ).maybeSingle();
+    if(error||!data?.disponible_desde)return null;
+    const hasta=new Date(data.disponible_desde as string).getTime();
+    return Number.isFinite(hasta)&&hasta>Date.now()?hasta:null;
+  }catch{return null;}
+}
+
+// ¿Queda algún proveedor al que valga la pena llamar ahora? Lo usa el agente en
+// segundo plano para no gastar ni una corrida cuando TODOS están en
+// enfriamiento. Sin proveedores configurados, o si no se puede consultar, se
+// responde que sí: es mejor que el error real se vea a frenar de más.
+export async function proveedoresDisponibles(admin:AdminClient|null):Promise<{disponible:boolean;hasta:string|null}>{
+  const libre={disponible:true,hasta:null};
+  if(!admin)return libre;
+  const groqActivo=habilitado(configGroq());
+  if(!GEMINI_API_KEY&&!groqActivo)return libre;
+  try{
+    const {data:filas,error}=await admin.from("gemini_modelo_stats").select("modelo, disponible_desde").in("modelo",[...GEMINI_MODELOS_BASE,PROVEEDOR_GROQ]);
+    if(error)return libre;
+    const ahora=Date.now();
+    const hasta=new Map((filas||[]).map((f)=>[f.modelo as string,f.disponible_desde?new Date(f.disponible_desde as string).getTime():0]));
+    const nombres=[...(GEMINI_API_KEY?GEMINI_MODELOS_BASE:[]),...(groqActivo?[PROVEEDOR_GROQ]:[])];
+    if(nombres.some((n)=>(hasta.get(n)??0)<=ahora))return libre;
+    const proximos=nombres.map((n)=>hasta.get(n)??0).filter((t)=>t>ahora);
+    return {disponible:false,hasta:proximos.length?new Date(Math.min(...proximos)).toISOString():null};
+  }catch{return libre;}
+}
+
 export async function leerComprobante(admin:AdminClient|null,imageBase64:string,mimeType:string,presupuesto:PresupuestoTiempo=PRESUPUESTO_EN_VIVO,enfoque?:{camposFaltantes?:string[]|null;datosParciales?:Record<string,unknown>|null;tipoItem?:string|null}):Promise<ResultadoOcr>{
-  const config=Object.fromEntries(['GROQ_OCR_ENABLED','GROQ_OCR_CONSENT','GROQ_PLAN','GROQ_API_KEY'].map(k=>[k,Deno.env.get(k)]));
+  const config=configGroq();
   const permitido=habilitado(config)&&['image/jpeg','image/png','image/webp'].includes(mimeType);
   const inicio=Date.now();
   try{
@@ -697,8 +760,25 @@ export async function leerComprobante(admin:AdminClient|null,imageBase64:string,
     if(!permitido)throw error;
     const restante=presupuesto.totalMs-(Date.now()-inicio);
     if(restante<2000)throw error;
-    const bruto=await consultarGroq(imageBase64,mimeType,armarPrompt(enfoque?.camposFaltantes,enfoque?.datosParciales),config,restante);
-    const resultado=interpretarRespuestaOcr(bruto,{tipo_item:enfoque?.tipoItem ?? null});
-    return {...resultado,proveedor_lectura:'groq'} as ResultadoOcr;
+    // Groq ya dijo que no tiene cupo: no se le vuelve a golpear (cada intento
+    // recibía el mismo 429) y se responde al instante, sin hacer esperar a
+    // nadie. "retryAfterMs" deja que el agente aplace el comprobante justo
+    // hasta que se libere, en vez de una hora fija.
+    const hastaGroq=await groqEnEnfriamiento(admin);
+    if(hastaGroq!==null){
+      const agotado=new Error('La lectura automática con IA alcanzó su límite gratuito por ahora y se renueva sola. Completa los datos a mano: el comprobante queda en cola y se vuelve a leer más tarde.') as Error&{retryAfterMs?:number};
+      agotado.retryAfterMs=Math.max(30000,hastaGroq-Date.now());
+      throw agotado;
+    }
+    try{
+      const bruto=await consultarGroq(imageBase64,mimeType,armarPrompt(enfoque?.camposFaltantes,enfoque?.datosParciales),config,restante);
+      const resultado=interpretarRespuestaOcr(bruto,{tipo_item:enfoque?.tipoItem ?? null});
+      await registrarIntentoModelo(admin,PROVEEDOR_GROQ,true);
+      return {...resultado,proveedor_lectura:'groq'} as ResultadoOcr;
+    }catch(errorGroq){
+      const limite=esLimiteGroq(errorGroq);
+      await registrarIntentoModelo(admin,PROVEEDOR_GROQ,false,errorGroq instanceof Error?errorGroq.message:String(errorGroq),limite?((errorGroq as {retryAfterMs?:number}).retryAfterMs??ENFRIAMIENTO_GROQ_POR_DEFECTO_MS):undefined);
+      throw errorGroq;
+    }
   }
 }
