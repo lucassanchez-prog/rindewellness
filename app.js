@@ -1460,6 +1460,7 @@ async function openAdminUsuarios(pushHistory = true) {
   }
 
   document.getElementById("btn-ir-plantillas").onclick = () => openAdminPlantillas();
+  document.getElementById("btn-registrar-fondo").onclick = () => abrirFormularioFondoEntregado(list, usuarios);
 
   const btnRecordatorios = document.getElementById("btn-recordatorios");
   btnRecordatorios.onclick = async () => {
@@ -1468,12 +1469,8 @@ async function openAdminUsuarios(pushHistory = true) {
     btnRecordatorios.textContent = "Enviando...";
     const { data, error } = await db.functions.invoke("recordatorios-pendientes", {});
     if (error || !data?.ok) {
-      let mensaje = error?.message;
-      try {
-        const cuerpo = await error?.context?.json();
-        if (cuerpo?.error) mensaje = cuerpo.error;
-      } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
-      toast("No se pudo enviar: " + (mensaje || data?.error || "revisa los logs de la función en Supabase."));
+      const mensaje = error ? await mensajeErrorFuncion(error) : data?.error;
+      toast("No se pudo enviar: " + (mensaje || "revisa los logs de la función en Supabase."));
     } else if (data.total_pendientes) {
       toast(`Recordatorio enviado a ${data.enviados} persona(s) sobre ${data.total_pendientes} pendiente(s).`);
     } else {
@@ -1491,12 +1488,8 @@ async function openAdminUsuarios(pushHistory = true) {
     btnLimpiarStorage.textContent = "Limpiando...";
     const { data, error } = await db.functions.invoke("limpiar-storage-huerfano", {});
     if (error || !data?.ok) {
-      let mensaje = error?.message;
-      try {
-        const cuerpo = await error?.context?.json();
-        if (cuerpo?.error) mensaje = cuerpo.error;
-      } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
-      toast("No se pudo limpiar: " + (mensaje || data?.error || "revisa los logs de la función en Supabase."));
+      const mensaje = error ? await mensajeErrorFuncion(error) : data?.error;
+      toast("No se pudo limpiar: " + (mensaje || "revisa los logs de la función en Supabase."));
     } else {
       toast(data.borrados ? `Se borraron ${data.borrados} archivo(s) huérfano(s).` : (data.nota || "No había archivos huérfanos."));
     }
@@ -1508,17 +1501,26 @@ async function openAdminUsuarios(pushHistory = true) {
   // system_events en los últimos 7 días -- sin esto, nadie tenía ningún
   // motivo para pensar en ir a mirar esa tabla directamente en Supabase.
   db.from("system_events")
-    .select("tipo")
+    .select("tipo, detalle")
     .gte("created_at", new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
     .like("tipo", "%_fail")
     .then(({ data: eventos, error: errEventos }) => {
       if (errEventos || !eventos || !eventos.length) return;
-      const conteo = {};
-      eventos.forEach((e) => { conteo[e.tipo] = (conteo[e.tipo] || 0) + 1; });
-      const resumen = Object.entries(conteo).sort((a, b) => b[1] - a[1]).map(([tipo, n]) => `${tipo} (${n})`).join(" · ");
+      const porTipo = {};
+      eventos.forEach((e) => {
+        const grupo = porTipo[e.tipo] || (porTipo[e.tipo] = { n: 0, causas: {} });
+        grupo.n++;
+        const causa = (e.detalle || "").trim();
+        if (causa) grupo.causas[causa] = (grupo.causas[causa] || 0) + 1;
+      });
+      const lineas = Object.entries(porTipo).sort((a, b) => b[1].n - a[1].n).map(([tipo, { n, causas }]) => {
+        const principal = Object.entries(causas).sort((a, b) => b[1] - a[1])[0];
+        return `${tipo} (${n})` + (principal ? ` · causa más frecuente (${principal[1]}): ${principal[0].slice(0, 160)}` : "");
+      });
       list.insertBefore(
         el("div", { class: "card", style: "border:1px solid var(--warn);margin-bottom:16px;" }, [
-          el("p", { style: "margin:0;font-size:0.85rem;" }, `⚠ Salud del sistema (últimos 7 días): ${resumen}`),
+          el("p", { style: "margin:0 0 4px;font-size:0.85rem;font-weight:600;" }, "⚠ Salud del sistema (últimos 7 días)"),
+          ...lineas.map((linea) => el("p", { style: "margin:0;font-size:0.85rem;" }, linea)),
         ]),
         list.firstChild
       );
@@ -1833,6 +1835,79 @@ function renderCuentasPanel(panel, usuario, cuentasActuales, todosLosUsuarios = 
 // la vez desde la columna "Perfil" en Usuarios, en vez de marcarles las
 // cuentas una por una.
 // ------------------------------------------------------------
+// Registra un fondo por rendir que Finanzas ya entregó fuera de la app: queda
+// Aprobado a nombre de quien lo registra y deja un evento de auditoría. La
+// función de base de datos exige rol admin y no deja registrarse uno mismo.
+function abrirFormularioFondoEntregado(contenedor, usuarios) {
+  const previo = document.getElementById("form-fondo-entregado");
+  if (previo) { previo.remove(); return; }
+
+  const empleados = usuarios.filter((u) => u.activo !== false && u.id !== currentUser.id);
+  const selEmpleado = el("select", { id: "ff-empleado" }, [
+    el("option", { value: "" }, "Selecciona un empleado"),
+    ...empleados.map((u) => el("option", { value: u.id }, u.nombre)),
+  ]);
+  const selEmpresa = el("select", { id: "ff-empresa" }, EMPRESAS.map((e) => el("option", { value: e }, e)));
+  const selCC = el("select", { id: "ff-cc" });
+  const llenarCentros = () => {
+    selCC.innerHTML = "";
+    (CENTROS_COSTO_POR_EMPRESA[selEmpresa.value] || ["Casa Matriz"]).forEach((o) => selCC.appendChild(el("option", { value: o }, o)));
+  };
+  selEmpresa.addEventListener("change", llenarCentros);
+  llenarCentros();
+  const inpMonto = el("input", { id: "ff-monto", type: "text", inputmode: "numeric", placeholder: "0" });
+  inpMonto.addEventListener("input", () => formatearInputMoney(inpMonto));
+  const inpMotivo = el("input", { id: "ff-motivo", type: "text", placeholder: "Ej. Fondo transferido desde Neo para insumos" });
+  const btnRegistrar = el("button", { class: "btn btn-primary", type: "button" }, "Registrar fondo aprobado");
+  const btnCancelar = el("button", { class: "btn btn-secondary", type: "button" }, "Cancelar");
+
+  const tarjeta = el("div", { class: "card", id: "form-fondo-entregado", style: "margin-bottom:16px;" }, [
+    el("h3", { style: "margin:0 0 4px;" }, "Registrar fondo ya entregado"),
+    el("p", { style: "margin:0 0 12px;font-size:0.85rem;" }, "Queda aprobado de inmediato y el empleado lo verá disponible para rendir. Úsalo solo si el dinero ya fue transferido."),
+    el("div", { class: "field" }, [el("label", { for: "ff-empleado" }, "Empleado"), selEmpleado]),
+    el("div", { class: "field-row" }, [
+      el("div", { class: "field" }, [el("label", { for: "ff-empresa" }, "Empresa"), selEmpresa]),
+      el("div", { class: "field" }, [el("label", { for: "ff-cc" }, "Centro de costo"), selCC]),
+    ]),
+    el("div", { class: "field-row" }, [
+      el("div", { class: "field" }, [el("label", { for: "ff-monto" }, "Monto transferido"), inpMonto]),
+      el("div", { class: "field" }, [el("label", { for: "ff-motivo" }, "Motivo"), inpMotivo]),
+    ]),
+    el("div", { style: "display:flex;gap:10px;margin-top:12px;" }, [btnRegistrar, btnCancelar]),
+  ]);
+  btnCancelar.addEventListener("click", () => tarjeta.remove());
+
+  btnRegistrar.addEventListener("click", async () => {
+    const empleado = empleados.find((u) => u.id === selEmpleado.value);
+    const monto = parseMoneyValue(inpMonto.value);
+    const motivo = inpMotivo.value.trim();
+    if (!empleado) { toast("Selecciona al empleado."); return; }
+    if (!monto) { toast("Ingresa el monto transferido."); return; }
+    if (!motivo) { toast("Indica el motivo del fondo."); return; }
+    if (!confirm(`¿Registrar un fondo APROBADO de ${fmtCLP(monto)} para ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})?`)) return;
+
+    btnRegistrar.disabled = true;
+    btnRegistrar.textContent = "Registrando...";
+    const { data: folio, error } = await db.rpc("registrar_fondo_entregado", {
+      p_empleado_id: empleado.id,
+      p_empresa: selEmpresa.value,
+      p_centro_costo: selCC.value,
+      p_monto: monto,
+      p_motivo: motivo,
+    });
+    if (error) {
+      toast("No se pudo registrar el fondo: " + mensajeErrorAmigable(error));
+      btnRegistrar.disabled = false;
+      btnRegistrar.textContent = "Registrar fondo aprobado";
+      return;
+    }
+    toast(`Fondo S-${folio} registrado para ${empleado.nombre}.`);
+    tarjeta.remove();
+  });
+
+  contenedor.insertBefore(tarjeta, contenedor.firstChild);
+}
+
 async function openAdminPlantillas(pushHistory = true) {
   if (pushHistory) pushView("view-plantillas"); else show("view-plantillas");
   const list = document.getElementById("list-plantillas");
@@ -3727,6 +3802,18 @@ async function prepararComprobanteIa(file) {
   })().catch(error=>{fotosPreparadas.delete(file);throw error;}));
   return fotosPreparadas.get(file);
 }
+// Cuando una Edge Function responde con un status distinto de 2xx, supabase-js
+// arma un error genérico ("Edge Function returned a non-2xx status code") y NO
+// lee el cuerpo: el mensaje real que armó la función queda en error.context
+// (el Response), así que hay que leerlo a mano para no perderlo.
+async function cuerpoErrorFuncion(error) {
+  try { return await error.context?.json(); } catch { return null; }
+}
+
+async function mensajeErrorFuncion(error) {
+  return (await cuerpoErrorFuncion(error))?.error || error.message;
+}
+
 async function llamarOcrRecibo(file, camposFaltantes, datosParciales, tipoItem) {
   // Ambos proveedores ven la misma copia; la cola de nube recibe también esa imagen.
   file = await prepararComprobanteIa(file);
@@ -3760,25 +3847,13 @@ async function llamarOcrRecibo(file, camposFaltantes, datosParciales, tipoItem) 
     "Se agotó el tiempo de espera leyendo el comprobante (conexión muy lenta o caída). Completa los datos a mano, o inténtalo de nuevo."
   );
   if (error) {
-    // Cuando la Edge Function responde con un status distinto de 2xx,
-    // supabase-js arma un error genérico ("Edge Function returned a
-    // non-2xx status code") y NO lee el cuerpo -- el mensaje real y
-    // específico que arma ocr-recibo (ej. "high demand", "MAX_TOKENS",
-    // falta de configuración) queda en error.context (el Response),
-    // así que hay que leerlo a mano para no perderlo.
-    let mensaje = error.message;
-    let previaId = null;
-    try {
-      const cuerpo = await error.context?.json();
-      if (cuerpo?.error) mensaje = cuerpo.error;
-      // ocr-recibo sube el comprobante y lo encola en ocr_previos apenas
-      // falla en vivo (ver migracion_ocr_previo.sql) -- este id es lo que
-      // deja seguirlo (disparar el agente altiro + saber cuándo esté listo)
-      // sin esperar a que se envíe la rendición.
-      if (cuerpo?.previaId) previaId = cuerpo.previaId;
-    } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
-    const err = new Error(mensaje);
-    err.previaId = previaId;
+    const cuerpo = await cuerpoErrorFuncion(error);
+    const err = new Error(cuerpo?.error || error.message);
+    // ocr-recibo sube el comprobante y lo encola en ocr_previos apenas
+    // falla en vivo (ver migracion_ocr_previo.sql) -- este id es lo que
+    // deja seguirlo (disparar el agente altiro + saber cuándo esté listo)
+    // sin esperar a que se envíe la rendición.
+    err.previaId = cuerpo?.previaId || null;
     throw err;
   }
   if (data?.error) throw new Error(data.error);
@@ -4774,6 +4849,17 @@ function detalleMontoVerificado(v) {
     : "Monto revisado: " + fmtCLP(v.monto_rendido);
 }
 
+// Texto exacto que contabilidad guarda en "documento" (ej. "Factura Electrónica
+// #37896"). Un mismo proveedor puede repetir el número de folio con otro tipo
+// (una factura exenta #1 y una afecta #1), así que buscar solo "%#folio"
+// mezclaba documentos distintos. El folio va sin ceros a la izquierda (el SII
+// los numera como entero y contabilidad guarda "#3191702" aunque el papel diga
+// "003191702") y sin comodines de LIKE.
+function patronDocumentoContable(tipoDocumento, nroDocumento) {
+  const folio = String(nroDocumento ?? "").trim().replace(/^0+(?=\d)/, "").replace(/[\\%_]/g, "\\$&");
+  return `${tipoDocumento} #${folio}`;
+}
+
 async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicion = [item]) {
   box.className = "verify-box show";
   box.textContent = "Consultando...";
@@ -4791,9 +4877,9 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
     // mismo número de folio. Para estar 100% seguros de que es EL documento
     // correcto exigimos las tres cosas juntas: RUT empresa + RUT proveedor +
     // Folio. Además "documento" guarda el texto completo del documento
-    // (ej. "Factura Electrónica #115277"), así que anclamos el folio al
-    // final del texto, justo después de un "#", para no confundir folios
-    // que son substring de otros (ej. "277" no debe matchear "#115277").
+    // (ej. "Factura Electrónica #115277"), así que se busca ese texto exacto
+    // (ver patronDocumentoContable): "277" no debe matchear "#115277" ni una
+    // factura exenta con el mismo número.
     const rutEmpresa = RUT_POR_EMPRESA[empresaRendicion];
     if (!rutEmpresa) throw new Error("Falta identificar el RUT de la empresa de la rendición");
     // El nombre comercial puede diferir de la razón social: NEO SPA y
@@ -4801,7 +4887,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
     const consultar = async (rut) => {
       let query = dbContabilidad.from("movimientos").select("*",{count:"exact"})
         .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor)
-        .ilike(MOVIMIENTOS_COLS.folioDoc, `%#${item.nro_documento}`);
+        .ilike(MOVIMIENTOS_COLS.folioDoc, patronDocumentoContable(item.tipo_documento, item.nro_documento));
       if (rut) query = query.eq(MOVIMIENTOS_COLS.rutEmpresa, rut);
       const {data,error,count} = await query.limit(500);
       if (error) throw error;
@@ -4847,8 +4933,9 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
       : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
       : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
   } catch (err) {
+    console.error("verificarDocumentoItem:", err);
     box.className = "verify-box show err";
-    box.textContent = "No se pudo verificar el documento ni el monto. Intenta nuevamente o revisa el registro en contabilidad.";
+    box.textContent = "No se pudo verificar el documento ni el monto" + (err?.message ? ` (${err.message})` : "") + ". Intenta nuevamente o revisa el registro en contabilidad.";
   }
 }
 
@@ -5771,12 +5858,8 @@ async function openDetalle(id, pushHistory = true) {
       btnReenviar.textContent = "Enviando...";
       const { data, error } = await db.functions.invoke("notificar-estado-rendicion", { body: { rendicion_id: r.id } });
       if (error || !data?.ok) {
-        let mensaje = error?.message;
-        try {
-          const cuerpo = await error?.context?.json();
-          if (cuerpo?.error) mensaje = cuerpo.error;
-        } catch { /* el cuerpo no era JSON legible, se usa el mensaje genérico */ }
-        toast("No se pudo enviar: " + (mensaje || data?.error || "revisa los logs de la función en Supabase."));
+        const mensaje = error ? await mensajeErrorFuncion(error) : data?.error;
+        toast("No se pudo enviar: " + (mensaje || "revisa los logs de la función en Supabase."));
       } else {
         toast("Notificación reenviada.");
       }
@@ -5832,8 +5915,8 @@ async function updateChecked(table, id, cambios) {
 // .catch(): con solo este último, ese caso pasaba completamente
 // desapercibido, sin ni un console.error que lo delatara.
 function notificarAsync(fn, body, contexto) {
-  db.functions.invoke(fn, { body }).then(({ error }) => {
-    if (error) console.error(contexto, error);
+  db.functions.invoke(fn, { body }).then(async ({ error }) => {
+    if (error) console.error(contexto, await mensajeErrorFuncion(error), error);
   }).catch((err) => console.error(contexto, err));
 }
 

@@ -13,7 +13,7 @@ function preparar(filas=[original],opciones={}){
     const data=filas.filter(row=>filters.every(([k,v])=>v.startsWith('%')?String(row[k]).endsWith(v.slice(1)):row[k]===v));
     return {data,error:null,count:opciones.incompleto?501:data.length};
   }};
-  const ctx=vm.createContext({window:{RindeCore:core},fmtCLP:core.fmtCLP,nombreCuenta:()=>original.cuenta_nom,dbContabilidad:{from:()=>{filters.length=0;return consulta;}},updateChecked:async(table,id,values)=>{
+  const ctx=vm.createContext({console:{error(){}},window:{RindeCore:core},fmtCLP:core.fmtCLP,nombreCuenta:()=>original.cuenta_nom,dbContabilidad:{from:()=>{filters.length=0;return consulta;}},updateChecked:async(table,id,values)=>{
     writes.push({table,id,values});return opciones.falloGuardado?{ok:false,mensaje:'No se guardó'}:{ok:true,data:[values]};
   }});
   for(const [inicio,fin] of [['const RUT_POR_EMPRESA =','// Centros de Costo'],['const CUENTA_POR_TIPO_DOC =','const CUENTA_CONTRAPARTIDA'],['const MOVIMIENTOS_COLS =','// Busca el nombre'],['function compararMontoContable(','function recalcTotal()']]){
@@ -53,6 +53,21 @@ test('elige la cuenta de proveedores y no la primera línea del asiento',async()
   const p=preparar([{...original,id:2,cuenta_cod:'4.01.03.12',cuenta_nom:'Implementos',debe:28990,haber:0},original]);
   await p.ctx.verificarDocumentoItem(p.items[1],p.box,'Neo Gym Chile SpA',p.items);
   assert.equal(p.writes[0].values.cuenta_contable,'2.01.07.01');assert.equal(p.writes[0].values.verificacion_contable.nombre_cuenta,'Proveedores Nacionales');
+});
+test('no mezcla otro tipo de documento con el mismo folio',async()=>{
+  const exenta={...original,id:3,documento:'Factura Exenta Electrónica #149876710',comprobante:'900',haber:5000};
+  const p=preparar([original,exenta]);await p.ctx.verificarDocumentoItem(p.items[0],p.box,'Neo Gym Chile SpA',p.items);
+  const v=p.writes[0].values.verificacion_contable;
+  assert.equal(v.estado,'coincide');assert.equal(v.monto_contable,28990);
+});
+test('encuentra la factura aunque el folio traiga ceros a la izquierda',async()=>{
+  const p=preparar();for(const item of p.items)item.nro_documento='0149876710';
+  await p.ctx.verificarDocumentoItem(p.items[0],p.box,'Neo Gym Chile SpA',p.items);
+  assert.equal(p.writes[0].values.verificacion_contable.estado,'coincide');
+});
+test('muestra la causa real cuando la consulta falla',async()=>{
+  const p=preparar([original],{incompleto:true});await p.ctx.verificarDocumentoItem(p.items[0],p.box,'Neo Gym Chile SpA',p.items);
+  assert.match(p.box.textContent,/No se pudo verificar/);assert.match(p.box.textContent,/Resultado contable incompleto/);
 });
 test('no muestra verificación exitosa si falla el guardado',async()=>{
   const p=preparar([original],{falloGuardado:true});await p.ctx.verificarDocumentoItem(p.items[0],p.box,'Neo Gym Chile SpA',p.items);
