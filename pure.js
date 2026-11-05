@@ -167,7 +167,36 @@
     return items.sort((a, b) => (posicionItem(a) - posicionItem(b)) || String(a.id).localeCompare(String(b.id)));
   }
 
-  const RindeCore = { ordenarItemsRendicion, comprobanteEntregaFondo, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  // Multifondo: una rendición puede rendirse contra varios fondos. Todos menos
+  // el último tienen un tope (monto) y el último recibe el resto. Mismo cálculo
+  // que la vista rendiciones_por_fondo de la base: se llenan en orden y, si el
+  // total baja (un gasto rechazado), los últimos quedan con menos o en cero.
+  function repartirEntreFondos(total, fondos) {
+    let antes = 0;
+    return (fondos || []).map((fondo, i, lista) => {
+      const resto = Math.max(0, Number(total || 0) - antes);
+      const parte = i === lista.length - 1 ? resto : Math.min(Number(fondo.monto || 0), resto);
+      antes += Number(fondo.monto || 0);
+      return { ...fondo, parte };
+    });
+  }
+
+  // Mismas reglas que validar_fondos_rendicion() en la base, para avisar antes
+  // de enviar. Devuelve el mensaje de error o null si la lista sirve.
+  function validarFondosRendicion(fondos, total) {
+    const lista = fondos || [];
+    if (!lista.length || lista.length > 10) return "Asocia entre 1 y 10 fondos.";
+    if (lista.some((f) => !f.id)) return lista.length > 1 ? "Falta elegir uno de los fondos." : "Selecciona el fondo (solicitud aprobada) que estás rindiendo.";
+    if (new Set(lista.map((f) => f.id)).size !== lista.length) return "El mismo fondo aparece dos veces.";
+    if (lista.length === 1) return null;
+    const topes = lista.slice(0, -1);
+    if (topes.some((f) => !Number.isSafeInteger(Number(f.monto)) || Number(f.monto) <= 0)) return "Indica cuánto se rinde de cada fondo (el último recibe el resto).";
+    const suma = topes.reduce((s, f) => s + Number(f.monto), 0);
+    if (suma >= Number(total || 0)) return "Los montos asignados (" + fmtCLP(suma) + ") cubren todo el total (" + fmtCLP(total) + "): al último fondo no le queda nada.";
+    return null;
+  }
+
+  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion,comprobanteEntregaFondo, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

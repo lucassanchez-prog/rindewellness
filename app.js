@@ -770,9 +770,11 @@ async function cargarConsumoFondos(solicitudes) {
     const rendiciones = [];
     let correcto = true;
     for (let pagina = 0; ;) {
-      const {data,error,count} = await db.from("rendiciones")
+      // rendiciones_por_fondo trae la PARTE de cada rendición que le toca a cada
+      // fondo (una rendición multifondo aparece una vez por fondo).
+      const {data,error,count} = await db.from("rendiciones_por_fondo")
         .select("id,solicitud_fondo_id,monto_total,monto_aprobado,estado", {count:"exact"})
-        .in("solicitud_fondo_id",lote).order("id").range(pagina,pagina+499);
+        .in("solicitud_fondo_id",lote).order("id").order("solicitud_fondo_id").range(pagina,pagina+499);
       if (error) {console.error("No se pudo calcular el consumo de fondos",error); correcto=false; break;}
       rendiciones.push(...(data || []));
       if (!data || !data.length) {if (count && rendiciones.length < count) correcto=false; break;}
@@ -1370,8 +1372,8 @@ async function renderReportes() {
     table.appendChild(el("thead",{},[el("tr",{},cols.map(c=>el("th",{},c)))]));
     const body=el("tbody");
     for(const fund of solicitudesAprobadas){
-      const consumption=resumirConsumoFondo(dashboardData.aprobaciones.filter(r=>r.solicitud_fondo_id===fund.id),fund.monto_solicitado);
-      const values=["S-"+(fund.folio??"—")+" · "+(fund.empleado_nombre||"—"),fund.empresa||"—",fmtCLP(fund.monto_solicitado),fmtCLP(consumption.aprobado),fmtCLP(consumption.porRevisar),fmtCLP(Math.abs(consumption.saldo))+(consumption.saldo<0?" · Exceso":" · Disponible")];
+      const filasFondo=dashboardData.consumoFondos.get(fund.id),consumption=filasFondo?resumirConsumoFondo(filasFondo,fund.monto_solicitado):null;
+      const values=["S-"+(fund.folio??"—")+" · "+(fund.empleado_nombre||"—"),fund.empresa||"—",fmtCLP(fund.monto_solicitado),...(consumption?[fmtCLP(consumption.aprobado),fmtCLP(consumption.porRevisar),fmtCLP(Math.abs(consumption.saldo))+(consumption.saldo<0?" · Exceso":" · Disponible")]:["No disponible","No disponible","No disponible"])];
       body.appendChild(el("tr",{},values.map((value,i)=>el("td",{"data-label":cols[i],class:i>1?"monto":""},value))));
     }
     table.appendChild(body);cont.appendChild(el("div",{class:"table-scroll"},[table]));
@@ -2154,6 +2156,10 @@ function wireNuevaRendicion() {
     document.getElementById("nr-fondo-wrap").style.display = esFondo ? "block" : "none";
     if (esFondo) cargarSolicitudesDisponibles();
   });
+  document.getElementById("btn-add-fondo").addEventListener("click", () => agregarFilaFondo().querySelector("select").focus());
+  document.getElementById("nr-fondo").addEventListener("change", actualizarFondosFormulario);
+  const montoPrimerFondo = document.getElementById("nr-fondo-monto");
+  montoPrimerFondo.addEventListener("input", () => { formatearInputMoney(montoPrimerFondo); actualizarFondosFormulario(); });
 
   // Borrador automático (ver "Borrador de la rendición en curso"): se guarda
   // medio segundo después del último cambio, y al instante si la página se
@@ -2197,7 +2203,7 @@ async function cargarSolicitudesDisponibles() {
       const empresas=[...new Set(otras.map(s=>s.empresa).filter(e=>e&&e!==empresa))];
       sel.replaceChildren(el("option",{value:""},empresas.length?"Sin fondos en esta empresa. Cambia Empresa a: "+empresas.join(", "):"No tienes fondos aprobados"));return;
     }
-    const rendidas=await consultarTodas(()=>db.from("rendiciones").select("id, solicitud_fondo_id, monto_total, monto_aprobado, estado",{count:"exact"}).in("solicitud_fondo_id",solicitudes.map(s=>s.id)).order("created_at").order("id"));
+    const rendidas=await consultarTodas(()=>db.from("rendiciones_por_fondo").select("id, solicitud_fondo_id, monto_total, monto_aprobado, estado",{count:"exact"}).in("solicitud_fondo_id",solicitudes.map(s=>s.id)).order("created_at").order("id").order("solicitud_fondo_id"));
     if(!vigente())return;
     sel.replaceChildren(...solicitudes.map(fund=>{
       const consumption=resumirConsumoFondo(rendidas.filter(r=>r.solicitud_fondo_id===fund.id),fund.monto_solicitado);
@@ -2207,7 +2213,92 @@ async function cargarSolicitudesDisponibles() {
   }catch(error){
     if(vigente())sel.replaceChildren(el("option",{value:""},"No se pudo comprobar el saldo. Cambia el tipo de rendición para reintentar."));
     console.error("Error comprobando fondos disponibles:",error);
-  }finally{if(vigente()){sel.disabled=false;window.RindeUI?.updateFormSummary();}}
+  }finally{if(vigente()){sel.disabled=false;refrescarFilasFondo();}}
+}
+
+// ------------------------------------------------------------
+// Multifondo: una rendición puede rendirse contra varios fondos.
+// ------------------------------------------------------------
+// La primera fila es el desplegable de siempre (#nr-fondo); "+ Rendir también
+// contra otro fondo" agrega filas. Cada fondo menos el último lleva cuánto se
+// rinde de él, y el último recibe el resto del total (ver repartirEntreFondos,
+// que calcula igual que la base). Con un solo fondo no se pide monto.
+function opcionesFondoActuales() {
+  return [...document.getElementById("nr-fondo").options].filter((o) => o.value).map((o) => ({ value: o.value, text: o.textContent }));
+}
+
+function llenarSelectFondo(sel, valor) {
+  const opciones = opcionesFondoActuales();
+  sel.replaceChildren(el("option", { value: "" }, "Elige otro fondo"), ...opciones.map((o) => el("option", { value: o.value }, o.text)));
+  sel.value = opciones.some((o) => o.value === valor) ? valor : "";
+}
+
+function agregarFilaFondo(valor = "", monto = "") {
+  const sel = el("select", { class: "nr-fondo-extra", "aria-label": "Otro fondo" });
+  llenarSelectFondo(sel, valor);
+  const inp = el("input", { class: "nr-fondo-monto", type: "text", inputmode: "numeric", placeholder: "Monto de este fondo", "aria-label": "Monto rendido contra este fondo" });
+  inp.value = monto;
+  const quitar = el("button", { class: "btn btn-ghost btn-sm", type: "button", "aria-label": "Quitar este fondo" }, "Quitar");
+  const fila = el("div", { class: "nr-fondo-fila" }, [sel, inp, quitar]);
+  inp.addEventListener("input", () => { formatearInputMoney(inp); actualizarFondosFormulario(); });
+  sel.addEventListener("change", actualizarFondosFormulario);
+  quitar.addEventListener("click", () => { fila.remove(); actualizarFondosFormulario(); programarGuardadoBorrador(); });
+  document.getElementById("nr-fondos-extra").appendChild(fila);
+  actualizarFondosFormulario();
+  return fila;
+}
+
+function filasFondoFormulario() {
+  return [
+    { sel: document.getElementById("nr-fondo"), inp: document.getElementById("nr-fondo-monto") },
+    ...[...document.querySelectorAll("#nr-fondos-extra .nr-fondo-fila")].map((f) => ({ sel: f.querySelector("select"), inp: f.querySelector("input") })),
+  ];
+}
+
+function leerFondosFormulario() {
+  return filasFondoFormulario().map(({ sel, inp }, i, filas) => ({ id: sel.value, monto: i < filas.length - 1 ? parseMoneyValue(inp.value) : null }));
+}
+
+function totalFormulario() {
+  return parseMoneyValue(document.getElementById("nr-total")?.textContent || "");
+}
+
+function etiquetaFondo(id) {
+  const opcion = opcionesFondoActuales().find((o) => o.value === id);
+  return opcion ? opcion.text.split(" · ")[0] : "Fondo sin elegir";
+}
+
+// Muestra u oculta los montos (el último fondo no lleva: recibe el resto) y el
+// reparto resultante, o el error que impediría enviar.
+function actualizarFondosFormulario() {
+  const filas = filasFondoFormulario(), varios = filas.length > 1;
+  filas.forEach(({ inp }, i) => { inp.hidden = !varios || i === filas.length - 1; });
+  const resumen = document.getElementById("nr-fondos-resumen");
+  if (varios) {
+    const fondos = leerFondosFormulario(), total = totalFormulario();
+    const error = window.RindeCore.validarFondosRendicion(fondos, total);
+    resumen.hidden = false;
+    resumen.classList.toggle("error", Boolean(error));
+    resumen.textContent = error || "Reparto del total " + fmtCLP(total) + ": " +
+      window.RindeCore.repartirEntreFondos(total, fondos).map((f) => etiquetaFondo(f.id) + " " + fmtCLP(f.parte)).join(" · ") + ". El último fondo recibe el resto.";
+  } else {
+    resumen.hidden = true;
+  }
+  document.getElementById("btn-add-fondo").hidden = filas.length >= opcionesFondoActuales().length;
+  window.RindeUI?.updateFormSummary();
+}
+
+// Tras recargar los fondos (otra empresa, otro tipo), las filas extra se
+// rellenan con las opciones nuevas; si su fondo ya no está, quedan sin elegir.
+function refrescarFilasFondo() {
+  document.querySelectorAll("#nr-fondos-extra select").forEach((sel) => llenarSelectFondo(sel, sel.value));
+  actualizarFondosFormulario();
+}
+
+function limpiarFilasFondo() {
+  document.getElementById("nr-fondos-extra").replaceChildren();
+  document.getElementById("nr-fondo-monto").value = "";
+  actualizarFondosFormulario();
 }
 
 // El Centro de Costo se elige UNA vez a nivel de encabezado (igual que la
@@ -2279,6 +2370,8 @@ function capturarBorradorRendicion() {
   if (!conContenido) return null;
   return {
     fecha: valor("nr-fecha"), tipo: valor("nr-tipo"), fondo: valor("nr-fondo"),
+    fondoMonto: valor("nr-fondo-monto"),
+    fondosExtra: [...document.querySelectorAll("#nr-fondos-extra .nr-fondo-fila")].map((f) => ({ id: f.querySelector("select").value, monto: f.querySelector("input").value })),
     empresa: valor("nr-empresa"), cc: valor("nr-cc"), comentario, items,
   };
 }
@@ -2375,6 +2468,9 @@ async function restaurarBorradorRendicion(entrada) {
       await cargarSolicitudesDisponibles();
       const selFondo = document.getElementById("nr-fondo");
       if (borrador.fondo && [...selFondo.options].some((o) => o.value === borrador.fondo)) selFondo.value = borrador.fondo;
+      document.getElementById("nr-fondo-monto").value = borrador.fondoMonto || "";
+      (borrador.fondosExtra || []).forEach((f) => agregarFilaFondo(f.id, f.monto));
+      actualizarFondosFormulario();
     }
     window.RindeUI?.updateFormSummary();
   } finally {
@@ -2460,6 +2556,7 @@ function openNuevaRendicion(pushHistory = true, opciones = {}) {
   document.getElementById("nr-fecha").value = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
   document.getElementById("nr-tipo").value = "Reembolso";
   document.getElementById("nr-fondo-wrap").style.display = "none";
+  limpiarFilasFondo();
   document.getElementById("nr-comentario").value = "";
   document.getElementById("nr-empresa").value = EMPRESAS[0];
   actualizarCentroCostoRendicion();
@@ -5224,7 +5321,7 @@ function recalcTotal() {
     total += parseMoneyValue(val);
   });
   document.getElementById("nr-total").textContent = fmtCLP(total);
-  window.RindeUI?.updateFormSummary();
+  actualizarFondosFormulario();
 }
 
 async function submitRendicion() {
@@ -5361,10 +5458,13 @@ async function submitRendicion() {
   }
   const hayItemsPendientesOcr = items.some((it) => it.ocr_reintento_estado === "pendiente");
 
-  let solicitudFondoId = null;
+  let solicitudFondoId = null, fondosRendicion = null;
   if (tipoRendicion === "FondoPorRendir") {
-    solicitudFondoId = document.getElementById("nr-fondo").value || null;
-    if (!solicitudFondoId) { toast("Selecciona el fondo (solicitud aprobada) que estás rindiendo."); return; }
+    const fondos = leerFondosFormulario();
+    const errorFondos = window.RindeCore.validarFondosRendicion(fondos, items.reduce((s, it) => s + Number(it.monto || 0), 0));
+    if (errorFondos) { toast(errorFondos); return; }
+    solicitudFondoId = fondos[0].id;
+    if (fondos.length > 1) fondosRendicion = fondos;
   }
 
   const btn = document.getElementById("btn-guardar-rendicion");
@@ -5389,6 +5489,7 @@ async function submitRendicion() {
     const resultado = await conTimeout(window.RindeData.guardarRendicionCompleta(db,{
       id:rendicionId,tipo_rendicion:tipoRendicion,empresa:empresaRendicion,
       comentario,solicitud_fondo_id:solicitudFondoId,fecha_rendicion:fecha,
+      ...(fondosRendicion?{fondos:fondosRendicion}:{}),
     },preparados),45000,"No se pudo confirmar el envío. Tu formulario se conserva; reintenta para comprobar si ya fue recibido.");
     if(currentUser?.id!==usuarioEnvio) return;
     const rendicion = resultado.rendicion;
@@ -5623,7 +5724,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     // exceso se contabilizó como Rendiciones por Pagar (ver
     // calcularSplitFondo), no como parte de este fondo.
     let rendidas = [], errorConsumo = null;
-    try { rendidas = await consultarTodas(() => db.from("rendiciones").select("id, folio, monto_total, monto_aprobado, estado",{count:"exact"}).eq("solicitud_fondo_id",s.id).order("created_at").order("id")); }
+    try { rendidas = await consultarTodas(() => db.from("rendiciones_por_fondo").select("id, folio, monto_total, monto_aprobado, estado, monto_total_rendicion",{count:"exact"}).eq("solicitud_fondo_id",s.id).order("created_at").order("id")); }
     catch (error) {errorConsumo=error; box.appendChild(el("p",{class:"ocr-status show err"},"No se pudo comprobar el consumo del fondo. Vuelve a abrir el detalle para reintentar."));}
     const aprobadas = (rendidas || []).filter((r) => r.estado === "Aprobado");
     const rendido = errorConsumo ? null : resumirConsumoFondo(rendidas,s.monto_solicitado).consumido;
@@ -5655,7 +5756,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
       rendidas.forEach((r) => {
         const celdas = [
           el("td", {}, `N° ${r.folio ?? "-"}`),
-          el("td", { class: "monto" }, fmtCLP(r.monto_total)),
+          el("td", { class: "monto" }, Number(r.monto_total_rendicion) !== Number(r.monto_total) ? [fmtCLP(r.monto_total), el("small", { style: "display:block;color:var(--ink-soft)" }, "de " + fmtCLP(r.monto_total_rendicion) + " (multifondo)")] : fmtCLP(r.monto_total)),
           el("td", {}, el("span", { class: "pill " + r.estado }, r.estado)),
         ];
         celdas.forEach((td, i) => td.setAttribute("data-label", cols[i]));
@@ -5762,6 +5863,119 @@ function crearResumenRendicion(items) {
   ]);
 }
 
+// Fondos de una rendición en orden, con la parte del total que le toca a cada uno.
+async function cargarFondosDeRendicion(rendicionId) {
+  const { data, error } = await db.from("rendiciones_por_fondo").select("solicitud_fondo_id, orden, tope, monto_total, monto_total_rendicion").eq("id", rendicionId).order("orden");
+  if (error) throw error;
+  const ids = (data || []).map((f) => f.solicitud_fondo_id);
+  const { data: solicitudes, error: errorSolicitudes } = ids.length
+    ? await db.from("solicitudes_fondos").select("id, folio, motivo, monto_solicitado").in("id", ids)
+    : { data: [], error: null };
+  if (errorSolicitudes) throw errorSolicitudes;
+  return (data || []).map((f) => ({ ...f, solicitud: (solicitudes || []).find((s) => s.id === f.solicitud_fondo_id) }));
+}
+
+async function bloqueFondosRendicion(r, editable, totalVigente) {
+  const caja = el("div", { class: "fondos-rendicion" });
+  let fondos = [];
+  try { if (r.tipo_rendicion === "FondoPorRendir") fondos = await cargarFondosDeRendicion(r.id); }
+  catch (error) {
+    console.error("No se pudo consultar el fondo asociado:", error);
+    caja.appendChild(el("p", { class: "ocr-status show err" }, "No se pudo consultar el fondo asociado. Vuelve a abrir el detalle para reintentar."));
+    return caja;
+  }
+  const enlace = (f) => el("a", {
+    href: "#", style: "color:var(--blue);font-weight:600;",
+    onclick: (e) => { e.preventDefault(); openDetalleSolicitud(f.solicitud_fondo_id); },
+  }, "S-" + (f.solicitud?.folio ?? "—"));
+  if (fondos.length === 1) caja.appendChild(el("p", { style: "margin:0" }, ["Fondo asociado: ", enlace(fondos[0])]));
+  else if (fondos.length > 1) {
+    caja.appendChild(el("p", { style: "margin:0" }, "Rendida contra " + fondos.length + " fondos:"));
+    caja.appendChild(el("ul", {}, fondos.map((f) => el("li", {}, [
+      enlace(f), " · " + (f.solicitud?.motivo || "Sin motivo") + " · " + fmtCLP(f.monto_total) + (f.tope == null ? " (el resto)" : ""),
+    ]))));
+  } else caja.appendChild(el("p", { style: "margin:0;color:var(--ink-soft)" }, "Reembolso: no está asociada a ningún fondo."));
+  if (editable) {
+    const boton = el("button", { class: "btn btn-secondary btn-sm", type: "button", style: "margin-top:8px" }, fondos.length ? "Cambiar fondos" : "Asociar a fondos");
+    boton.addEventListener("click", async () => {
+      boton.disabled = true;
+      try { caja.appendChild(await editorFondosRendicion(r, fondos, totalVigente)); boton.remove(); }
+      catch (error) { toast(mensajeErrorAmigable(error)); boton.disabled = false; }
+    });
+    caja.appendChild(boton);
+  }
+  return caja;
+}
+
+// Editor de los fondos de una rendición Pendiente (dueño o aprobador). Mismas
+// reglas que el formulario; sin filas, la rendición vuelve a ser Reembolso.
+async function editorFondosRendicion(r, actuales, total) {
+  const disponibles = await consultarTodas(() => db.from("solicitudes_fondos").select("id, folio, motivo, monto_solicitado", { count: "exact" })
+    .eq("empleado_id", r.empleado_id).eq("estado", "Aprobado").eq("empresa", r.empresa).order("created_at", { ascending: false }).order("id"));
+  const editor = el("div", { class: "editor-fondos" });
+  const cerrar = () => openDetalle(r.id, false);
+  if (!disponibles.length) {
+    const volver = el("button", { class: "btn btn-ghost btn-sm", type: "button" }, "Cerrar");
+    volver.addEventListener("click", cerrar);
+    editor.append(el("p", { style: "margin:0 0 8px" }, (r.empleado_nombre || "Esta persona") + " no tiene fondos aprobados en " + (r.empresa || "esta empresa") + "."), volver);
+    return editor;
+  }
+  const folio = (id) => "S-" + (disponibles.find((s) => s.id === id)?.folio ?? "—");
+  const filas = el("div");
+  const resumen = el("p", { class: "nr-fondos-resumen" });
+  const agregar = el("button", { class: "btn btn-secondary btn-sm", type: "button" }, "+ Agregar fondo");
+  const leer = () => [...filas.children].map((f, i, lista) => ({ id: f.querySelector("select").value, monto: i < lista.length - 1 ? parseMoneyValue(f.querySelector("input").value) : null }));
+  const actualizar = () => {
+    const lista = [...filas.children];
+    lista.forEach((f, i) => { f.querySelector("input").hidden = lista.length < 2 || i === lista.length - 1; });
+    const fondos = leer();
+    const error = fondos.length ? window.RindeCore.validarFondosRendicion(fondos, total) : null;
+    resumen.classList.toggle("error", Boolean(error));
+    resumen.textContent = error || (!fondos.length ? "Sin fondos: la rendición queda como Reembolso."
+      : fondos.length === 1 ? "Todo el total (" + fmtCLP(total) + ") contra " + folio(fondos[0].id) + "."
+      : "Reparto del total " + fmtCLP(total) + ": " + window.RindeCore.repartirEntreFondos(total, fondos).map((f) => folio(f.id) + " " + fmtCLP(f.parte)).join(" · ") + ". El último fondo recibe el resto.");
+    agregar.hidden = lista.length >= disponibles.length;
+  };
+  const agregarFila = (id = "", monto = null) => {
+    const sel = el("select", { "aria-label": "Fondo" }, [el("option", { value: "" }, "Elige un fondo"),
+      ...disponibles.map((s) => el("option", { value: s.id }, "S-" + s.folio + " · " + (s.motivo || "Sin motivo") + " · " + fmtCLP(s.monto_solicitado)))]);
+    sel.value = disponibles.some((s) => s.id === id) ? id : "";
+    const inp = el("input", { class: "nr-fondo-monto", type: "text", inputmode: "numeric", placeholder: "Monto de este fondo", "aria-label": "Monto rendido contra este fondo" });
+    if (monto != null) { inp.value = String(Math.round(Number(monto))); formatearInputMoney(inp); }
+    const quitar = el("button", { class: "btn btn-ghost btn-sm", type: "button", "aria-label": "Quitar este fondo" }, "Quitar");
+    const fila = el("div", { class: "nr-fondo-fila" }, [sel, inp, quitar]);
+    sel.addEventListener("change", actualizar);
+    inp.addEventListener("input", () => { formatearInputMoney(inp); actualizar(); });
+    quitar.addEventListener("click", () => { fila.remove(); actualizar(); });
+    filas.appendChild(fila);
+  };
+  agregar.addEventListener("click", () => { agregarFila(); actualizar(); });
+  actuales.forEach((f) => agregarFila(f.solicitud_fondo_id, f.tope));
+  if (!actuales.length) agregarFila();
+  const guardar = el("button", { class: "btn btn-primary btn-sm", type: "button" }, "Guardar fondos");
+  const cancelar = el("button", { class: "btn btn-ghost btn-sm", type: "button" }, "Cancelar");
+  cancelar.addEventListener("click", cerrar);
+  guardar.addEventListener("click", async () => {
+    const fondos = leer();
+    const error = fondos.length ? window.RindeCore.validarFondosRendicion(fondos, total) : null;
+    if (error) { toast(error); return; }
+    if (!fondos.length && !confirm("¿Dejar esta rendición como Reembolso, sin fondo asociado?")) return;
+    guardar.disabled = true;
+    const { error: errorGuardar } = await db.rpc("asignar_fondos_rendicion", { p_rendicion: r.id, p_fondos: fondos });
+    guardar.disabled = false;
+    if (errorGuardar) { toast(mensajeErrorAmigable(errorGuardar)); return; }
+    toast(fondos.length ? "Fondos de la rendición actualizados." : "La rendición quedó como Reembolso.");
+    cerrar();
+    loadDashboard();
+  });
+  editor.append(
+    el("strong", {}, "Fondos de esta rendición"),
+    el("p", { class: "portal-muted", style: "margin:4px 0 10px" }, "Cada fondo menos el último lleva cuánto se rinde de él; el último recibe el resto."),
+    filas, resumen, el("div", { style: "display:flex;gap:10px;flex-wrap:wrap" }, [agregar, guardar, cancelar]));
+  actualizar();
+  return editor;
+}
+
 async function openDetalle(id, pushHistory = true) {
   const box0 = document.getElementById("detalle-card");
   box0.innerHTML = "<p style='color:var(--ink-soft)'>Cargando...</p>";
@@ -5810,20 +6024,13 @@ async function openDetalle(id, pushHistory = true) {
   const gruposDuplicados = documentosDuplicados(items.filter((it) => it.estado !== "Rechazado"));
   if (gruposDuplicados.length) box.appendChild(el("p", { class: "ocr-status show err" }, "⚠ Hay documentos repetidos en esta rendición. Comprueba que correspondan a una distribución del gasto y que no se esté rindiendo dos veces la factura."));
 
-  // Si esta rendición justifica un fondo entregado por adelantado, se
-  // muestra el vínculo con su solicitud (folio real, no el uuid) para
-  // poder ir a ver cuánto se otorgó y cuánto queda disponible.
-  if (r.tipo_rendicion === "FondoPorRendir" && r.solicitud_fondo_id) {
-    const { data: solicitud } = await db.from("solicitudes_fondos").select("folio").eq("id", r.solicitud_fondo_id).maybeSingle();
-    if (solicitud) {
-      box.appendChild(el("p", { style: "margin:0 0 14px;font-size:0.88rem" }, [
-        "Fondo asociado: ",
-        el("a", {
-          href: "#", style: "color:var(--blue);font-weight:600;",
-          onclick: (e) => { e.preventDefault(); openDetalleSolicitud(r.solicitud_fondo_id); },
-        }, `S-${solicitud.folio}`),
-      ]));
-    }
+  // Fondos que justifica esta rendición (uno o varios, con la parte de cada
+  // uno; folio real, no el uuid) y, mientras está Pendiente, el editor para
+  // asociarla a fondos o cambiarlos -- p. ej. si se envió como Reembolso.
+  const puedeCambiarFondos = r.estado === "Pendiente" && (esAprobadorViewer || r.empleado_id === currentUser.id);
+  if ((r.tipo_rendicion === "FondoPorRendir" && r.solicitud_fondo_id) || puedeCambiarFondos) {
+    const totalVigente = items.filter((it) => it.estado !== "Rechazado").reduce((s, it) => s + Number(it.monto || 0), 0);
+    box.appendChild(await bloqueFondosRendicion(r, puedeCambiarFondos, totalVigente));
   }
 
   const puedeEditarItems = r.estado === "Pendiente" && (esAprobadorViewer || r.empleado_id === currentUser.id);
@@ -6842,19 +7049,25 @@ async function generarInformePDF(rendicion, items) {
     linea("Respaldos: "+cantidadAdjuntos+" de "+resumen.total+" gastos con archivo adjunto."+(cantidadAdjuntos<resumen.total?" Hay gastos sin adjunto.":""));
     if(resumen.rechazados)linea("Los gastos rechazados se conservan en este informe y no forman parte del monto aprobado ni del consumo del fondo.");
     if(rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id){
-      const {data:fondo,error:errorFondo}=await db.from("solicitudes_fondos").select("id,folio,monto_solicitado").eq("id",rendicion.solicitud_fondo_id).maybeSingle();
-      if(!errorFondo && fondo){
-        const consumo=await cargarConsumoFondos([fondo]);const filas=consumo.get(fondo.id);
+      let fondosRendicion=null;
+      try{fondosRendicion=await cargarFondosDeRendicion(rendicion.id);}catch(error){console.error("No se pudo consultar los fondos:",error);}
+      if(!fondosRendicion||!fondosRendicion.length||fondosRendicion.some(f=>!f.solicitud))linea("Fondo asociado: no se pudo consultar su referencia y saldo.");
+      else{
+      const consumo=await cargarConsumoFondos(fondosRendicion.map(f=>({id:f.solicitud_fondo_id})));
+      for(const f of fondosRendicion){
+        const fondo={...f.solicitud,id:f.solicitud_fondo_id};
+        const filas=consumo.get(fondo.id);
         const saldo=filas?resumirConsumoFondo(filas,fondo.monto_solicitado):null;
         if(y+45>245){doc.addPage();y=20;}
         doc.setFillColor(237,245,241);doc.roundedRect(margen,y,util,39,3,3,"F");
         doc.setFont("helvetica","bold");doc.setFontSize(9);doc.setTextColor(...verde);
-        doc.text("FONDO S-"+fondo.folio+" · Monto del fondo: "+fmtCLP(fondo.monto_solicitado),margen+5,y+9);
+        doc.text("FONDO S-"+fondo.folio+" · Monto del fondo: "+fmtCLP(fondo.monto_solicitado)+(fondosRendicion.length>1?" · Esta rendición: "+fmtCLP(f.monto_total):""),margen+5,y+9);
         doc.setTextColor(...tinta);doc.text(saldo?"Consumido total: "+fmtCLP(saldo.consumido)+" · "+(saldo.saldo<0?"Exceso: "+fmtCLP(-saldo.saldo):"Disponible: "+fmtCLP(saldo.saldo)):"Consumo y saldo no disponibles",margen+5,y+18);
         doc.setFont("helvetica","normal");doc.setFontSize(8);
         if(saldo)doc.text("Aprobado: "+fmtCLP(saldo.aprobado)+" · Por revisar: "+fmtCLP(saldo.porRevisar),margen+5,y+25);
         doc.setFontSize(6.5);doc.text("Consumo: aprobados y pendientes de todas las rendiciones del fondo; excluye rechazados.",margen+5,y+33);y+=47;
-      }else linea("Fondo asociado: no se pudo consultar su referencia y saldo.");
+      }
+      }
     }
     doc.setFont("helvetica","bold");doc.setFontSize(12);doc.setTextColor(...tinta);doc.text("Detalle de gastos",margen,y);y+=6;
     doc.autoTable({

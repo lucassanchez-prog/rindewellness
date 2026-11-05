@@ -116,11 +116,17 @@
     right.append(totals,node('p',{class:'portal-muted'},'Confirma proveedor, documento, fecha y monto antes de enviar.'),submit);
     nr.addEventListener('input',updateFormSummary);nr.addEventListener('change',updateFormSummary);
   }
+  // Con varios fondos (multifondo) se listan sus folios; con uno, el texto completo de la opción.
+  function fondosElegidos() {
+    const sels=[...document.querySelectorAll('#nr-fondo, #nr-fondos-extra select')];
+    if(sels.length<2)return sels[0]?.selectedOptions[0]?.textContent||'—';
+    return sels.map(s=>s.value?s.selectedOptions[0].textContent.split(' · ')[0]:'(sin elegir)').join(' + ');
+  }
   function updateFormSummary() {
     const text=id=>{const n=document.getElementById(id);return n?.tagName==='SELECT'?n.selectedOptions[0]?.textContent||'—':n?.value||'—';};
     const fill=(id,entries)=>{const box=document.getElementById(id);if(box)box.replaceChildren(...entries.flatMap(([k,v])=>[node('dt',{},k),node('dd',{},v)]));};
     fill('portal-sf-summary',[['Solicitante',profile?.nombre||'—'],['Empresa',text('sf-empresa')],['Centro de costo',text('sf-cc')],['Monto solicitado',money(core.parseMoneyValue(document.getElementById('sf-monto')?.value||''))]]);
-    fill('portal-nr-summary',[['Gastos',String(document.querySelectorAll('#items-container .item-card').length)],['Tipo',text('nr-tipo')],['Fondo asociado',document.getElementById('nr-tipo')?.value==='FondoPorRendir'?text('nr-fondo'):'No aplica · Reembolso']]);
+    fill('portal-nr-summary',[['Gastos',String(document.querySelectorAll('#items-container .item-card').length)],['Tipo',text('nr-tipo')],['Fondo asociado',document.getElementById('nr-tipo')?.value==='FondoPorRendir'?fondosElegidos():'No aplica · Reembolso']]);
   }
   function createPreview(items, table, iterator, accountName, openOriginal, showAccount = false) {
     if(destroyPreview)destroyPreview();

@@ -95,9 +95,9 @@ test('navegar por fondos conserva su destino al volver y no reinicia la vista ac
 });
 
 test('el selector de fondo reserva pendientes y no convierte un fallo de saldo en cero',async()=>{
- const select={disabled:false,children:[],replaceChildren(...children){this.children=children;}};
+ const select={disabled:false,children:[],replaceChildren(...children){this.children=children;},get options(){return this.children.map(c=>({value:c.attrs.value,textContent:c.text}));}};
  let failure=false,call=0;
- const c=ctx({currentUser:{id:'u'},document:{getElementById:id=>id==='nr-fondo'?select:{value:'Empresa'}},window:{RindeUI:{updateFormSummary(){}}},el:(tag,attrs,text)=>({tag,attrs,text}),fmtCLP:String,consultarTodas:async()=>{call++;if(call===1)return [{id:'f',folio:2,monto_solicitado:350000}];if(failure)throw Error('fallo');return [{solicitud_fondo_id:'f',estado:'Pendiente',monto_total:105131,monto_aprobado:40131},{solicitud_fondo_id:'f',estado:'Rechazado',monto_total:20000}];},console:{error(){}}});
+ const c=ctx({currentUser:{id:'u'},document:{getElementById:id=>id==='nr-fondo'?select:{value:'Empresa'},querySelectorAll:()=>[]},window:{RindeUI:{updateFormSummary(){}}},el:(tag,attrs,text)=>({tag,attrs,text}),fmtCLP:String,consultarTodas:async()=>{call++;if(call===1)return [{id:'f',folio:2,monto_solicitado:350000}];if(failure)throw Error('fallo');return [{solicitud_fondo_id:'f',estado:'Pendiente',monto_total:105131,monto_aprobado:40131},{solicitud_fondo_id:'f',estado:'Rechazado',monto_total:20000}];},console:{error(){}}});
  vm.runInContext(tramo('function resumirConsumoFondo(','async function cargarConsumoFondos('),c);
  vm.runInContext(tramo('let cargaSolicitudesDisponibles =','// El Centro de Costo'),c);
  await c.cargarSolicitudesDisponibles();assert.match(select.children[0].text,/Disponible 244869/);assert.match(select.children[0].text,/En revisión 65000/);

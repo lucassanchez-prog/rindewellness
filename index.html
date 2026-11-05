@@ -9,7 +9,7 @@
 <link rel="icon" href="assets/logo-gw.png" />
 <link rel="apple-touch-icon" href="assets/logo-gw.png" />
 <link rel="stylesheet" href="styles.css?v=12" />
-<link rel="stylesheet" href="portal-ui.css?v=105" />
+<link rel="stylesheet" href="portal-ui.css?v=106" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -321,7 +321,13 @@
           </div>
           <div class="field" id="nr-fondo-wrap" style="display:none">
             <label for="nr-fondo">Fondo asociado (solicitud aprobada que estás rindiendo)</label>
-            <select id="nr-fondo"></select>
+            <div class="nr-fondo-fila">
+              <select id="nr-fondo"></select>
+              <input id="nr-fondo-monto" class="nr-fondo-monto" type="text" inputmode="numeric" placeholder="Monto de este fondo" aria-label="Monto rendido contra este fondo" hidden />
+            </div>
+            <div id="nr-fondos-extra"></div>
+            <p class="nr-fondos-resumen" id="nr-fondos-resumen" hidden></p>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-add-fondo" hidden>+ Rendir también contra otro fondo</button>
           </div>
           <div class="field-row">
             <div class="field">
@@ -431,14 +437,14 @@
        app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
        2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
        el navegador seguía sirviendo la versión anterior. -->
-  <script src="pure.js?v=105"></script>
-  <script src="borradores.js?v=105"></script>
-  <script src="data-access.js?v=105"></script>
-  <script src="reportes-exportacion.js?v=105"></script>
-  <script src="lector-local.js?v=105"></script>
-  <script src="foto-comprobante.js?v=105"></script>
-  <script src="revision-comprobante.js?v=105"></script>
-  <script src="portal-ui.js?v=105"></script>
-  <script src="app.js?v=105"></script>
+  <script src="pure.js?v=106"></script>
+  <script src="borradores.js?v=106"></script>
+  <script src="data-access.js?v=106"></script>
+  <script src="reportes-exportacion.js?v=106"></script>
+  <script src="lector-local.js?v=106"></script>
+  <script src="foto-comprobante.js?v=106"></script>
+  <script src="revision-comprobante.js?v=106"></script>
+  <script src="portal-ui.js?v=106"></script>
+  <script src="app.js?v=106"></script>
 </body>
 </html>
