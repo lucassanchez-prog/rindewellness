@@ -154,7 +154,20 @@
     return {filas, monto, glosa, fecha, cuentaBanco:cuenta, nombreBanco:banco, fileName:`comprobante_entrega_fondo_S-${solicitud.folio}.csv`};
   }
 
-  const RindeCore = { comprobanteEntregaFondo, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  // Orden en que se cargaron los gastos al enviar la rendición. La tabla no tiene
+  // columna de orden (el id es aleatorio), pero la posición viaja en la ruta del
+  // comprobante: "usuario/<envío>-<posición>-..." (ver prepararAdjuntos). Sin esto
+  // Postgres devuelve las filas en cualquier orden, y un ítem recién editado saltaba
+  // al primer lugar. Ordena en el lugar, como Array.sort, y devuelve el mismo arreglo.
+  function posicionItem(item) {
+    const m = /^[^/]+\/[0-9a-f-]{36}-(\d+)-/i.exec(String(item?.adjunto_url || ""));
+    return m ? Number(m[1]) : Infinity;
+  }
+  function ordenarItemsRendicion(items) {
+    return items.sort((a, b) => (posicionItem(a) - posicionItem(b)) || String(a.id).localeCompare(String(b.id)));
+  }
+
+  const RindeCore = { ordenarItemsRendicion, comprobanteEntregaFondo, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

@@ -5788,6 +5788,7 @@ async function openDetalle(id, pushHistory = true) {
   if (errorItems || !items || cantidadItems !== items.length) {
     box0.textContent = "No se pudo cargar el detalle completo. Vuelve a abrir la rendición."; return;
   }
+  window.RindeCore.ordenarItemsRendicion(items);
   const itemsConMontoEditado = new Set((montosEditados || []).map((h) => h.item_id));
 
   const esAprobadorViewer = esAprobadorEfectivo(currentProfile);
