@@ -9,7 +9,7 @@
 --      que ocr-reintento-pendientes).
 --   2. Confirmar que no hay comprobantes que se quieran conservar sin rendición:
 --      la limpieza borra los archivos sin gasto asociado con más de 24 horas
---      (al 2026-11-09, entre ellos los de las rendiciones N° 64 y 65 borradas).
+--      (al 2026-11-09 eso incluye los de la N° 64 y 65, borradas a propósito).
 --
 -- Usa el mismo secreto que el bot de lectura (vault: ocr_cron_secret, que en
 -- las funciones es CRON_SECRET).
