@@ -91,7 +91,7 @@
     for(const r of rendiciones){
       for(const it of incluidas.get(r.id)){
         const d=dia(r.fecha_rendicion||r.created_at),esDoc=it.tipo_item==='ConDocumento';
-        gastos.push({_rendicion:r.id,_mes:d.slice(0,7),'Folio':r.folio??null,'Fecha':fecha(r.fecha_rendicion||r.created_at),'Empleado':r.empleado_nombre||'','Empresa':it.empresa||r.empresa||'',
+        gastos.push({_rendicion:r.id,_mes:d.slice(0,7),'Folio':r.folio??null,'Fecha':fecha(r.fecha_rendicion||r.created_at),'Empleado':r.empleado_nombre||'','Empresa':r.empresa||it.empresa||'',_empresaItem:it.empresa||'',
           'Centro de costo':it.centro_costo||'Sin centro de costo','Tipo':esDoc?'Documento electrónico':'Comprobante / boleta','Proveedor':it.nombre_proveedor||'','RUT proveedor':it.rut_proveedor||'',
           'Tipo documento':it.tipo_documento||'','N° documento':it.nro_documento==null?'':String(it.nro_documento),'Fecha documento':fecha(it.fecha_vencimiento),'Categoría':it.categoria||'Sin categoría',
           'Cuenta':it.cuenta_contable||'','Nombre cuenta':nombreCuenta(it.cuenta_contable)||'','Monto':Number(it.monto||0),'Estado':it.estado||'Pendiente',
@@ -148,10 +148,14 @@
     const docs=gastos.filter(g=>g.Tipo==='Documento electrónico'&&g.Estado==='Aprobado');
     const docsVerif=docs.filter(g=>g['En contabilidad']==='Sí').length;
     control('Documentos aprobados verificados en contabilidad',docs.length?docsVerif+' de '+docs.length+' verificados':'Sin documentos aprobados','Informativo');
+    // La empresa que vale es la de la rendición (la usan el CSV de Kame y la app);
+    // si se cambió después de enviarla, sus gastos pueden haber quedado con la anterior.
+    const otraEmpresa=gastos.filter(g=>g._empresaItem&&g._empresaItem!==g.Empresa);
+    control('Gastos con la misma empresa que su rendición',otraEmpresa.length?otraEmpresa.length+' con otra empresa guardada (N° '+[...new Set(otraEmpresa.map(g=>g.Folio))].join(', ')+'); el informe usa la de la rendición':'Todos coinciden',otraEmpresa.length?'Revisar':'OK');
     const suma=totales.aprobado+totales.rechazado+totales.pendiente;
     control('Rendido = aprobado + rechazado + pendiente',Math.abs(suma-totales.rendido)<0.5?'Cuadra':'Diferencia de '+(totales.rendido-suma),Math.abs(suma-totales.rendido)<0.5?'OK':'Revisar');
 
-    const limpiar=g=>{const {_rendicion,_mes,rendido,aprobado,rechazado,pendiente,...resto}=g;return resto;};
+    const limpiar=g=>{const {_rendicion,_mes,_empresaItem,rendido,aprobado,rechazado,pendiente,...resto}=g;return resto;};
     return {filtroTexto:textoFiltro(filtro),rendiciones:filasRendiciones,gastos:gastos.map(limpiar),fondos,totales,
       porEmpresa,porMes:porMes.map(g=>({...g,nombre:g.clave==='sin fecha'?'Sin fecha':nombreMes(g.clave)})),porCategoria,porEmpleado,porCentro,porCuenta,cuadratura,
       // Nombres anteriores, por si algo externo los usa.

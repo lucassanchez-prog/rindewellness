@@ -58,6 +58,15 @@ test('fondos con multifondo: cada fondo cuenta solo su parte',()=>{
  assert.equal(d.fondos.reduce((s,f)=>s+f.Consumido,0),250);
 });
 
+test('el informe usa la empresa de la rendición aunque el gasto guarde otra (N° 37, 38, 58 y 66)',()=>{
+ const conOtra=items.map(it=>it.id==='i4'?{...it,empresa:'RFA SpA'}:it);
+ const d=reportes.preparar(rendiciones,conOtra,solicitudes,{porFondo});
+ assert.equal(d.gastos.find(g=>g.Folio===19).Empresa,'Dmoov Corp SpA');
+ assert.equal(d.porEmpresa.some(g=>g.clave==='RFA SpA'),false);
+ const c=d.cuadratura.find(x=>/misma empresa/.test(x.Control));assert.equal(c.Estado,'Revisar');assert.match(c.Resultado,/N° 19/);
+ assert.equal('_empresaItem' in d.gastos[0],false);
+});
+
 test('la cuadratura marca lo que no cuadra',()=>{
  const ok=reportes.preparar(rendiciones,items,solicitudes,{porFondo});
  assert.equal(ok.cuadratura.filter(c=>c.Estado==='Revisar').length,1,'solo falta un comprobante');
