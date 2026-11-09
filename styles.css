@@ -324,6 +324,7 @@ button {
 .pill.Pendiente { background: var(--warn-bg); color: var(--warn); }
 .pill.Aprobado { background: var(--success-bg); color: var(--success); }
 .pill.Rechazado { background: var(--danger-bg); color: var(--danger); }
+.pill.Cerrado { background: var(--line); color: var(--ink-soft); }
 
 .empty-state {
   text-align: center;

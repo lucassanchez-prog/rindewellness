@@ -99,6 +99,20 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .fondo-kame-confirmacion input { width:20px; height:20px; flex:0 0 20px; margin-top:2px; }
 .fondo-kame-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:20px; }
 .fondo-kame-preview p { overflow-wrap:anywhere; }
+/* Liquidación de fondos */
+.fondo-kame-fields [hidden], .liquidacion-anular[hidden] { display:none; }
+.liquidacion-fondos { display:grid; gap:8px; margin:16px 0; }
+.liquidacion-fondo { display:flex; align-items:flex-start; gap:10px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; cursor:pointer; }
+.liquidacion-fondo input { width:20px; height:20px; flex:0 0 20px; margin-top:2px; }
+.liquidacion-fondo small { display:block; color:var(--ink-soft); margin-top:2px; }
+.liquidacion-fondo.bloqueado { opacity:.65; cursor:not-allowed; }
+.liquidacion-fondo .liquidacion-aviso { color:var(--warn); }
+.liquidacion-neto { font-size:1.05rem; margin:16px 0 8px; }
+.liquidacion-total td { font-weight:600; border-top:2px solid var(--line); }
+.liquidacion-resumen { margin:20px 0; padding:18px 20px; border:1px solid var(--line); border-radius:16px; background:var(--card); }
+.liquidacion-resumen h3 { margin:0 0 6px; }
+.liquidacion-anular { margin-top:12px; }
+.liquidacion-anular textarea, .fondo-kame-form textarea { width:100%; }
 .fondo-kame-preview table { min-width:520px; }
 @media(max-width:640px) { .fondo-kame-fields { grid-template-columns:1fr; } .fondo-kame-form { padding:16px; } .fondo-kame-actions .btn { width:100%; } }
 

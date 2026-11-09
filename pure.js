@@ -154,6 +154,53 @@
     return {filas, monto, glosa, fecha, cuentaBanco:cuenta, nombreBanco:banco, fileName:`comprobante_entrega_fondo_S-${solicitud.folio}.csv`};
   }
 
+  // Asiento de una liquidación de fondos (ver liquidar_fondos en la base).
+  // Cada exceso se cancela en 2.01.07.29 con el folio de la rendición que lo
+  // generó (así quedó como documento en Kame); cada restante sale de
+  // 1.01.11.05 con el folio del fondo (como en la entrega). La diferencia neta
+  // va al banco: entra si la persona devuelve, sale si la empresa le paga.
+  // Sin excesos ni restantes no hay asiento (filas vacías).
+  function comprobanteLiquidacionFondos(liq, detalle) {
+    if (!liq || liq.anulada_en) throw new Error("La liquidación no existe o fue anulada.");
+    const tipo = {Devolucion:"INGRESO",Pago:"EGRESO",Compensado:"TRASPASO"}[liq.resultado];
+    if (!tipo) throw new Error("La liquidación tiene un resultado desconocido.");
+    const nombre = String(liq.empleado_nombre || "").replace(/\s+/g," ").trim();
+    if (!liq.empresa || !nombre || !validarRut(liq.rut_empleado || "")) throw new Error("Completa el nombre y el RUT válido del empleado antes de exportar.");
+    const entero = (v) => { const n = Number(v); if (!Number.isSafeInteger(n) || n < 0) throw new Error("La liquidación tiene montos no válidos."); return n; };
+    const fecha = String(liq.fecha || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) throw new Error("La liquidación no tiene una fecha válida.");
+    const f = fecha.split("-").reverse().join("/"), rut = formatearRut(liq.rut_empleado);
+    const referencia = String(liq.referencia || "").replace(/\s+/g," ").trim();
+    const glosa = (`LIQUIDACION FONDOS L-${liq.folio} · ${nombre} · ${liq.empresa}` + (referencia ? ` · REF ${referencia}` : "")).replace(/\s+/g," ").trim();
+    const filas = [];
+    const fila = (cuenta, debe, haber, comentario, folioDoc) => filas.push([tipo,"S",1,f,glosa,cuenta,debe,haber,comentario,
+      folioDoc == null ? "" : rut, folioDoc == null ? "" : nombre, folioDoc == null ? "" : "Otros", folioDoc == null ? "" : String(folioDoc), folioDoc == null ? "" : f, "","",""]);
+    let exceso = 0, restante = 0;
+    for (const d of [...(detalle || [])].sort((a,b) => Number(a.folio_fondo) - Number(b.folio_fondo))) {
+      const ex = entero(d.exceso), re = entero(d.restante);
+      const partes = (d.excesos || []).map(e => ({folio:e.folio, monto:entero(e.monto)})).filter(e => e.monto > 0);
+      if (partes.reduce((s,e) => s + e.monto, 0) !== ex) throw new Error(`El exceso del fondo S-${d.folio_fondo} no cuadra con sus rendiciones.`);
+      partes.forEach(e => fila("2.01.07.29", e.monto, 0, `Exceso rendición N° ${e.folio} · fondo S-${d.folio_fondo}`, e.folio));
+      if (re > 0) fila("1.01.11.05", 0, re, `Restante fondo S-${d.folio_fondo}`, d.folio_fondo);
+      exceso += ex; restante += re;
+    }
+    if (exceso !== entero(liq.total_exceso) || restante !== entero(liq.total_restante)) throw new Error("El detalle de la liquidación no cuadra con sus totales.");
+    const neto = entero(liq.monto_neto);
+    if (neto !== Math.abs(restante - exceso) || (neto === 0) !== (liq.resultado === "Compensado")
+      || (liq.resultado === "Devolucion" && restante <= exceso) || (liq.resultado === "Pago" && exceso <= restante)) {
+      throw new Error("El resultado de la liquidación no cuadra con sus montos.");
+    }
+    if (neto > 0) {
+      const cuenta = String(liq.cuenta_banco || "").trim(), banco = String(liq.nombre_banco || "").trim();
+      if (!/^\d+(?:\.\d+){2,5}$/.test(cuenta) || cuenta === "1.01.11.05" || cuenta === "2.01.07.29") throw new Error("Indica el código de la cuenta bancaria en Kame.");
+      const comentario = (liq.resultado === "Devolucion" ? "Devolución de " : "Pago a ") + nombre + (banco ? " · " + banco : "");
+      if (liq.resultado === "Devolucion") fila(cuenta, neto, 0, comentario, null); else fila(cuenta, 0, neto, comentario, null);
+    }
+    const debe = filas.reduce((s,r) => s + r[6], 0), haber = filas.reduce((s,r) => s + r[7], 0);
+    if (debe !== haber) throw new Error("El asiento de la liquidación no cuadra.");
+    return {filas, tipo, glosa, total:debe, fileName:`comprobante_liquidacion_L-${liq.folio}.csv`};
+  }
+
   // Orden en que se cargaron los gastos al enviar la rendición. La tabla no tiene
   // columna de orden (el id es aleatorio), pero la posición viaja en la ruta del
   // comprobante: "usuario/<envío>-<posición>-..." (ver prepararAdjuntos). Sin esto
@@ -196,7 +243,7 @@
     return null;
   }
 
-  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion,comprobanteEntregaFondo, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {
