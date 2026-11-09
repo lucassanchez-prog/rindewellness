@@ -6328,7 +6328,7 @@ async function openDetalle(id, pushHistory = true) {
       class: "btn btn-secondary btn-sm", type: "button",
       onclick: async () => { await descargarCSV(r, items); avisoKame.textContent = textoExportacionKame(r) || avisoKame.textContent; },
     }, "Descargar comprobante para Kame"));
-    acciones.appendChild(avisoKame);
+    if (esAprobadorViewer) acciones.appendChild(avisoKame);
   }
   // El aviso por correo al empleado se manda una sola vez, al momento de
   // aprobar/rechazar (ver finalizarAprobacionRendicion) -- si falló ahí
