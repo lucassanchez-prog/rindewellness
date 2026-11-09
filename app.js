@@ -696,14 +696,27 @@ function wireDashboard() {
   document.getElementById("btn-solicitar-fondos").addEventListener("click", () => openNuevaSolicitud());
   document.getElementById("btn-admin-usuarios").addEventListener("click", () => openAdminUsuarios());
   document.getElementById("btn-reportes").addEventListener("click", () => openReportes());
-  const btnExportarExcel = document.getElementById("btn-exportar-excel");
-  btnExportarExcel.addEventListener("click", async () => {
-    btnExportarExcel.disabled = true;
-    const textoOriginal = btnExportarExcel.textContent;
-    btnExportarExcel.textContent = "Generando...";
-    await exportarExcel();
-    btnExportarExcel.disabled = false;
-    btnExportarExcel.textContent = textoOriginal;
+  // "Exportar a Excel" abre un panel para elegir período, empresa y estado.
+  const panelExcel = document.getElementById("panel-excel");
+  const selEmpresaExcel = document.getElementById("excel-empresa");
+  EMPRESAS.forEach((emp) => selEmpresaExcel.appendChild(el("option", { value: emp }, emp)));
+  const ponerPeriodoExcel = (tipo) => { const p = periodoExcel(tipo); document.getElementById("excel-desde").value = p.desde; document.getElementById("excel-hasta").value = p.hasta; };
+  document.getElementById("btn-exportar-excel").addEventListener("click", () => {
+    if (panelExcel.style.display === "none") { if (!document.getElementById("excel-hasta").value) ponerPeriodoExcel("mes"); document.getElementById("excel-status").className = "ocr-status"; }
+    panelExcel.style.display = panelExcel.style.display === "none" ? "block" : "none";
+  });
+  document.querySelectorAll("#excel-atajos [data-periodo]").forEach((b) => b.addEventListener("click", () => ponerPeriodoExcel(b.dataset.periodo)));
+  document.getElementById("btn-cancelar-excel").addEventListener("click", () => { panelExcel.style.display = "none"; });
+  const btnDescargarExcel = document.getElementById("btn-descargar-excel");
+  btnDescargarExcel.addEventListener("click", async () => {
+    btnDescargarExcel.disabled = true;
+    btnDescargarExcel.textContent = "Generando...";
+    await exportarExcel({
+      desde: document.getElementById("excel-desde").value, hasta: document.getElementById("excel-hasta").value,
+      empresa: selEmpresaExcel.value, estado: document.getElementById("excel-estado").value,
+    });
+    btnDescargarExcel.disabled = false;
+    btnDescargarExcel.textContent = "Descargar Excel";
   });
   document.getElementById("btn-comprobante-rango").addEventListener("click", () => {
     document.getElementById("panel-rango").style.display = "block";
@@ -7325,19 +7338,44 @@ function cargarExcelJs() {
     document.head.appendChild(script);
   });excelJsCargando.catch(()=>{excelJsCargando=null;});return excelJsCargando;
 }
-async function exportarExcel() {
-  toast('Generando Excel...');
+// Período rápido para el panel del Excel, en fechas de Chile (AAAA-MM-DD).
+function periodoExcel(tipo) {
+  const hoy = new Intl.DateTimeFormat("en-CA",{timeZone:"America/Santiago",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+  const [a, m] = hoy.split("-").map(Number);
+  const dd = (n) => String(n).padStart(2, "0");
+  if (tipo === "mes-anterior") {
+    const am = m === 1 ? a - 1 : a, mm = m === 1 ? 12 : m - 1;
+    return { desde: `${am}-${dd(mm)}-01`, hasta: `${am}-${dd(mm)}-${dd(new Date(Date.UTC(am, mm, 0)).getUTCDate())}` };
+  }
+  if (tipo === "anio") return { desde: `${a}-01-01`, hasta: hoy };
+  if (tipo === "todo") return { desde: "", hasta: "" };
+  return { desde: `${a}-${dd(m)}-01`, hasta: hoy };
+}
+
+// Excel general con el período, la empresa y el estado elegidos en el panel.
+// Antes siempre exportaba TODO el historial, y la hoja de fondos contaba cada
+// rendición entera contra su fondo principal (mal con multifondo).
+async function exportarExcel(filtro = {}) {
+  const status = document.getElementById("excel-status");
+  const aviso = (texto, clase = "") => { if (status) { status.className = "ocr-status show " + clase; status.textContent = texto; } };
+  if (filtro.desde && filtro.hasta && filtro.desde > filtro.hasta) { aviso("La fecha «Desde» es posterior a «Hasta».", "err"); return; }
+  aviso("Generando Excel…");
   try {
     const rendiciones=await consultarTodas(() => db.from('rendiciones').select('*, solicitudes_fondos!rendiciones_solicitud_fondo_id_fkey(folio)',{count:'exact'}).order('folio').order('id'));
     const ids=rendiciones.map(r=>r.id),items=[];
     for(let i=0;i<ids.length;i+=100)items.push(...await consultarTodas(() => db.from('rendicion_items').select('*',{count:'exact'}).in('rendicion_id',ids.slice(i,i+100)).order('rendicion_id').order('id')));
+    window.RindeCore.ordenarItemsRendicion(items);
     const solicitudes=await consultarTodas(() => db.from('solicitudes_fondos').select('*',{count:'exact'}).order('folio').order('id'));
-    const datos=window.RindeReportes.preparar(rendiciones,items,solicitudes,nombreCuenta);
+    const porFondo=await consultarTodas(() => db.from('rendiciones_por_fondo').select('id,folio,estado,solicitud_fondo_id,orden,monto_total,monto_aprobado',{count:'exact'}).order('id').order('solicitud_fondo_id'));
+    const datos=window.RindeReportes.preparar(rendiciones,items,solicitudes,{nombreCuenta,filtro,porFondo});
+    if(!datos.rendiciones.length){aviso("No hay rendiciones con esos filtros. Prueba otro período o «Todo el historial».","err");return;}
     const corte=new Date(),ExcelJS=await cargarExcelJs();
     const libro=window.RindeReportes.crearLibro(ExcelJS,datos,corte);
     const buffer=await libro.xlsx.writeBuffer();
     const blob=new Blob([buffer],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-    const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='rendiciones_'+corte.toISOString().slice(0,10)+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);
-    toast('Excel descargado: informe ejecutivo, resumen, detalle y fondos.');
-  }catch(err){console.error('Error exportando a Excel:',err);toast('No se pudo generar el Excel: '+(err.message||''));}
+    const sufijo=filtro.desde||filtro.hasta?(filtro.desde||'inicio')+'_a_'+(filtro.hasta||'hoy'):'historial_'+corte.toISOString().slice(0,10);
+    const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='rendiciones_'+sufijo+'.xlsx';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);
+    const revisar=datos.cuadratura.filter(c=>c.Estado==='Revisar').length;
+    aviso(`Listo: ${datos.rendiciones.length} rendiciones y ${datos.gastos.length} gastos.`+(revisar?` La hoja «Cuadratura» marca ${revisar} control(es) para revisar.`:" Todos los controles de cuadratura están OK."),revisar?"":"ok");
+  }catch(err){console.error('Error exportando a Excel:',err);aviso('No se pudo generar el Excel: '+(err.message||''),"err");}
 }

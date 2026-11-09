@@ -9,7 +9,7 @@
 <link rel="icon" href="assets/logo-gw.png" />
 <link rel="apple-touch-icon" href="assets/logo-gw.png" />
 <link rel="stylesheet" href="styles.css?v=12" />
-<link rel="stylesheet" href="portal-ui.css?v=108" />
+<link rel="stylesheet" href="portal-ui.css?v=109" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -210,6 +210,47 @@
             <button class="btn btn-ghost" type="button" id="btn-cancelar-rango">Cancelar</button>
           </div>
           <p class="ocr-status" id="rango-status"></p>
+        </div>
+
+        <div class="card" id="panel-excel" style="display:none; margin-bottom:18px;">
+          <h3 style="margin:0 0 4px;">Exportar a Excel</h3>
+          <p class="portal-muted" style="margin:0 0 12px;">El período se cuenta por la fecha de la rendición. Los fondos muestran su saldo al día de hoy.</p>
+          <div class="field-row">
+            <div class="field">
+              <label for="excel-desde">Desde</label>
+              <input type="date" id="excel-desde" />
+            </div>
+            <div class="field">
+              <label for="excel-hasta">Hasta</label>
+              <input type="date" id="excel-hasta" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="excel-empresa">Empresa</label>
+              <select id="excel-empresa"><option value="">Todas las empresas</option></select>
+            </div>
+            <div class="field">
+              <label for="excel-estado">Estado</label>
+              <select id="excel-estado">
+                <option value="">Todos los estados</option>
+                <option value="Aprobado">Solo aprobadas</option>
+                <option value="Pendiente">Solo pendientes</option>
+                <option value="Rechazado">Solo rechazadas</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;" id="excel-atajos">
+            <button class="btn btn-ghost btn-sm" type="button" data-periodo="mes">Este mes</button>
+            <button class="btn btn-ghost btn-sm" type="button" data-periodo="mes-anterior">Mes anterior</button>
+            <button class="btn btn-ghost btn-sm" type="button" data-periodo="anio">Este año</button>
+            <button class="btn btn-ghost btn-sm" type="button" data-periodo="todo">Todo el historial</button>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button class="btn btn-primary" type="button" id="btn-descargar-excel">Descargar Excel</button>
+            <button class="btn btn-ghost" type="button" id="btn-cancelar-excel">Cancelar</button>
+          </div>
+          <p class="ocr-status" id="excel-status"></p>
         </div>
 
         <p id="dashboard-carga-status" class="ocr-status show" role="status" aria-live="polite" hidden></p>
@@ -437,14 +478,14 @@
        app abierta sigue corriendo el JavaScript viejo sin enterarse. Pasó el
        2026-09-22: se trabajó todo el día sobre app.js con el v=39 intacto, y
        el navegador seguía sirviendo la versión anterior. -->
-  <script src="pure.js?v=108"></script>
-  <script src="borradores.js?v=108"></script>
-  <script src="data-access.js?v=108"></script>
-  <script src="reportes-exportacion.js?v=108"></script>
-  <script src="lector-local.js?v=108"></script>
-  <script src="foto-comprobante.js?v=108"></script>
-  <script src="revision-comprobante.js?v=108"></script>
-  <script src="portal-ui.js?v=108"></script>
-  <script src="app.js?v=108"></script>
+  <script src="pure.js?v=109"></script>
+  <script src="borradores.js?v=109"></script>
+  <script src="data-access.js?v=109"></script>
+  <script src="reportes-exportacion.js?v=109"></script>
+  <script src="lector-local.js?v=109"></script>
+  <script src="foto-comprobante.js?v=109"></script>
+  <script src="revision-comprobante.js?v=109"></script>
+  <script src="portal-ui.js?v=109"></script>
+  <script src="app.js?v=109"></script>
 </body>
 </html>
