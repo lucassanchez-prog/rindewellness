@@ -7328,7 +7328,7 @@ function cargarExcelJs() {
 async function exportarExcel() {
   toast('Generando Excel...');
   try {
-    const rendiciones=await consultarTodas(() => db.from('rendiciones').select('*, solicitudes_fondos(folio)',{count:'exact'}).order('folio').order('id'));
+    const rendiciones=await consultarTodas(() => db.from('rendiciones').select('*, solicitudes_fondos!rendiciones_solicitud_fondo_id_fkey(folio)',{count:'exact'}).order('folio').order('id'));
     const ids=rendiciones.map(r=>r.id),items=[];
     for(let i=0;i<ids.length;i+=100)items.push(...await consultarTodas(() => db.from('rendicion_items').select('*',{count:'exact'}).in('rendicion_id',ids.slice(i,i+100)).order('rendicion_id').order('id')));
     const solicitudes=await consultarTodas(() => db.from('solicitudes_fondos').select('*',{count:'exact'}).order('folio').order('id'));

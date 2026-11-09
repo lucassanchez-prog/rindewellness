@@ -42,3 +42,13 @@ test('valida igual que la base',()=>{
   assert.match(validarFondosRendicion([{id:'a',monto:148550},{id:'b',monto:null}],148550),/no le queda nada/);
   assert.match(validarFondosRendicion([],1000),/entre 1 y 10/);
 });
+
+test('con rendicion_fondos hay dos caminos rendiciones→solicitudes_fondos: todo embed debe nombrar la FK',()=>{
+  // Sin la FK, PostgREST responde PGRST201 ("more than one relationship was found")
+  // y el Excel general dejó de generarse.
+  const fs=require('node:fs'),path=require('node:path');
+  for(const archivo of ['app.js','data-access.js','reportes-exportacion.js','portal-ui.js']){
+    const src=fs.readFileSync(path.join(__dirname,'..',archivo),'utf8');
+    assert.doesNotMatch(src,/solicitudes_fondos\(/,archivo+' embebe solicitudes_fondos sin indicar la FK');
+  }
+});
