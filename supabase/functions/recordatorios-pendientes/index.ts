@@ -34,6 +34,8 @@ const FROM_EMAIL = Deno.env.get("RESEND_FROM_EMAIL") || "RindeWellness <onboardi
 const FALLBACK_EMAIL = Deno.env.get("RESEND_FALLBACK_EMAIL");
 const APP_URL = Deno.env.get("APP_URL") || "https://rindewellness.netlify.app";
 const DIAS_PARA_RECORDAR = 3;
+// Secreto compartido con pg_cron (mismo que usa ocr-reintento-pendientes).
+const CRON_SECRET = Deno.env.get("CRON_SECRET");
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -45,8 +47,12 @@ function escapeHtml(value: unknown): string {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
+// La tarea diaria de pg_cron llega con el secreto compartido (devuelve null:
+// no hay una persona detrás); a mano, desde el botón, con la sesión de un
+// aprobador o admin.
 async function requireProfile(req: Request, admin: ReturnType<typeof createClient>) {
   const authHeader = req.headers.get("Authorization") || "";
+  if (CRON_SECRET && authHeader === `Bearer ${CRON_SECRET}`) return null;
   const jwt = authHeader.replace(/^Bearer\s+/i, "");
   if (!jwt) throw new Error("No autenticado.");
   const anon = createClient(SUPABASE_URL, ANON_KEY);
@@ -68,7 +74,7 @@ Deno.serve(async (req: Request) => {
   try {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
     const caller = await requireProfile(req, admin);
-    callerId = caller.id;
+    callerId = caller?.id ?? null;
 
     // Misma ventana de N días gobierna dos cosas distintas (hace cuánto se
     // creó, hace cuánto se recordó por última vez) -- un solo valor alcanza.

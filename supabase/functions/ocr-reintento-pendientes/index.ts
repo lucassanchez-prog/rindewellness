@@ -331,7 +331,10 @@ Deno.serve(async (req: Request) => {
     // min sin que nadie lo esté mirando; un resumen agregado alcanza para
     // el registro y para el auto-frenado de arriba, y no infla
     // system_events con docenas de filas por hora.
-    await logEvent(admin, "ocr_reintento_run", { metadata: { procesados, exitosos, proveedores } });
+    // Solo las corridas que hicieron algo: corre cada 5 minutos y casi siempre
+    // no hay nada pendiente (eran ~8.700 eventos vacíos al mes). Salud del
+    // sistema ya ignoraba las vacías; la salud del cron se ve en cron.job_run_details.
+    if (procesados > 0) await logEvent(admin, "ocr_reintento_run", { metadata: { procesados, exitosos, proveedores } });
     return new Response(JSON.stringify({ ok: true, procesados, exitosos }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

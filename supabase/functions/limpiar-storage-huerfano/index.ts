@@ -26,14 +26,19 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const HORAS_MINIMAS = 24;
+// Secreto compartido con pg_cron (mismo que usa ocr-reintento-pendientes).
+const CRON_SECRET = Deno.env.get("CRON_SECRET");
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+// La tarea semanal de pg_cron llega con el secreto compartido (devuelve null:
+// no hay una persona detrás); a mano, desde el botón, con la sesión de un admin.
 async function requireAdmin(req: Request, admin: ReturnType<typeof createClient>) {
   const authHeader = req.headers.get("Authorization") || "";
+  if (CRON_SECRET && authHeader === `Bearer ${CRON_SECRET}`) return null;
   const jwt = authHeader.replace(/^Bearer\s+/i, "");
   if (!jwt) throw new Error("No autenticado.");
   const anon = createClient(SUPABASE_URL, ANON_KEY);
@@ -52,7 +57,7 @@ Deno.serve(async (req: Request) => {
   let callerId: string | null = null;
   try {
     const caller = await requireAdmin(req, admin);
-    callerId = caller.id;
+    callerId = caller?.id ?? null;
 
     let borrados = 0;
     // Lotes acotados: cada llamada comprueba las referencias en la base completa.

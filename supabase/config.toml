@@ -8,3 +8,11 @@ project_id = "rbmmwgndtrgdzherqxko"
 # el header -- pasó exactamente eso las primeras corridas del cron.
 [functions.ocr-reintento-pendientes]
 verify_jwt = false
+
+# Igual que el bot: los llama pg_cron con el secreto compartido (no es un JWT).
+# Cada función valida por su cuenta el secreto o la sesión de un aprobador/admin.
+[functions.recordatorios-pendientes]
+verify_jwt = false
+
+[functions.limpiar-storage-huerfano]
+verify_jwt = false

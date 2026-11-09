@@ -6323,10 +6323,12 @@ async function openDetalle(id, pushHistory = true) {
   // inconsistentes en vez de una fila prolija.
   const acciones = el("div", { style: "display:flex; flex-wrap:wrap; gap:8px; margin-top:16px;" });
   if (r.estado === "Aprobado") {
+    const avisoKame = el("p", { class: "portal-muted", style: "flex-basis:100%;margin:0;font-size:0.85rem" }, textoExportacionKame(r) || "El CSV para Kame todavía no se ha descargado.");
     acciones.appendChild(el("button", {
       class: "btn btn-secondary btn-sm", type: "button",
-      onclick: () => descargarCSV(r, items),
+      onclick: async () => { await descargarCSV(r, items); avisoKame.textContent = textoExportacionKame(r) || avisoKame.textContent; },
     }, "Descargar comprobante para Kame"));
+    acciones.appendChild(avisoKame);
   }
   // El aviso por correo al empleado se manda una sola vez, al momento de
   // aprobar/rechazar (ver finalizarAprobacionRendicion) -- si falló ahí
@@ -6553,6 +6555,17 @@ async function mostrarHistorialRendicion(rendicionId, box) {
   ));
 }
 
+// Cuenta de un documento editado. El aprobador la escribe (null si quien edita
+// es el empleado, que no la ve). Vacía, o igual a la del tipo anterior cuando
+// cambió el tipo sin que el empleado pudiera tocarla, pasa a la del tipo nuevo.
+function cuentaDocumentoEditado(it, tipoNuevo, cuentaEscrita) {
+  const porDefecto = CUENTA_POR_TIPO_DOC[tipoNuevo] || "";
+  if (cuentaEscrita !== null) return cuentaEscrita || porDefecto;
+  const actual = it.tipo_item === "ConDocumento" ? (it.cuenta_contable || "") : "";
+  const delTipoAnterior = it.tipo_item === "ConDocumento" && actual === CUENTA_POR_TIPO_DOC[it.tipo_documento];
+  return !actual || (delTipoAnterior && tipoNuevo !== it.tipo_documento) ? porDefecto : actual;
+}
+
 function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
   lineWrap.innerHTML = "";
   // Prefijado con el id del ítem: sin esto, editar dos ítems de la misma
@@ -6645,7 +6658,10 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
       camposTipo.appendChild(el("div", { class: "field-row" }, [nombreProv, rutProv]));
 
       const tipoDoc = fieldSelect(`${pfx}tipodoc`, "Tipo de documento", TIPOS_DOCUMENTO);
-      tipoDoc.querySelector("select").value = draftCon.tipoDocumento;
+      const tipoDocSel = tipoDoc.querySelector("select");
+      tipoDocSel.value = draftCon.tipoDocumento;
+      // Un documento sin cuenta (p. ej. venía de "Boleta") parte con la del tipo.
+      if (!draftCon.cuentaContable) draftCon.cuentaContable = CUENTA_POR_TIPO_DOC[tipoDocSel.value] || "";
       const nroDoc = fieldInput(`${pfx}nrodoc`, "N° de documento", "text");
       nroDoc.querySelector("input").value = draftCon.nroDocumento;
       camposTipo.appendChild(el("div", { class: "field-row" }, [tipoDoc, nroDoc]));
@@ -6667,6 +6683,18 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
         const nombreHint = el("p", { class: "ocr-status show", id: `${pfx}cuenta-nombre` }, nombreCuenta(cuentaInput.value));
         cuentaInput.addEventListener("input", () => { nombreHint.textContent = nombreCuenta(cuentaInput.value) || "Cuenta no reconocida"; });
         cuenta.appendChild(nombreHint);
+        // La cuenta de un documento es la de su pasivo (Proveedores u Honorarios
+        // por Pagar): si cambia el tipo y la cuenta era la del tipo anterior, se
+        // cambia con él. Antes quedaba la de Proveedores en boletas de honorarios.
+        let tipoDocAnterior = tipoDocSel.value;
+        tipoDocSel.addEventListener("change", () => {
+          const actual = cuentaInput.value.trim();
+          if (!actual || actual === CUENTA_POR_TIPO_DOC[tipoDocAnterior]) {
+            cuentaInput.value = CUENTA_POR_TIPO_DOC[tipoDocSel.value] || actual;
+            nombreHint.textContent = nombreCuenta(cuentaInput.value) || "Cuenta no reconocida";
+          }
+          tipoDocAnterior = tipoDocSel.value;
+        });
         // Sugerencia de cuenta de GASTO según la categoría elegida (no
         // reemplaza la cuenta de arriba, que sigue siendo la de pasivo
         // -- Proveedores/Honorarios por Pagar -- fija según el tipo de
@@ -6757,6 +6785,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           descripcion: lineWrap.querySelector(`#${pfx}desc`).value.trim(),
           centro_costo: lineWrap.querySelector(`#${pfx}cc`).value.trim(),
         };
+        if (!(cambios.monto > 0)) { toast("El monto debe ser mayor a $0."); return; }
         if (tipoEditado === "ConDocumento") {
           const rutEditado = formatearRut(lineWrap.querySelector(`#${pfx}rut`).value.trim());
           if (rutEditado && !validarRut(rutEditado)) { toast("Ese RUT de proveedor no es válido."); return; }
@@ -6765,7 +6794,9 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           cambios.tipo_documento = lineWrap.querySelector(`#${pfx}tipodoc`).value;
           cambios.nro_documento = lineWrap.querySelector(`#${pfx}nrodoc`).value.trim();
           cambios.fecha_vencimiento = lineWrap.querySelector(`#${pfx}venc`).value || null;
-          if (esAprobadorViewer) cambios.cuenta_contable = lineWrap.querySelector(`#${pfx}cuenta`).value.trim();
+          cambios.cuenta_contable = cuentaDocumentoEditado(it, cambios.tipo_documento,
+            esAprobadorViewer ? lineWrap.querySelector(`#${pfx}cuenta`).value.trim() : null);
+          if (!cambios.cuenta_contable) { toast("Falta la cuenta contable del documento."); return; }
           cambios.categoria = lineWrap.querySelector(`#${pfx}categoria`)?.value || null;
         } else {
           cambios.nombre_proveedor = lineWrap.querySelector(`#${pfx}nombreprov2`).value.trim();
@@ -6926,7 +6957,32 @@ async function conDatosActualesDeEmpleado(rendicion) {
   };
 }
 
+// Registro de qué rendiciones ya tienen su CSV para Kame descargado: importar
+// dos veces el mismo comprobante lo duplica en contabilidad. Si el registro
+// falla (p. ej. sin conexión) el CSV ya se descargó: solo se avisa en consola.
+function textoExportacionKame(r) {
+  if (!r?.kame_exportado_en) return "";
+  const veces = Number(r.kame_exportaciones || 1);
+  return "CSV para Kame descargado el " + fmtDate(r.kame_exportado_en) + (r.kame_exportado_por_nombre ? " por " + r.kame_exportado_por_nombre : "")
+    + (veces > 1 ? " (" + veces + " veces)" : "");
+}
+
+async function registrarExportacionKame(rendiciones) {
+  const ids = rendiciones.map((r) => r.id);
+  for (let inicio = 0; inicio < ids.length; inicio += 500) {
+    const { error } = await db.rpc("marcar_exportado_kame", { p_rendiciones: ids.slice(inicio, inicio + 500) });
+    if (error) { console.warn("No se pudo registrar la descarga del CSV para Kame:", error); return; }
+  }
+  const ahora = new Date().toISOString();
+  rendiciones.forEach((r) => {
+    r.kame_exportado_en = r.kame_exportado_en || ahora;
+    r.kame_exportado_por_nombre = r.kame_exportado_por_nombre || currentProfile?.nombre || null;
+    r.kame_exportaciones = Number(r.kame_exportaciones || 0) + 1;
+  });
+}
+
 async function descargarCSV(rendicion, items) {
+  if (rendicion.kame_exportado_en && !confirm(textoExportacionKame(rendicion) + ".\n\nSi ya lo importaste en Kame, importarlo de nuevo duplica el comprobante. ¿Descargarlo igual?")) return;
   const rendicionActualizada = await conDatosActualesDeEmpleado(rendicion);
   let split = null;
   if (rendicionActualizada.tipo_rendicion === "FondoPorRendir" && rendicionActualizada.solicitud_fondo_id) {
@@ -6942,6 +6998,7 @@ async function descargarCSV(rendicion, items) {
   a.href = URL.createObjectURL(blob);
   a.download = fileName;
   a.click();
+  await registrarExportacionKame([rendicion]);
 }
 
 // ------------------------------------------------------------
@@ -7164,12 +7221,24 @@ async function generarComprobantesPorRango(desde, hasta) {
   statusEl.className = "ocr-status show";
   statusEl.textContent = "Generando comprobantes...";
   try {
-    const rendiciones = await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).eq("estado","Aprobado").gte("fecha_aprobacion",`${desde}T00:00:00`).lte("fecha_aprobacion",`${hasta}T23:59:59`).order("fecha_aprobacion").order("id"));
+    let rendiciones = await consultarTodas(() => db.from("rendiciones").select("*",{count:"exact"}).eq("estado","Aprobado").gte("fecha_aprobacion",`${desde}T00:00:00`).lte("fecha_aprobacion",`${hasta}T23:59:59`).order("fecha_aprobacion").order("id"));
 
     if (!rendiciones || !rendiciones.length) {
       statusEl.textContent = "No hay rendiciones aprobadas en ese rango de fechas.";
       statusEl.className = "ocr-status show err";
       return;
+    }
+    // Las que ya se bajaron antes (rangos que se cruzan, o la descarga al aprobar).
+    const yaExportadas = rendiciones.filter((r) => r.kame_exportado_en);
+    if (yaExportadas.length && !confirm(yaExportadas.length + " de las " + rendiciones.length + " rendiciones ya tienen su CSV para Kame descargado (N° "
+      + yaExportadas.slice(0, 12).map((r) => r.folio).join(", ") + (yaExportadas.length > 12 ? "…" : "") + ").\n\n"
+      + "Aceptar: incluirlas igual (si ya están en Kame, se duplican).\nCancelar: dejarlas fuera.")) {
+      rendiciones = rendiciones.filter((r) => !r.kame_exportado_en);
+      if (!rendiciones.length) {
+        statusEl.textContent = "Todas las rendiciones del rango ya tenían su CSV descargado; no se generó otro.";
+        statusEl.className = "ocr-status show";
+        return;
+      }
     }
 
     const ids = rendiciones.map((r) => r.id);
@@ -7196,6 +7265,8 @@ async function generarComprobantesPorRango(desde, hasta) {
       if (!itemsPorRendicion[it.rendicion_id]) itemsPorRendicion[it.rendicion_id] = [];
       itemsPorRendicion[it.rendicion_id].push(it);
     });
+    // Mismo orden de carga que en el detalle (antes salían en orden de id, al azar).
+    Object.values(itemsPorRendicion).forEach((lista) => window.RindeCore.ordenarItemsRendicion(lista));
 
     const porEmpresa = {};
     rendiciones.forEach((r) => {
@@ -7228,6 +7299,7 @@ async function generarComprobantesPorRango(desde, hasta) {
     a.href = URL.createObjectURL(blob);
     a.download = `${nombreCarpeta}.zip`;
     a.click();
+    await registrarExportacionKame(rendiciones);
 
     statusEl.textContent = `Listo: ${rendiciones.length} rendición(es) en ${Object.keys(porEmpresa).length} empresa(s).`;
     statusEl.className = "ocr-status show ok";
