@@ -69,6 +69,9 @@ function tipoItemLabel(tipoItem) {
   return tipoItem === "ConDocumento" ? "Documento electrónico" : "Comprobante/Boleta";
 }
 
+// Ver folioDocumentoValido en pure.js (misma regla en la base).
+const MENSAJE_FOLIO_INVALIDO = (n) => `El N° de documento${n ? " del Ítem " + n : ""} debe tener solo números (como el folio de una factura). Si es una boleta o un ticket con letras, cárgalo como "Comprobante/Boleta".`;
+
 const CUENTA_POR_TIPO_DOC = {
   "Factura Electrónica": "2.01.07.01",
   "Factura Exenta Electrónica": "2.01.07.01",
@@ -5377,6 +5380,11 @@ async function submitRendicion() {
         toast(`El RUT del proveedor del Ítem ${idx + 1} no es válido.`);
         return;
       }
+      if (!window.RindeCore.folioDocumentoValido(document.getElementById(`${id}-folio`).value)) {
+        toast(MENSAJE_FOLIO_INVALIDO(idx + 1));
+        document.getElementById(`${id}-folio`).focus();
+        return;
+      }
       items.push({
         tipo_item: "ConDocumento",
         nombre_proveedor: document.getElementById(`${id}-nombreprov`).value.trim(),
@@ -7055,6 +7063,7 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
           cambios.rut_proveedor = rutEditado;
           cambios.tipo_documento = lineWrap.querySelector(`#${pfx}tipodoc`).value;
           cambios.nro_documento = lineWrap.querySelector(`#${pfx}nrodoc`).value.trim();
+          if (!window.RindeCore.folioDocumentoValido(cambios.nro_documento)) { toast(MENSAJE_FOLIO_INVALIDO()); return; }
           cambios.fecha_vencimiento = lineWrap.querySelector(`#${pfx}venc`).value || null;
           cambios.cuenta_contable = cuentaDocumentoEditado(it, cambios.tipo_documento,
             esAprobadorViewer ? lineWrap.querySelector(`#${pfx}cuenta`).value.trim() : null);

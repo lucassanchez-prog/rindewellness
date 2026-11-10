@@ -214,8 +214,23 @@
     const m = /^[^/]+\/[0-9a-f-]{36}-(\d+)-/i.exec(String(item?.adjunto_url || ""));
     return m ? Number(m[1]) : Infinity;
   }
+  // Desde 2026-11-10 cada gasto guarda su posición en la columna "orden" (la
+  // llena la base al insertar). Los gastos sin orden siguen usando la ruta.
+  function ordenItem(item) {
+    return item?.orden == null || item.orden === "" ? posicionItem(item) : Number(item.orden);
+  }
   function ordenarItemsRendicion(items) {
-    return items.sort((a, b) => (posicionItem(a) - posicionItem(b)) || String(a.id).localeCompare(String(b.id)));
+    return items.sort((a, b) => (ordenItem(a) - ordenItem(b)) || String(a.id).localeCompare(String(b.id)));
+  }
+
+  // Folio de una factura, factura exenta o boleta de honorarios: el SII los
+  // numera solo con dígitos (hasta 10). Un código con letras, como el de un
+  // ticket o una boleta de supermercado, no es un documento tributario: va
+  // como Comprobante/Boleta. Vacío se permite (el lector puede completarlo).
+  // Misma regla que validar_folio_documento en la base.
+  function folioDocumentoValido(nro) {
+    const v = String(nro ?? "").trim();
+    return v === "" || /^0*[1-9]\d{0,9}$/.test(v);
   }
 
   // Multifondo: una rendición puede rendirse contra varios fondos. Todos menos
@@ -247,7 +262,7 @@
     return null;
   }
 
-  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {
