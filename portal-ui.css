@@ -108,6 +108,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .liquidacion-fondo.bloqueado { opacity:.65; cursor:not-allowed; }
 .liquidacion-fondo .liquidacion-aviso { color:var(--warn); }
 .liquidacion-neto { font-size:1.05rem; margin:16px 0 8px; }
+.liquidacion-pendiente { margin:12px 0 0; padding:10px 12px; border-left:3px solid var(--warn); background:var(--warn-bg); border-radius:6px; }
 .liquidacion-total td { font-weight:600; border-top:2px solid var(--line); }
 .liquidacion-resumen { margin:20px 0; padding:18px 20px; border:1px solid var(--line); border-radius:16px; background:var(--card); }
 .liquidacion-resumen h3 { margin:0 0 6px; }

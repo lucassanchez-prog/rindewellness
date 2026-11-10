@@ -5728,6 +5728,15 @@ function tablaAsiento(filas) {
   return el("div", { class: "table-scroll" }, tabla);
 }
 
+// Lo que la liquidación deja abierto en Kame, documento por documento.
+function avisoPendientesLiquidacion(c, neto, nombre) {
+  if (!neto || !c.pendientes.length) return el("p", { class: "portal-muted" }, "Los fondos quedan saldados: no hay nada que pagar ni devolver.");
+  const docs = c.pendientes.map((p) => (p.cuenta === "2.01.07.29" ? "rendición N° " : "fondo S-") + p.folio + " (" + fmtCLP(p.monto) + ")").join(", ");
+  return el("p", { class: "liquidacion-pendiente" }, neto < 0
+    ? `Queda por pagar a ${nombre} ${fmtCLP(-neto)} en 2.01.07.29 Rendiciones por Pagar: ${docs}. Finanzas lo paga en Kame como cualquier reembolso.`
+    : `${nombre} debe devolver ${fmtCLP(neto)}, que sigue en 1.01.11.05 Fondo por Rendir: ${docs}. Regístralo en Kame cuando deposite.`);
+}
+
 async function leerLiquidacion(id) {
   const [{ data: l, error: e1 }, { data: detalle, error: e2 }] = await Promise.all([
     db.from("liquidaciones_fondos").select("*").eq("id", id).maybeSingle(),
@@ -5789,14 +5798,10 @@ async function armarFormularioLiquidacion(fondo, form) {
 
   const hoy = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Santiago", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
   const fecha = el("input", { type: "date", required: "", id: `liq-fecha-${fondo.id}`, max: hoy }); fecha.value = hoy;
-  const cuenta = el("input", { type: "text", id: `liq-cuenta-${fondo.id}`, placeholder: "Código de la cuenta en Kame", autocomplete: "off" });
-  const banco = el("input", { type: "text", id: `liq-banco-${fondo.id}`, placeholder: "Nombre del banco o cuenta", maxlength: "100" });
-  const referencia = el("input", { type: "text", id: `liq-ref-${fondo.id}`, placeholder: "N° de transferencia o depósito (opcional)", maxlength: "100" });
   const observacion = el("textarea", { id: `liq-obs-${fondo.id}`, rows: "2", maxlength: "500", placeholder: "Opcional: acuerdos, quién autorizó, etc." });
   const confirmado = el("input", { type: "checkbox", id: `liq-ok-${fondo.id}` });
   const textoConfirmacion = el("span", {});
-  const campoBanco = [el("div", { class: "field" }, [el("label", { for: cuenta.id }, "Cuenta bancaria · código"), cuenta]), el("div", { class: "field" }, [el("label", { for: banco.id }, "Nombre de la cuenta bancaria"), banco])];
-  const campos = el("div", { class: "fondo-kame-fields" }, [el("div", { class: "field" }, [el("label", { for: fecha.id }, "Fecha de la liquidación"), fecha]), el("div", { class: "field" }, [el("label", { for: referencia.id }, "Referencia"), referencia]), ...campoBanco]);
+  const campos = el("div", { class: "fondo-kame-fields" }, [el("div", { class: "field" }, [el("label", { for: fecha.id }, "Fecha de la liquidación"), fecha]), el("div", { class: "field" }, [el("label", { for: observacion.id }, "Observación"), observacion])]);
   const resumen = el("div", { class: "fondo-kame-preview", "aria-live": "polite" });
   const estado = el("p", { class: "portal-muted", role: "status" });
   const calcular = el("button", { class: "btn btn-secondary", type: "button" }, "Calcular liquidación");
@@ -5809,21 +5814,19 @@ async function armarFormularioLiquidacion(fondo, form) {
     const neto = Number(previa.neto);
     return window.RindeCore.comprobanteLiquidacionFondos({ folio: "nuevo", empresa: previa.empresa, empleado_nombre: previa.empleado_nombre, rut_empleado: previa.rut_empleado,
       fecha: fecha.value, resultado: neto > 0 ? "Devolucion" : neto < 0 ? "Pago" : "Compensado", total_restante: previa.total_restante, total_exceso: previa.total_exceso,
-      monto_neto: Math.abs(neto), cuenta_banco: cuenta.value, nombre_banco: banco.value, referencia: referencia.value }, previa.detalle);
+      monto_neto: Math.abs(neto) }, previa.detalle);
   };
   const refrescar = () => {
     liquidar.disabled = true;
     if (!previa) return;
     const neto = Number(previa.neto);
-    campoBanco.forEach((c) => { c.hidden = neto === 0; });
-    textoConfirmacion.textContent = neto > 0 ? `Confirmo que ${nombre} ya devolvió ${fmtCLP(neto)} y que esta liquidación no está registrada en Kame.`
-      : neto < 0 ? `Confirmo que se pagaron (o se pagarán con esta referencia) ${fmtCLP(-neto)} a ${nombre} y que esta liquidación no está registrada en Kame.`
-      : "Revisé los montos y esta liquidación no está registrada en Kame.";
+    textoConfirmacion.textContent = "Revisé los montos y esta liquidación no está registrada en Kame.";
     const partes = [el("p", { class: "liquidacion-neto " + (neto < 0 ? "portal-negative" : "") }, el("strong", {}, textoNetoLiquidacion(neto, previa.empleado_nombre || nombre))), tablaLiquidacion(previa.detalle, fondo.id)];
     try {
       const c = asiento();
-      partes.push(el("p", { style: "margin-top:16px;font-weight:600" }, c.filas.length ? `Asiento para Kame (${c.tipo}) en ${previa.empresa}` : "No requiere asiento: los fondos se consumieron exactamente."));
+      partes.push(el("p", { style: "margin-top:16px;font-weight:600" }, c.filas.length ? `Asiento para Kame (TRASPASO) en ${previa.empresa}: compensa ${fmtCLP(c.compensado)}` : "No requiere asiento: no hay excesos que cruzar con restantes."));
       if (c.filas.length) partes.push(tablaAsiento(c.filas));
+      partes.push(avisoPendientesLiquidacion(c, neto, previa.empleado_nombre || nombre));
       liquidar.disabled = !confirmado.checked || ocupado;
       estado.textContent = confirmado.checked ? "" : "Marca la confirmación para liquidar.";
     } catch (error) { estado.textContent = error.message; }
@@ -5831,7 +5834,7 @@ async function armarFormularioLiquidacion(fondo, form) {
   };
   const invalidar = () => { previa = null; liquidar.disabled = true; resumen.replaceChildren(); estado.textContent = "Calcula la liquidación para ver el resultado."; };
   checks.forEach((cb) => cb.addEventListener("change", invalidar));
-  [fecha, cuenta, banco, referencia, confirmado].forEach((i) => i.addEventListener("input", refrescar));
+  [fecha, confirmado].forEach((i) => i.addEventListener("input", refrescar));
   confirmado.addEventListener("change", refrescar);
 
   calcular.addEventListener("click", async () => {
@@ -5856,8 +5859,7 @@ async function armarFormularioLiquidacion(fondo, form) {
     ocupado = true; liquidar.disabled = true; calcular.disabled = true; estado.textContent = "Liquidando…";
     try {
       const { data, error } = await db.rpc("liquidar_fondos", { p_fondos: previa.ids, p_fecha: fecha.value, p_neto_esperado: Number(previa.neto),
-        p_cuenta_banco: Number(previa.neto) ? cuenta.value : null, p_nombre_banco: Number(previa.neto) ? banco.value : null,
-        p_referencia: referencia.value || null, p_observacion: observacion.value || null });
+        p_observacion: observacion.value || null });
       if (error) throw error;
       let aviso = `Liquidación L-${data.folio} registrada.`;
       if (c.filas.length) {
@@ -5873,10 +5875,9 @@ async function armarFormularioLiquidacion(fondo, form) {
   const algunoBloqueado = !checks.get(fondo.id) || checks.get(fondo.id).disabled;
   form.replaceChildren(...[
     el("h3", {}, "Liquidar fondos de " + nombre),
-    el("p", { class: "portal-muted" }, `Elige los fondos abiertos de ${fondo.empresa} que se cierran juntos. Los excesos se cruzan con los restantes y solo la diferencia se devuelve o se paga. Para cerrar un fondo por separado, deja solo ese marcado.`),
+    el("p", { class: "portal-muted" }, `Elige los fondos abiertos de ${fondo.empresa} que se cierran juntos. Los excesos se cruzan con los restantes; la diferencia queda en Kame en su documento y se paga o se devuelve como hoy. Para cerrar un fondo por separado, deja solo ese marcado.`),
     algunoBloqueado ? el("p", { class: "ocr-status show err" }, "Este fondo todavía tiene rendiciones en revisión.") : null,
     lista, el("div", { class: "fondo-kame-actions" }, [calcular]), resumen, campos,
-    el("div", { class: "field" }, [el("label", { for: observacion.id }, "Observación"), observacion]),
     el("label", { class: "fondo-kame-confirmacion", for: confirmado.id }, [confirmado, textoConfirmacion]),
     el("p", { class: "portal-muted" }, "Supone que la entrega de cada fondo y los CSV de sus rendiciones ya están importados en Kame."),
     el("div", { class: "fondo-kame-actions" }, [liquidar]), estado].filter(Boolean));
@@ -5896,8 +5897,10 @@ async function bloqueLiquidacion(s, esAdmin) {
     el("h3", {}, `Liquidado en L-${l.folio}`),
     el("p", {}, `${fmtDate(l.fecha)} · ${RESULTADO_LIQUIDACION[l.resultado] || l.resultado}${Number(l.monto_neto) ? " por " + fmtCLP(l.monto_neto) : ""} · registrado por ${l.creado_por_nombre || "-"}`),
     tablaLiquidacion(detalle, s.id));
-  if (l.nombre_banco) caja.appendChild(el("p", { class: "portal-muted" }, `Banco: ${l.cuenta_banco} · ${l.nombre_banco}` + (l.referencia ? ` · Ref. ${l.referencia}` : "")));
-  else if (l.referencia) caja.appendChild(el("p", { class: "portal-muted" }, "Ref. " + l.referencia));
+  try {
+    const c = window.RindeCore.comprobanteLiquidacionFondos(l, detalle);
+    caja.appendChild(avisoPendientesLiquidacion(c, l.resultado === "Devolucion" ? Number(l.monto_neto) : -Number(l.monto_neto), l.empleado_nombre || "La persona"));
+  } catch (error) { caja.appendChild(el("p", { class: "ocr-status show err" }, error.message)); }
   if (l.observacion) caja.appendChild(el("p", { class: "portal-muted" }, "Observación: " + l.observacion));
   if (!esAdmin) return caja;
 
