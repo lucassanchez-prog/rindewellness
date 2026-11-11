@@ -133,6 +133,9 @@ def leer_claude(cliente, modelo, foto, prompt, esfuerzo):
     except anthropic.RateLimitError as e:
         return {"error": "limite: " + str(e)[:200], "reintentar": True}
     except anthropic.APIStatusError as e:
+        # Sin crédito, o un problema de la cuenta: no es una lectura fallida.
+        if e.status_code in (400, 402) and re.search(r"credit balance|billing|workspace", str(e), re.I):
+            return {"error": "la cuenta no puede usar la API: " + str(e)[:200], "abortar": True}
         return {"error": f"HTTP {e.status_code}: {str(e)[:200]}", "reintentar": e.status_code >= 500}
     except anthropic.APIConnectionError as e:
         return {"error": "conexion: " + str(e)[:200], "reintentar": True}
@@ -288,7 +291,9 @@ def main():
     if os.path.exists(ruta_lecturas):
         for linea in open(ruta_lecturas, encoding="utf-8"):
             x = json.loads(linea)
-            if not x["resultado"].get("reintentar"):
+            # Solo cuentan las lecturas reales; los cortes de conexión, cupo o cuenta se reintentan.
+            r = x["resultado"]
+            if not r.get("reintentar") and not r.get("abortar") and not str(r.get("error", "")).startswith(("HTTP", "limite", "conexion", "la cuenta")):
                 lecturas[x["lector"]][x["id"]] = x["resultado"]
     salida = open(ruta_lecturas, "a", encoding="utf-8")
     def guardar(lector, g, r):
@@ -314,7 +319,7 @@ def main():
                 m, g = futuros[f]; r = f.result()
                 if r.get("abortar"):
                     for x in futuros: x.cancel()
-                    sys.exit(f"Claude rechazó la credencial ({r['error']}). Revisa ANTHROPIC_API_KEY o `ant auth login`; no se anotó nada.")
+                    sys.exit(f"Detenido: {r['error']}. No se cobró ni se anotó esta lectura; corrige la cuenta y vuelve a correr el mismo comando.")
                 guardar(m, g, r)
                 print(f"  [{i}/{len(pendientes)}] {m}: {'error ' + r['error'] if r.get('error') else 'ok'} {r.get('segundos', '')}s")
     for activo, lector, leer, pausa in ((a.con_gemini, "gemini:" + a.gemini_modelo, lambda f: leer_gemini(a.gemini_modelo, f, prompt), 5),
