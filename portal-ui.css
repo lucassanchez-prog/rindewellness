@@ -137,3 +137,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .fondos-rendicion ul{margin:4px 0 0;padding-left:18px}
 .editor-fondos{border:1px solid var(--line);border-radius:9px;padding:14px;margin:0 0 16px;background:var(--paper)}
 @media(max-width:640px){.nr-fondo-fila{flex-wrap:wrap}.nr-fondo-fila select{flex:1 1 100%}.nr-fondo-fila .nr-fondo-monto{flex:1 1 auto;width:auto}.nr-fondo-fila .btn{min-height:44px}}
+
+.correcciones-admin { margin-top:16px; border:1px dashed var(--line); }
+.correcciones-admin .correccion-accion { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.correcciones-admin textarea { width:100%; }

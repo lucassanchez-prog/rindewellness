@@ -10,7 +10,7 @@ function preparar(filas=[original],opciones={}){
   const writes=[],filters=[];
   const items=[{...base,id:'florida',centro_costo:'NEO LA FLORIDA'},{...base,id:'inde',centro_costo:'NEO INDEPENDENCIA'}];
   const consulta={select(){return this;},eq(k,v){filters.push([k,v]);return this;},ilike(k,v){filters.push([k,v]);return this;},async limit(){
-    const data=filas.filter(row=>filters.every(([k,v])=>v.startsWith('%')?String(row[k]).endsWith(v.slice(1)):row[k]===v));
+    const data=filas.filter(row=>filters.every(([k,v])=>v.startsWith('%')&&v.endsWith('%')?String(row[k]??'').includes(v.slice(1,-1)):v.startsWith('%')?String(row[k]).endsWith(v.slice(1)):row[k]===v));
     return {data,error:null,count:opciones.incompleto?501:data.length};
   }};
   const ctx=vm.createContext({console:{error(){}},window:{RindeCore:core},fmtCLP:core.fmtCLP,nombreCuenta:()=>original.cuenta_nom,dbContabilidad:{from:()=>{filters.length=0;return consulta;}},updateChecked:async(table,id,values)=>{
@@ -72,4 +72,17 @@ test('muestra la causa real cuando la consulta falla',async()=>{
 test('no muestra verificación exitosa si falla el guardado',async()=>{
   const p=preparar([original],{falloGuardado:true});await p.ctx.verificarDocumentoItem(p.items[0],p.box,'Neo Gym Chile SpA',p.items);
   assert.equal(p.box.textContent,'No se guardó');assert.match(p.box.className,/err/);
+});
+
+// N° 68 (2026-11): la factura existía en contabilidad, pero una nota de
+// crédito del mismo proveedor por casi el mismo monto la había anulado.
+test('avisa si el proveedor tiene una nota de crédito por casi el mismo monto',async()=>{
+  const nc={...original,id:9,documento:null,concepto:'Nota de Crédito Electrónica #777, ficha 96.792.430-K',comprobante:'860',debe:28990,haber:0};
+  const p=preparar([original,nc]);await p.ctx.verificarDocumentoItem(p.items[0],p.box,'Neo Gym Chile SpA',p.items);
+  const v=p.writes[0].values.verificacion_contable;
+  assert.equal(v.estado,'coincide','el monto de la factura igual coincide');
+  assert.deepEqual(v.notas_credito.map(n=>[n.folio,n.monto]),[['777',28990]]);
+  assert.match(p.box.className,/err/);assert.match(p.box.textContent,/NC #777/);assert.match(p.box.textContent,/Revisa si anula esta factura/);
+  const sinNc=preparar();await sinNc.ctx.verificarDocumentoItem(sinNc.items[0],sinNc.box,'Neo Gym Chile SpA',sinNc.items);
+  assert.deepEqual(sinNc.writes[0].values.verificacion_contable.notas_credito,[]);assert.match(sinNc.box.className,/ ok$/);
 });

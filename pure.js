@@ -204,6 +204,44 @@
     if (debe !== haber || debe !== compensado || pendientes.reduce((s,p) => s + p.monto, 0) !== neto) throw new Error("El asiento de la liquidación no cuadra.");
     return {filas, tipo:"TRASPASO", glosa, total:debe, compensado, pendientes, fileName:`comprobante_liquidacion_L-${liq.folio}.csv`};
   }
+
+  // Línea de comprobante Kame invertida (Debe <-> Haber), con la fecha del
+  // reverso y "REVERSO" en el comentario. Columnas: 3 Fecha, 4 Comentario,
+  // 6 Debe, 7 Haber, 8 Comentario Línea (ver CSV_HEADER en app.js).
+  function invertirFilaKame(campos, fecha) {
+    const f = [...campos];
+    if (f.length < 9) throw new Error("Línea de comprobante incompleta.");
+    if (!/^\d{2}\/\d{2}\/\d{4}$/.test(String(fecha || ""))) throw new Error("Fecha del reverso no válida.");
+    [f[6], f[7]] = [f[7], f[6]];
+    f[3] = fecha;
+    f[4] = ("REVERSO " + String(f[4] || "")).trim();
+    f[8] = ("REVERSO " + String(f[8] || "")).trim();
+    return f;
+  }
+
+  // Notas de crédito del proveedor que podrían anular una factura: en la
+  // contabilidad la NC no dice a qué factura anula (N° 68, 2026-11: factura
+  // 62052 por $148.550 y NC 59532 por $148.560 el mismo día). Se marcan las
+  // NC del mismo proveedor y empresa, a 60 días o menos de la factura y por
+  // un monto casi igual (2 % o $1.000). "movimientos" son filas de la tabla
+  // de contabilidad (documento, concepto, debe, haber, fecha, comprobante).
+  function notasCreditoCercanas(movimientos, factura) {
+    const monto = Number(factura?.monto), fecha = Date.parse(factura?.fecha || "");
+    if (!Number.isFinite(monto) || monto <= 0) return [];
+    const tolerancia = Math.max(1000, Math.round(monto * 0.02));
+    const vistas = new Map();
+    for (const m of movimientos || []) {
+      const texto = String(m?.documento || "") + " " + String(m?.concepto || "");
+      const nc = /Nota de Cr[eé]dito[^#]*#\s*(\d+)/i.exec(texto);
+      if (!nc) continue;
+      const importe = Math.max(Number(m.debe) || 0, Number(m.haber) || 0);
+      if (Math.abs(importe - monto) > tolerancia) continue;
+      const cuando = Date.parse(m.fecha || "");
+      if (Number.isFinite(fecha) && Number.isFinite(cuando) && Math.abs(cuando - fecha) > 60 * 86400000) continue;
+      if (!vistas.has(nc[1])) vistas.set(nc[1], { folio: nc[1], monto: importe, fecha: m.fecha || null, comprobante: m.comprobante || null });
+    }
+    return [...vistas.values()];
+  }
 
   // Orden en que se cargaron los gastos al enviar la rendición. La tabla no tiene
   // columna de orden (el id es aleatorio), pero la posición viaja en la ruta del
@@ -262,7 +300,7 @@
     return null;
   }
 
-  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido, invertirFilaKame, notasCreditoCercanas,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

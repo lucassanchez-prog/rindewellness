@@ -2,6 +2,8 @@ import { revisarCompletitud } from "./estado-lectura.ts";
 import { revisarEstructuraDocumento } from "./analisis-documento.ts";
 import { habilitado, consultarGroq } from "./respaldo-nube.ts";
 import { PROVEEDOR_CLAUDE, claudeAdmite, claudeHabilitado, configClaude, consultarClaude, type ErrorClaude } from "./claude-ocr.ts";
+import { avisarAdministradores } from "./aviso-admin.ts";
+import { logEvent } from "./logging.ts";
 import { verificarCampos } from "./verificacion-ocr.ts";
 // Lógica compartida para leer un comprobante con Gemini: arma el prompt,
 // prueba una cadena de modelos candidatos con reintentos, y valida/limpia
@@ -749,6 +751,24 @@ export async function proveedoresDisponibles(admin:AdminClient|null):Promise<{di
   }catch{return libre;}
 }
 
+// Claude sin crédito o con la llave rechazada: queda en "Salud del sistema"
+// (evento *_fail) y se avisa por correo. Solo pasa cuando Claude estaba
+// disponible, así que llega a lo más un aviso por hora (su pausa). El correo
+// espera como máximo 4 s para no demorar la lectura de la persona.
+async function avisarCuentaClaude(admin:AdminClient|null,error:unknown){
+  if(!admin)return;
+  const detalle=error instanceof Error?error.message:String(error);
+  await logEvent(admin as never,"ocr_claude_cuenta_fail",{detalle,metadata:{proveedor:PROVEEDOR_CLAUDE}});
+  await Promise.race([
+    avisarAdministradores(admin as never,"RindeWellness: Claude dejó de leer comprobantes","Lector Claude en pausa",[
+      "La lectura de comprobantes con Claude se pausó porque la cuenta de la API no está disponible: probablemente se acabó el crédito o la llave fue rechazada.",
+      "Mientras tanto la app sigue leyendo con Gemini y Groq, así que nadie queda bloqueado, pero con sus límites gratuitos.",
+      "Revisa el saldo en platform.claude.com (Plans & Billing) de la organización de la llave guardada en Supabase (ANTHROPIC_API_KEY). Claude se vuelve a probar solo cada hora.",
+    ]),
+    new Promise((r)=>setTimeout(r,4000)),
+  ]);
+}
+
 // Cadena de lectores: Claude (principal, si está activado) -> Gemini -> Groq.
 // Claude usa una parte del presupuesto de tiempo; si falla, los respaldos
 // siguen con lo que queda. Un fallo de cupo o de cuenta lo enfría en
@@ -769,6 +789,7 @@ export async function leerComprobante(admin:AdminClient|null,imageBase64:string,
       const mensaje=errorClaude instanceof Error?errorClaude.message:String(errorClaude);
       await registrarIntentoModelo(admin,PROVEEDOR_CLAUDE,false,mensaje,(errorClaude as ErrorClaude).retryAfterMs);
       console.error("Claude no leyó el comprobante; se usa el respaldo:",mensaje);
+      if((errorClaude as ErrorClaude).cuenta)await avisarCuentaClaude(admin,errorClaude);
       const restante=presupuesto.totalMs-(Date.now()-inicioClaude);
       if(restante<5000)throw errorClaude;
       presupuesto={porLlamadaMs:Math.min(presupuesto.porLlamadaMs,restante),totalMs:restante};

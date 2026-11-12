@@ -1550,6 +1550,8 @@ async function openAdminUsuarios(pushHistory = true) {
       if (nombresProveedor.length) {
         const detalle = nombresProveedor.sort((a, b) => lecturas.total[b] - lecturas.total[a]).map((p) => `${p} ${lecturas.total[p]}`).join(" · ");
         lineas.push(`Lecturas con IA: ${detalle}` + (lecturas.delBot ? ` (${lecturas.delBot} las hizo el bot de reintentos)` : ""));
+        // Costo medido con Claude Haiku 5.5 (~US$0,0013 por foto, 2026-11-11). Gemini y Groq son gratuitos.
+        if (lecturas.total.claude) lineas.push(`Costo estimado de Claude en 7 días: ~US$${(lecturas.total.claude * 0.0013).toFixed(2)} (${lecturas.total.claude} lecturas). Si se pausa por falta de crédito, aparece arriba como ocr_claude_cuenta_fail.`);
       }
       list.insertBefore(
         el("div", { class: "card", style: "border:1px solid " + (eventos.length ? "var(--warn)" : "var(--border, #2c3a44)") + ";margin-bottom:16px;" }, [
@@ -5247,6 +5249,12 @@ function patronDocumentoContable(tipoDocumento, nroDocumento) {
   return `${tipoDocumento} #${folio}`;
 }
 
+function textoNotasCredito(ncs) {
+  return "⚠ El proveedor tiene " + (ncs.length > 1 ? ncs.length + " notas de crédito" : "una nota de crédito") + " por un monto casi igual: "
+    + ncs.map((nc) => "NC #" + nc.folio + " por " + fmtCLP(nc.monto) + (nc.fecha ? " (" + fmtDate(nc.fecha) + ")" : "")).join(", ")
+    + ". Revisa si anula esta factura antes de aprobar.";
+}
+
 async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicion = [item]) {
   box.className = "verify-box show";
   box.textContent = "Consultando...";
@@ -5293,6 +5301,22 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
     const cuenta = CUENTA_POR_TIPO_DOC[item.tipo_documento];
     const nombreCuentaVerificada = lineaProveedor?.[MOVIMIENTOS_COLS.cuentaNom] || nombreCuenta(cuenta) || "Nombre no disponible";
     const comprobante = lineaProveedor?.[MOVIMIENTOS_COLS.comprobante] || null;
+    // Una factura puede venir anulada por una nota de crédito (N° 68): la NC
+    // no dice qué factura anula, así que se buscan las del mismo proveedor y
+    // empresa por un monto casi igual y cerca en fecha (notasCreditoCercanas).
+    // Si la consulta falla, la verificación sigue igual, sin aviso de NC.
+    let notasCredito = [];
+    if (match) {
+      try {
+        // El concepto siempre trae el documento ("Nota de Crédito Electrónica #59532, ficha ...").
+        const {data:ncs,error:errorNc} = await dbContabilidad.from("movimientos")
+          .select("fecha, documento, concepto, debe, haber, comprobante")
+          .eq(MOVIMIENTOS_COLS.rutFicha, item.rut_proveedor).eq(MOVIMIENTOS_COLS.rutEmpresa, rutEmpresa)
+          .ilike(MOVIMIENTOS_COLS.concepto, "%Nota de Cr%").limit(200);
+        if (errorNc) throw errorNc;
+        notasCredito = window.RindeCore.notasCreditoCercanas(ncs, { monto: comparacionMonto?.contable ?? grupo.monto, fecha: match.fecha || item.fecha_vencimiento });
+      } catch (errorNc) { notasCredito = []; console.error("No se pudieron revisar notas de crédito:", errorNc?.message || errorNc); }
+    }
 
     // Escribir primero, mostrar el resultado recién si de verdad quedó
     // guardado -- antes se pintaba el ✔ aunque el update no hubiera tocado
@@ -5302,7 +5326,7 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
       existe_en_contabilidad: !!match,
       cuenta_contable: cuenta,
       comprobante_contable_encontrado: comprobante,
-      verificacion_contable: {empresa_revisada:empresaRendicion || null,rut_empresa:rutEmpresa,empresa_contable:lineaProveedor?.empresa || null,otras_empresas:otrasEmpresas,estado:comparacionMonto?.estado || (otrasEmpresas.length ? "empresa_distinta" : "no_encontrado"),monto_rendido:Number(item.monto),monto_documento_rendido:grupo.monto,miembros:grupo.miembros,monto_contable:comparacionMonto?.contable ?? null,diferencia:comparacionMonto?.diferencia ?? null,cuenta,nombre_cuenta:nombreCuentaVerificada,comprobante,rut_proveedor:item.rut_proveedor,tipo_documento:item.tipo_documento,nro_documento:item.nro_documento},
+      verificacion_contable: {empresa_revisada:empresaRendicion || null,rut_empresa:rutEmpresa,empresa_contable:lineaProveedor?.empresa || null,otras_empresas:otrasEmpresas,estado:comparacionMonto?.estado || (otrasEmpresas.length ? "empresa_distinta" : "no_encontrado"),monto_rendido:Number(item.monto),monto_documento_rendido:grupo.monto,miembros:grupo.miembros,monto_contable:comparacionMonto?.contable ?? null,diferencia:comparacionMonto?.diferencia ?? null,cuenta,nombre_cuenta:nombreCuentaVerificada,comprobante,notas_credito:notasCredito,rut_proveedor:item.rut_proveedor,tipo_documento:item.tipo_documento,nro_documento:item.nro_documento},
     });
     if (!res.ok) {
       box.className = "verify-box show err";
@@ -5313,12 +5337,13 @@ async function verificarDocumentoItem(item, box, empresaRendicion, itemsRendicio
     item.cuenta_contable = cuenta;
     item.verificacion_contable = res.data?.[0]?.verificacion_contable || null;
 
-    box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" ? "ok" : "err");
+    box.className = "verify-box show " + (!match ? "no" : comparacionMonto.estado === "coincide" && !notasCredito.length ? "ok" : "err");
     box.textContent = !match ? (otrasEmpresas.length ? "⚠ Documento registrado en otra empresa: "+otrasEmpresas.join(", ")+". No se confirmó el monto para "+empresaRendicion+"." : "✘ Todavía no aparece registrada en contabilidad. El monto no se pudo comprobar.")
       : comparacionMonto.estado === "coincide" ? "✔ Documento encontrado · " + (grupo.miembros.length>1 ? "Suma de "+grupo.miembros.length+" gastos coincide: " : "Monto coincide: ") + fmtCLP(comparacionMonto.contable) + (grupo.miembros.length>1 ? " · Este gasto: "+fmtCLP(item.monto) : "") + " · Cuenta " + cuenta + " · " + nombreCuentaVerificada
       : comparacionMonto.estado === "diferente" ? "⚠ Documento encontrado, pero el monto difiere. Rendido: " + fmtCLP(comparacionMonto.rendido) + ". Contabilidad: " + fmtCLP(comparacionMonto.contable) + ". Diferencia: " + fmtCLP(comparacionMonto.diferencia) + ". Si distribuiste la factura entre varios gastos, revisa la suma de esas partes."
       : comparacionMonto.estado === "ambiguo" ? "⚠ Documento encontrado en varios comprobantes contables. No se puede confirmar un único monto; revisa los registros."
       : "⚠ Documento encontrado, pero no hay un monto contable del proveedor que pueda confirmarse. Revisa el comprobante.";
+    if (notasCredito.length) box.textContent += " " + textoNotasCredito(notasCredito);
   } catch (err) {
     console.error("verificarDocumentoItem:", err);
     box.className = "verify-box show err";
@@ -5502,6 +5527,15 @@ async function submitRendicion() {
       const { data, error } = await db.rpc("buscar_documento_duplicado", { p_rut: item.rut_proveedor, p_nro: item.nro_documento, p_tipo: item.tipo_documento });
       if (error) throw new Error("No se pudo comprobar documentos duplicados. Vuelve a intentar antes de enviar.");
       if (data?.length && !confirm("El documento " + item.nro_documento + " ya aparece en la rendición N° " + data[0].folio + ". ¿Confirmas que corresponde enviarlo nuevamente?")) return;
+    }
+    // Varias rendiciones de un gasto cada una contra el mismo fondo (N° 69 a 74,
+    // 2026-11) se revisan y se exportan por separado. Se avisa, sin bloquear.
+    if (solicitudFondoId) {
+      let q = db.from("rendiciones").select("folio").eq("empleado_id", currentUser.id).eq("estado", "Pendiente").eq("solicitud_fondo_id", solicitudFondoId);
+      if (envioRendicionId) q = q.neq("id", envioRendicionId);
+      const { data: pendientesFondo } = await q;
+      if (pendientesFondo?.length && !confirm("Ya tienes " + (pendientesFondo.length > 1 ? pendientesFondo.length + " rendiciones pendientes" : "la rendición N° " + pendientesFondo[0].folio + " pendiente") + " contra este mismo fondo"
+        + (pendientesFondo.length > 1 ? " (" + pendientesFondo.map((p) => "N° " + p.folio).join(", ") + ")" : "") + ".\n\nSi son gastos del mismo evento, conviene enviarlos juntos en una sola rendición. ¿Enviar esta como una rendición nueva igual?")) return;
     }
     const usuarioEnvio = currentUser.id;
     const rendicionId = envioRendicionId || (envioRendicionId = crypto.randomUUID());
@@ -6640,8 +6674,161 @@ async function openDetalle(id, pushHistory = true) {
   }
   box.appendChild(acciones);
   box.appendChild(historialBox);
+  if (currentProfile?.rol === "admin") {
+    try { const panel = await panelCorreccionesAdmin(r, items); if (panel) box.appendChild(panel); }
+    catch (error) { console.warn("No se pudo armar el panel de correcciones:", error); }
+  }
 
   if (pushHistory) pushView("view-detalle", { id }); else show("view-detalle");
+}
+
+// ------------------------------------------------------------
+// Correcciones de administrador (detalle de una rendición). Cada acción llama
+// a una función de la base que valida, aplica, deja historial y un evento en
+// una sola transacción (ver 20261112120000_correcciones_admin.sql). Aquí solo
+// se ofrecen las acciones que tienen sentido para el estado de la rendición.
+// ------------------------------------------------------------
+function descargarTextoCsv(fileName, content) {
+  const url = URL.createObjectURL(new Blob(["﻿" + content], { type: "text/csv;charset=utf-8" }));
+  const link = el("a", { href: url, download: fileName });
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Reverso para Kame de una rendición aprobada cuyo CSV ya se descargó: las
+// mismas líneas con Debe y Haber invertidos, fechadas hoy. Se arma ANTES de
+// anular, porque después los gastos quedan rechazados y ya no hay asiento.
+async function prepararReversoKame(r, items) {
+  const rend = await conDatosActualesDeEmpleado(r);
+  let split = null;
+  if (rend.tipo_rendicion === "FondoPorRendir" && rend.solicitud_fondo_id) {
+    split = (await calcularSplitFondo([rend])).get(rend.id) || null;
+  }
+  const [y, m, d] = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Santiago", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()).split("-");
+  const filas = construirFilasCSV(rend, items, 1, split, { reverso: { fecha: `${d}/${m}/${y}` } });
+  return { fileName: `reverso_rendicion_${r.folio ?? r.id.slice(0, 8)}.csv`, content: [CSV_HEADER, ...filas].join("\r\n") };
+}
+
+function formularioCorreccion({ titulo, descripcion, campos = [], textoBoton, ejecutar }) {
+  const motivo = el("textarea", { rows: "2", maxlength: "500", placeholder: "Motivo (queda en el historial)" });
+  const estado = el("p", { class: "portal-muted", role: "status", style: "margin:8px 0 0" });
+  const boton = el("button", { class: "btn btn-primary btn-sm", type: "button" }, textoBoton);
+  const caja = el("div", { class: "correccion-accion", hidden: "" }, [
+    el("p", { style: "margin:0 0 8px;font-size:0.88rem" }, descripcion),
+    ...campos,
+    el("div", { class: "field" }, [el("label", {}, "Motivo"), motivo]),
+    boton, estado,
+  ]);
+  const abrir = el("button", { class: "btn btn-secondary btn-sm", type: "button", "aria-expanded": "false" }, titulo);
+  abrir.addEventListener("click", () => { caja.hidden = !caja.hidden; abrir.setAttribute("aria-expanded", String(!caja.hidden)); });
+  boton.addEventListener("click", async () => {
+    const texto = motivo.value.trim();
+    if (texto.length < 3) { estado.textContent = "Explica el motivo de la corrección."; motivo.focus(); return; }
+    boton.disabled = true; estado.textContent = "Aplicando…";
+    try { await ejecutar(texto, estado); }
+    catch (error) { estado.textContent = mensajeErrorAmigable(error); }
+    finally { boton.disabled = false; }
+  });
+  return { abrir, caja };
+}
+
+async function panelCorreccionesAdmin(r, items) {
+  const panel = el("section", { class: "card correcciones-admin", "aria-label": "Correcciones de administrador" });
+  const botones = el("div", { style: "display:flex;flex-wrap:wrap;gap:8px" });
+  const cajas = el("div", {});
+  const agregar = (f) => { botones.appendChild(f.abrir); cajas.appendChild(f.caja); };
+  const rpc = async (nombre, args) => { const { data, error } = await db.rpc(nombre, args); if (error) throw error; return data; };
+  const pendienteLibre = r.estado === "Pendiente" && !r.kame_exportado_en;
+  const sinFondo = r.tipo_rendicion === "Reembolso" && !r.solicitud_fondo_id;
+
+  if (pendienteLibre && sinFondo) {
+    const selEmpresa = el("select", {}, EMPRESAS.filter((e) => e !== r.empresa).map((e) => el("option", { value: e }, e)));
+    agregar(formularioCorreccion({
+      titulo: "Cambiar empresa",
+      descripcion: `Hoy es de ${r.empresa}. Cambia la rendición y sus ${items.length} gastos; la verificación contable de cada gasto se vuelve a hacer.`,
+      campos: [el("div", { class: "field" }, [el("label", {}, "Empresa nueva"), selEmpresa])],
+      textoBoton: "Cambiar empresa",
+      ejecutar: async (motivo) => {
+        if (!confirm(`¿Pasar la rendición N° ${r.folio} de ${r.empresa} a ${selEmpresa.value}?`)) return;
+        await rpc("admin_cambiar_empresa_rendicion", { p_rendicion: r.id, p_empresa: selEmpresa.value, p_motivo: motivo });
+        toast(`Rendición N° ${r.folio} ahora es de ${selEmpresa.value}.`); loadDashboard(); openDetalle(r.id, false);
+      },
+    }));
+
+    const { data: perfiles } = await db.from("profiles").select("id, nombre, activo").eq("activo", true).order("nombre");
+    const candidatos = (perfiles || []).filter((p) => p.id !== r.empleado_id && p.id !== currentUser.id);
+    if (candidatos.length) {
+      const selEmpleado = el("select", {}, candidatos.map((p) => el("option", { value: p.id }, p.nombre)));
+      agregar(formularioCorreccion({
+        titulo: "Traspasar a otro empleado",
+        descripcion: `Hoy es de ${r.empleado_nombre}. Úsalo cuando alguien cargó la rendición por otra persona. Las boletas quedan donde están y el nuevo dueño las puede ver.`,
+        campos: [el("div", { class: "field" }, [el("label", {}, "Nuevo dueño"), selEmpleado])],
+        textoBoton: "Traspasar",
+        ejecutar: async (motivo) => {
+          const nombre = selEmpleado.selectedOptions[0]?.textContent;
+          if (!confirm(`¿Traspasar la rendición N° ${r.folio} de ${r.empleado_nombre} a ${nombre}?`)) return;
+          await rpc("admin_cambiar_empleado_rendicion", { p_rendicion: r.id, p_empleado: selEmpleado.value, p_motivo: motivo });
+          toast(`Rendición N° ${r.folio} traspasada a ${nombre}.`); loadDashboard(); openDetalle(r.id, false);
+        },
+      }));
+    }
+  }
+
+  if (pendienteLibre) {
+    let q = db.from("rendiciones").select("id, folio, comentario, monto_total, created_at").eq("estado", "Pendiente")
+      .eq("empleado_id", r.empleado_id).eq("empresa", r.empresa).eq("tipo_rendicion", r.tipo_rendicion)
+      .is("kame_exportado_en", null).neq("id", r.id).order("folio");
+    q = r.solicitud_fondo_id ? q.eq("solicitud_fondo_id", r.solicitud_fondo_id) : q.is("solicitud_fondo_id", null);
+    const { data: hermanas } = await q;
+    if (hermanas?.length) {
+      const checks = hermanas.map((h) => {
+        const cb = el("input", { type: "checkbox", value: h.id, id: "unir-" + h.id });
+        return { cb, h, fila: el("label", { for: cb.id, style: "display:flex;gap:8px;align-items:center;margin:4px 0" }, [cb, `N° ${h.folio} · ${h.comentario || "Sin comentario"} · ${fmtCLP(h.monto_total)}`]) };
+      });
+      agregar(formularioCorreccion({
+        titulo: "Unir con otras rendiciones",
+        descripcion: `Rendiciones pendientes de ${r.empleado_nombre} con la misma empresa, tipo y fondo. Sus gastos pasan a la N° ${r.folio}, al final y en el orden en que se enviaron; las elegidas desaparecen.`,
+        campos: checks.map((c) => c.fila),
+        textoBoton: `Unir en la N° ${r.folio}`,
+        ejecutar: async (motivo, estado) => {
+          const elegidas = checks.filter((c) => c.cb.checked);
+          if (!elegidas.length) { estado.textContent = "Marca al menos una rendición."; return; }
+          if (!confirm(`¿Unir ${elegidas.map((c) => "N° " + c.h.folio).join(", ")} en la N° ${r.folio}? Las elegidas dejan de existir.`)) return;
+          const res = await rpc("admin_unir_rendiciones", { p_destino: r.id, p_origenes: elegidas.map((c) => c.h.id), p_motivo: motivo });
+          toast(`${res.unidas} unidas en la N° ${r.folio}: ${res.gastos_movidos} gastos, total ${fmtCLP(res.total)}.`); loadDashboard(); openDetalle(r.id, false);
+        },
+      }));
+    }
+  }
+
+  if (r.estado === "Aprobado" && r.empleado_id !== currentUser.id) {
+    const exportada = !!r.kame_exportado_en;
+    agregar(formularioCorreccion({
+      titulo: "Anular aprobación",
+      descripcion: "Pasa la rendición a Rechazada con este motivo y le avisa a " + r.empleado_nombre + " por correo."
+        + (exportada ? " Su CSV ya se descargó para Kame: se descarga también el REVERSO, que hay que importar en Kame para cancelar el asiento." : " Su CSV todavía no se ha descargado para Kame."),
+      textoBoton: "Anular aprobación",
+      ejecutar: async (motivo, estado) => {
+        let reverso = null;
+        if (exportada) {
+          estado.textContent = "Preparando el reverso para Kame…";
+          reverso = await prepararReversoKame(r, items);
+        }
+        if (!confirm(`¿Anular la aprobación de la rendición N° ${r.folio} (${fmtCLP(r.monto_total)})?` + (exportada ? "\n\nSe descargará el reverso para Kame." : ""))) { estado.textContent = ""; return; }
+        await rpc("admin_anular_aprobacion", { p_rendicion: r.id, p_motivo: motivo });
+        if (reverso) descargarTextoCsv(reverso.fileName, reverso.content);
+        notificarAsync("notificar-estado-rendicion", { rendicion_id: r.id }, "No se pudo notificar al empleado:");
+        toast(`Aprobación de la N° ${r.folio} anulada.` + (reverso ? " Importa el reverso en Kame una sola vez." : "")); loadDashboard(); openDetalle(r.id, false);
+      },
+    }));
+  }
+
+  if (!botones.children.length) return null;
+  panel.append(
+    el("h3", { style: "margin:0 0 4px;font-size:1rem" }, "Correcciones de administrador"),
+    el("p", { class: "portal-muted", style: "margin:0 0 10px;font-size:0.85rem" }, "Cada corrección pide un motivo y queda en el historial y en el registro de eventos."),
+    botones, cajas);
+  return panel;
 }
 
 // Marca un ítem individual Aprobado/Rechazado (el aprobador puede cambiar
@@ -6712,6 +6899,8 @@ async function aprobarTodosPendientes(rendicion, items) {
 async function finalizarAprobacionRendicion(rendicion, items) {
   const duplicados = documentosDuplicados(items.filter((it) => it.estado !== "Rechazado"));
   if (duplicados.length && !confirm("Hay documentos repetidos dentro de esta rendición. Verifica la distribución de montos antes de aprobar. ¿Continuar?")) return;
+  const conNc = items.filter((it) => it.estado === "Aprobado" && it.verificacion_contable?.notas_credito?.length);
+  if (conNc.length && !confirm("Ojo: " + conNc.map((it) => (it.tipo_documento || "Documento") + " " + (it.nro_documento || "") + ": " + textoNotasCredito(it.verificacion_contable.notas_credito)).join("\n\n") + "\n\n¿Aprobar igual?")) return;
   const { data, error } = await db.rpc("finalizar_rendicion", { p_id: rendicion.id });
   if (error || !data) { toast(mensajeErrorAmigable(error || new Error("No se pudo finalizar."))); await openDetalle(rendicion.id, false); return; }
   Object.assign(rendicion, data.rendicion);
@@ -7124,7 +7313,12 @@ function csvRow(fields) {
 // fondo entregado (cuenta "Fondo por Rendir") y, si la persona gastó más
 // de lo que se le había entregado, el excedente aparte contra "Rendiciones
 // por Pagar" -- como si esa parte fuera un reembolso normal de bolsillo.
-function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null) {
+// opciones.reverso = { fecha: "dd/mm/aaaa" }: mismas líneas con Debe y Haber
+// invertidos, para anular en Kame un comprobante ya importado (ver
+// anularAprobacionAdmin). Mismos folios de documento y fichas, así Kame
+// cancela exactamente lo que se importó.
+function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null, opciones = {}) {
+  const fila = (campos) => csvRow(opciones.reverso ? window.RindeCore.invertirFilaKame(campos, opciones.reverso.fecha) : campos);
   const fecha = fmtDateSlash(rendicion.fecha_rendicion || rendicion.created_at) || rendicion.created_at;
   const fondoFolio = split?.fondoFolio ?? rendicion.solicitudes_fondos?.folio;
   const referenciaFondo = rendicion.tipo_rendicion === "FondoPorRendir" && rendicion.solicitud_fondo_id && fondoFolio != null ? " · FONDO S-" + fondoFolio : "";
@@ -7151,7 +7345,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
       // El Centro de Costo de un "Documento electrónico" es solo para uso
       // interno de la app (reportes, Excel) -- no se manda en el
       // comprobante de Kame para este tipo de ítem.
-      rows.push(csvRow([
+      rows.push(fila([
         "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
         glosa, it.rut_proveedor, it.nombre_proveedor || "", it.tipo_documento, it.nro_documento,
         it.fecha_vencimiento ? fmtDateSlash(it.fecha_vencimiento) : "",
@@ -7160,7 +7354,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
     } else {
       // Sin proveedor, pero igual va con Ficha: la del empleado que hizo el
       // gasto, para poder trazar de quién es cada línea.
-      rows.push(csvRow([
+      rows.push(fila([
         "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
         glosa, rendicion.rut_empleado || "", rendicion.empleado_nombre, "", "", "",
         it.centro_costo || it.empresa || "", "", "",
@@ -7169,7 +7363,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null)
   });
 
   const folioDoc = rendicion.folio ?? rendicion.id.slice(0, 8);
-  const filaContrapartida = (cuenta, monto) => csvRow([
+  const filaContrapartida = (cuenta, monto) => fila([
     "TRASPASO", "S", folioTransaccion, fecha, glosa, cuenta, 0, monto,
     glosa, rendicion.rut_empleado || "", rendicion.empleado_nombre, "Otros", folioDoc,
     fecha, "", "", "",

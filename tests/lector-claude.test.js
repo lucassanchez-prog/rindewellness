@@ -16,9 +16,9 @@ function preparar(config={}){
   const ambiente={GEMINI_API_KEY:'clave-gemini',CLAUDE_OCR_ENABLED:'true',ANTHROPIC_API_KEY:'clave-claude',...config};
   const previo={deno:globalThis.Deno,fetch:globalThis.fetch,cliente:globalThis.__clienteClaudePrueba};
   globalThis.Deno={env:{get:k=>ambiente[k]}};
-  const estados=new Map(),rpcs=[],llamadas={claude:[],gemini:0};
+  const estados=new Map(),rpcs=[],llamadas={claude:[],gemini:0},eventos=[];
   const admin={
-    from:()=>{const api={_modelos:null,_uno:null,
+    from:(tabla)=>{const api={_modelos:null,_uno:null,insert:async(fila)=>{if(tabla==='system_events')eventos.push(fila);return {error:null};},
       select(){return api;},in(_c,lista){api._modelos=lista;return api;},eq(_c,valor){api._uno=valor;return api;},
       maybeSingle:async()=>({data:estados.has(api._uno)?{disponible_desde:estados.get(api._uno)}:null,error:null}),
       then:(ok,ko)=>Promise.resolve({data:[...estados].filter(([m])=>!api._modelos||api._modelos.includes(m)).map(([modelo,d])=>({modelo,disponible_desde:d,intentos_ok:0,intentos_fail:0,ultimo_resultado:null,ultimo_intento:null})),error:null}).then(ok,ko)};
@@ -32,7 +32,7 @@ function preparar(config={}){
     globalThis.fetch=async(url)=>{if(String(url).includes('generativelanguage')){llamadas.gemini++;return gemini();}throw new Error('fetch inesperado: '+url);};
   };
   const restaurar=()=>{globalThis.Deno=previo.deno;globalThis.fetch=previo.fetch;globalThis.__clienteClaudePrueba=previo.cliente;};
-  return {admin,estados,rpcs,llamadas,simular,restaurar};
+  return {admin,estados,rpcs,llamadas,eventos,simular,restaurar};
 }
 const fila=(rpcs,modelo)=>rpcs.filter(r=>r.p_modelo===modelo).at(-1);
 const minutos=(iso)=>(Date.parse(iso)-Date.now())/60000;
@@ -54,6 +54,7 @@ test('Claude lee primero con Haiku, la misma instrucción y la foto, y Gemini no
     assert.match(body.messages[0].content[1].text,/^Eres un asistente que extrae datos/);
     assert.ok(timeoutMs<=18000,'en vivo deja tiempo para un respaldo');
     assert.equal(fila(p.rpcs,'claude').p_exito,true);
+    assert.deepEqual(p.eventos,[],'una lectura buena no deja evento de falla');
   }finally{p.restaurar();}
 });
 
@@ -94,6 +95,8 @@ test('cuenta de Claude sin crédito: se enfría una hora y la persona igual reci
     assert.equal(r.proveedor_lectura,'gemini');
     const m=minutos(fila(p.rpcs,'claude').p_enfriamiento);
     assert.ok(m>55&&m<65,'esperado ~60 min, fue '+m);
+    assert.deepEqual(p.eventos.map(e=>e.tipo),['ocr_claude_cuenta_fail'],'queda en Salud del sistema');
+    assert.match(p.eventos[0].detalle,/llave o crédito/);
   }finally{p.restaurar();}
 });
 
