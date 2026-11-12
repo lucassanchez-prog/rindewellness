@@ -869,6 +869,9 @@ async function loadDashboard() {
 
   applyDashboardFilters();
   window.RindeUI.renderHome(dashboardData,esAprobadorEfectivo(perfil),resumirConsumoFondo,renderList);
+  // Recorrido guiado: se ofrece la primera vez y queda en el menú ("Ver recorrido").
+  try { window.RindeRecorrido?.preparar({ usuarioId: usuario.id, nombre: perfil?.nombre || "", rol: perfil?.rol || "empleado", aprobador: esAprobadorEfectivo(perfil) }); }
+  catch (error) { console.error("No se pudo preparar el recorrido:", error); }
   if(aviso)aviso.hidden=true;
   } catch (error) {
     if(gen!==dashboardCarga || currentUser?.id!==usuario.id)return;

@@ -141,3 +141,18 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .correcciones-admin { margin-top:16px; border:1px dashed var(--line); }
 .correcciones-admin .correccion-accion { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
 .correcciones-admin textarea { width:100%; }
+/* Recorrido guiado (recorrido.js): la "luz" deja ver el elemento explicado y
+   oscurece el resto con su sombra; sin elemento, oscurece el fondo completo. */
+.recorrido-capa { position:fixed; inset:0; z-index:1000; }
+.recorrido-fondo { position:fixed; inset:0; background:transparent; }
+.recorrido-capa:has(.recorrido-luz[hidden]) .recorrido-fondo { background:rgba(8,14,18,.62); }
+.recorrido-luz { position:fixed; border-radius:10px; box-shadow:0 0 0 9999px rgba(8,14,18,.62); outline:2px solid var(--blue); pointer-events:none; transition:all .2s ease; }
+.recorrido-luz[hidden] { display:none; }
+.recorrido-caja { position:fixed; width:max-content; background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:var(--shadow); }
+.recorrido-titulo { margin:0 0 6px; font-size:1.05rem; }
+.recorrido-texto { margin:0 0 14px; font-size:.92rem; line-height:1.5; color:var(--ink-soft); }
+.recorrido-acciones { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.recorrido-contador { margin-right:auto; font-size:.8rem; color:var(--ink-soft); }
+.recorrido-acciones .btn { min-height:40px; }
+.portal-recorrido { display:block; width:100%; text-align:left; margin-top:12px; font-size:.88rem; }
+@media (prefers-reduced-motion: reduce) { .recorrido-luz { transition:none; } }
