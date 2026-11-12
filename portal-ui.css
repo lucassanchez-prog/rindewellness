@@ -166,3 +166,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
   #view-dashboard .hero-row>div:last-child .btn{width:100%;min-height:44px;margin:0}
   #view-dashboard .hero-row>div:last-child #btn-nueva{grid-column:1/-1;order:-1}
 }
+
+/* "Mostrar más" de las listas largas (limitarLista en app.js). */
+.lista-mas{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px;margin:14px 0 4px}
+.lista-mas .btn{min-height:44px}

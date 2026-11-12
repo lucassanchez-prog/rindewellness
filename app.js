@@ -905,6 +905,12 @@ function applyDashboardFilters() {
     (!empresa || s.empresa === empresa) &&
     (!texto || `${s.motivo || ""} ${s.empleado_nombre || ""}`.toLowerCase().includes(texto));
 
+  // Con otros filtros, cada lista vuelve a mostrar las primeras 20 (ver limitarLista).
+  const claveFiltros = [estado, empresa, texto, document.getElementById("filtro-empleado").value].join("|");
+  for (const id of ["list-mias", "list-aprobaciones", "list-solicitudes-mias", "list-solicitudes-aprobacion"]) {
+    const lista = document.getElementById(id);
+    if (lista && lista.dataset.filtros !== claveFiltros) { lista.dataset.filtros = claveFiltros; delete lista.dataset.limite; }
+  }
   renderList(document.getElementById("list-mias"), dashboardData.mias.filter(pasaFiltro), false);
   renderList(document.getElementById("list-aprobaciones"), dashboardData.aprobaciones.filter(r => pasaFiltro(r) && normalizarBusquedaEmpleado(r.empleado_nombre).includes(normalizarBusquedaEmpleado(document.getElementById("filtro-empleado").value))), true);
   renderListSolicitudes(document.getElementById("list-solicitudes-mias"), dashboardData.solicitudesMias.filter(pasaFiltroSolicitud), false);
@@ -934,9 +940,25 @@ function renderStats(pendiente, aprobado, count, esAdmin, antiguas) {
   }
 }
 
+// En el teléfono una lista con todas las rendiciones medía más de 22.000 px: se
+// muestran 20 y un botón agrega 20 más. Los filtros y la búsqueda siguen
+// recorriendo todas; esto solo limita cuántas filas se dibujan.
+const FILAS_POR_PAGINA = 20;
+function limitarLista(container, rows, volverAPintar) {
+  const limite = Math.max(FILAS_POR_PAGINA, Number(container.dataset.limite) || FILAS_POR_PAGINA);
+  const pie = rows.length > limite ? el("div", { class: "lista-mas" }, [
+    el("span", { class: "portal-muted" }, `Mostrando ${limite} de ${rows.length}`),
+    el("button", { class: "btn btn-secondary", type: "button", onclick: () => { container.dataset.limite = String(limite + FILAS_POR_PAGINA); volverAPintar(); } },
+      `Mostrar ${Math.min(FILAS_POR_PAGINA, rows.length - limite)} más`),
+  ]) : null;
+  return { visibles: rows.slice(0, limite), pie };
+}
+
 function renderList(container, rows, showEmpleado) {
   container.replaceChildren();
   if(!rows.length){container.appendChild(el("div",{class:"empty-state"},"No hay rendiciones para estos filtros."));return;}
+  const todas = rows, pagina = limitarLista(container, todas, () => renderList(container, todas, showEmpleado));
+  rows = pagina.visibles;
   const cols=["Folio",showEmpleado?"Empleado / Empresa":"Empresa","Motivo / Fecha","Rendido","Aprobado","Estado"];
   const table=el("table",{class:"items-table portal-list-table portal-rendiciones-table","aria-label":"Rendiciones"},[
     el("colgroup",{},[8,23,27,15,15,12].map(width=>el("col",{style:"width:"+width+"%"}))),
@@ -948,11 +970,14 @@ function renderList(container, rows, showEmpleado) {
       el("td",{class:"monto"},fmtCLP(r.monto_rendido??r.monto_total)),el("td",{class:"monto portal-approved"},fmtCLP(r.monto_aprobado??(r.estado==="Aprobado"?r.monto_total:0))),el("td",{class:"center portal-status"},el("span",{class:"pill "+r.estado},r.estado))];
     cells.forEach((c,i)=>c.setAttribute("data-label",cols[i]));tbody.appendChild(filaClickable(()=>openDetalle(r.id),cells));
   });table.append(tbody);container.appendChild(el("div",{class:"table-scroll"},table));
+  if (pagina.pie) container.appendChild(pagina.pie);
 }
 
 function renderListSolicitudes(container, rows, showEmpleado) {
   container.replaceChildren();
   if(!rows.length){container.appendChild(el("div",{class:"empty-state"},"No hay solicitudes de fondos para estos filtros."));return;}
+  const todas = rows, pagina = limitarLista(container, todas, () => renderListSolicitudes(container, todas, showEmpleado));
+  rows = pagina.visibles;
   const cols=[showEmpleado?"Folio / Empleado":"Folio","Motivo / Empresa","Solicitado","Consumo aprobado","En revisión","Saldo / Exceso","Estado"];
   const table=el("table",{class:"items-table portal-list-table fondos-tabla","aria-label":"Solicitudes de fondos"},[
     el("colgroup",{},[16,24,12,14,11,13,10].map(width=>el("col",{style:"width:"+width+"%"}))),
@@ -966,6 +991,7 @@ function renderListSolicitudes(container, rows, showEmpleado) {
       cerrado?el("td",{class:"monto"},["—",el("small",{},"Liquidado")]):el("td",{class:"monto "+(c?.saldo<0?"portal-negative":"")},[amount(Math.abs(c?.saldo||0)),el("small",{},approved&&c?(c.saldo<0?"Exceso":"Disponible para rendir"):"")]),el("td",{class:"center portal-status"},el("span",{class:"pill "+s.estado},s.estado))];
     cells.forEach((cell,i)=>cell.setAttribute("data-label",cols[i]));tbody.appendChild(filaClickable(()=>openDetalleSolicitud(s.id),cells));
   });table.append(tbody);container.append(el("div",{class:"table-scroll"},table),el("p",{class:"portal-muted"},"El saldo descuenta gastos aprobados y pendientes de revisión. Los rechazados quedan excluidos."));
+  if (pagina.pie) container.appendChild(pagina.pie);
 }
 
 // ------------------------------------------------------------
