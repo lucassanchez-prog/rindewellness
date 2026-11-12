@@ -1,6 +1,7 @@
 import { revisarCompletitud } from "./estado-lectura.ts";
 import { revisarEstructuraDocumento } from "./analisis-documento.ts";
 import { habilitado, consultarGroq } from "./respaldo-nube.ts";
+import { PROVEEDOR_CLAUDE, claudeAdmite, claudeHabilitado, configClaude, consultarClaude, type ErrorClaude } from "./claude-ocr.ts";
 import { verificarCampos } from "./verificacion-ocr.ts";
 // Lógica compartida para leer un comprobante con Gemini: arma el prompt,
 // prueba una cadena de modelos candidatos con reintentos, y valida/limpia
@@ -519,7 +520,7 @@ export function normalizarMonto(valor: unknown): number | null {
 }
 
 export interface ResultadoOcr {
-  proveedor_lectura?: "gemini" | "groq";
+  proveedor_lectura?: "claude" | "gemini" | "groq";
   analisis_documento?: Record<string, unknown>;
   requiere_separacion?: boolean;
   aviso_documento?: string;
@@ -715,12 +716,12 @@ export function tieneDatosUtiles(resultado: ResultadoOcr): boolean {
 
 const configGroq=()=>Object.fromEntries(['GROQ_OCR_ENABLED','GROQ_OCR_CONSENT','GROQ_PLAN','GROQ_API_KEY'].map(k=>[k,Deno.env.get(k)]));
 
-// Hasta cuándo (ms) Groq está en enfriamiento, o null si se puede llamar. Si
-// no se puede consultar, se asume que sí (falla abierto).
-async function groqEnEnfriamiento(admin:AdminClient|null):Promise<number|null>{
+// Hasta cuándo (ms) un proveedor (Groq, Claude) está en enfriamiento, o null
+// si se puede llamar. Si no se puede consultar, se asume que sí (falla abierto).
+async function enEnfriamiento(admin:AdminClient|null,proveedor:string):Promise<number|null>{
   if(!admin)return null;
   try{
-    const {data,error}=await admin.from("gemini_modelo_stats").select("disponible_desde").eq("modelo",PROVEEDOR_GROQ).maybeSingle();
+    const {data,error}=await admin.from("gemini_modelo_stats").select("disponible_desde").eq("modelo",proveedor).maybeSingle();
     if(error||!data?.disponible_desde)return null;
     const hasta=new Date(data.disponible_desde as string).getTime();
     return Number.isFinite(hasta)&&hasta>Date.now()?hasta:null;
@@ -734,26 +735,50 @@ async function groqEnEnfriamiento(admin:AdminClient|null):Promise<number|null>{
 export async function proveedoresDisponibles(admin:AdminClient|null):Promise<{disponible:boolean;hasta:string|null}>{
   const libre={disponible:true,hasta:null};
   if(!admin)return libre;
-  const groqActivo=habilitado(configGroq());
-  if(!GEMINI_API_KEY&&!groqActivo)return libre;
+  const groqActivo=habilitado(configGroq()),claudeActivo=claudeHabilitado(configClaude());
+  if(!GEMINI_API_KEY&&!groqActivo&&!claudeActivo)return libre;
   try{
-    const {data:filas,error}=await admin.from("gemini_modelo_stats").select("modelo, disponible_desde").in("modelo",[...GEMINI_MODELOS_BASE,PROVEEDOR_GROQ]);
+    const {data:filas,error}=await admin.from("gemini_modelo_stats").select("modelo, disponible_desde").in("modelo",[...GEMINI_MODELOS_BASE,PROVEEDOR_GROQ,PROVEEDOR_CLAUDE]);
     if(error)return libre;
     const ahora=Date.now();
     const hasta=new Map((filas||[]).map((f)=>[f.modelo as string,f.disponible_desde?new Date(f.disponible_desde as string).getTime():0]));
-    const nombres=[...(GEMINI_API_KEY?GEMINI_MODELOS_BASE:[]),...(groqActivo?[PROVEEDOR_GROQ]:[])];
+    const nombres=[...(claudeActivo?[PROVEEDOR_CLAUDE]:[]),...(GEMINI_API_KEY?GEMINI_MODELOS_BASE:[]),...(groqActivo?[PROVEEDOR_GROQ]:[])];
     if(nombres.some((n)=>(hasta.get(n)??0)<=ahora))return libre;
     const proximos=nombres.map((n)=>hasta.get(n)??0).filter((t)=>t>ahora);
     return {disponible:false,hasta:proximos.length?new Date(Math.min(...proximos)).toISOString():null};
   }catch{return libre;}
 }
 
+// Cadena de lectores: Claude (principal, si está activado) -> Gemini -> Groq.
+// Claude usa una parte del presupuesto de tiempo; si falla, los respaldos
+// siguen con lo que queda. Un fallo de cupo o de cuenta lo enfría en
+// gemini_modelo_stats (fila "claude") y mientras tanto ni se le llama.
 export async function leerComprobante(admin:AdminClient|null,imageBase64:string,mimeType:string,presupuesto:PresupuestoTiempo=PRESUPUESTO_EN_VIVO,enfoque?:{camposFaltantes?:string[]|null;datosParciales?:Record<string,unknown>|null;tipoItem?:string|null}):Promise<ResultadoOcr>{
+  const cfgClaude=configClaude();
+  if(claudeHabilitado(cfgClaude)&&claudeAdmite(mimeType,imageBase64)&&await enEnfriamiento(admin,PROVEEDOR_CLAUDE)===null){
+    const inicioClaude=Date.now();
+    // En vivo hay 30 s en total: Claude (~9 s promedio medido) tiene hasta 18 s
+    // y quedan ~12 s para un respaldo. En segundo plano, hasta 45 s.
+    const limiteClaude=presupuesto.totalMs>30000?Math.min(45000,presupuesto.porLlamadaMs,presupuesto.totalMs-20000):18000;
+    try{
+      const bruto=await consultarClaude(imageBase64,mimeType,armarPrompt(enfoque?.camposFaltantes,enfoque?.datosParciales),cfgClaude,limiteClaude);
+      const resultado=interpretarRespuestaOcr(bruto,{tipo_item:enfoque?.tipoItem ?? null});
+      await registrarIntentoModelo(admin,PROVEEDOR_CLAUDE,true);
+      return {...resultado,proveedor_lectura:'claude'} as ResultadoOcr;
+    }catch(errorClaude){
+      const mensaje=errorClaude instanceof Error?errorClaude.message:String(errorClaude);
+      await registrarIntentoModelo(admin,PROVEEDOR_CLAUDE,false,mensaje,(errorClaude as ErrorClaude).retryAfterMs);
+      console.error("Claude no leyó el comprobante; se usa el respaldo:",mensaje);
+      const restante=presupuesto.totalMs-(Date.now()-inicioClaude);
+      if(restante<5000)throw errorClaude;
+      presupuesto={porLlamadaMs:Math.min(presupuesto.porLlamadaMs,restante),totalMs:restante};
+    }
+  }
   const config=configGroq();
   const permitido=habilitado(config)&&['image/jpeg','image/png','image/webp'].includes(mimeType);
   const inicio=Date.now();
   try{
-    const limite=permitido?{porLlamadaMs:Math.min(presupuesto.porLlamadaMs,presupuesto.totalMs>30000?40000:18000),totalMs:presupuesto.totalMs>30000?Math.min(60000,presupuesto.totalMs-25000):18000}:presupuesto;
+    const limite=permitido?{porLlamadaMs:Math.min(presupuesto.porLlamadaMs,presupuesto.totalMs>30000?40000:18000),totalMs:presupuesto.totalMs>30000?Math.min(60000,presupuesto.totalMs-25000):Math.min(18000,presupuesto.totalMs)}:presupuesto;
     const resultado=await leerConGemini(admin,imageBase64,mimeType,limite,enfoque);
     return {...resultado,proveedor_lectura:'gemini'} as ResultadoOcr;
   }catch(error){
@@ -764,7 +789,7 @@ export async function leerComprobante(admin:AdminClient|null,imageBase64:string,
     // recibía el mismo 429) y se responde al instante, sin hacer esperar a
     // nadie. "retryAfterMs" deja que el agente aplace el comprobante justo
     // hasta que se libere, en vez de una hora fija.
-    const hastaGroq=await groqEnEnfriamiento(admin);
+    const hastaGroq=await enEnfriamiento(admin,PROVEEDOR_GROQ);
     if(hastaGroq!==null){
       const agotado=new Error('La lectura automática con IA alcanzó su límite gratuito por ahora y se renueva sola. Completa los datos a mano: el comprobante queda en cola y se vuelve a leer más tarde.') as Error&{retryAfterMs?:number};
       agotado.retryAfterMs=Math.max(30000,hastaGroq-Date.now());
