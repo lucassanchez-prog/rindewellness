@@ -156,3 +156,13 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 .recorrido-acciones .btn { min-height:40px; }
 .portal-recorrido { display:block; width:100%; text-align:left; margin-top:12px; font-size:.88rem; }
 @media (prefers-reduced-motion: reduce) { .recorrido-luz { transition:none; } }
+/* Teléfono (revisión móvil 2026-11-12): "← Volver" medía 64x19 px, muy chico
+   para el dedo; y los 5 botones de Rendiciones iban apilados a lo ancho y
+   ocupaban la primera pantalla entera. Ahora van en dos columnas, con
+   "Nueva rendición" primero y a lo ancho. */
+@media (max-width:900px){
+  .back-link{display:inline-flex;align-items:center;min-height:44px;padding:8px 14px 8px 0;margin-bottom:6px}
+  #view-dashboard .hero-row>div:last-child{display:grid!important;grid-template-columns:1fr 1fr;gap:8px}
+  #view-dashboard .hero-row>div:last-child .btn{width:100%;min-height:44px;margin:0}
+  #view-dashboard .hero-row>div:last-child #btn-nueva{grid-column:1/-1;order:-1}
+}
