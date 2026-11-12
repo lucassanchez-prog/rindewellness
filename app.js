@@ -4843,7 +4843,9 @@ async function aplicarResultadoOcrSin(id, data, gen) {
   }
   if (data.descripcion) document.getElementById(`${id}-desc2`).value = data.descripcion;
   const montoIA2 = montoValidoCLP(data.monto);
-  if (montoIA2) document.getElementById(`${id}-monto2`).value = montoIA2.toLocaleString("es-CL");
+  // En dólares, el monto en pesos se calcula: lo leído es el monto en USD y
+  // la persona lo confirma en su campo (un "$9.00" no son 900 pesos).
+  if (montoIA2 && document.getElementById(`${id}-moneda`)?.value !== "USD") document.getElementById(`${id}-monto2`).value = montoIA2.toLocaleString("es-CL");
   // Datos del documento, informativos. A diferencia de "Documento
   // electrónico", acá el tipo es texto libre: por esta pestaña entra
   // cualquier cosa (boleta, voucher, comprobante de transferencia, recibo)
@@ -4954,6 +4956,88 @@ function sincronizarCuentaDesdeCategoria(id) {
   campoCuenta.value = match ? match.cuenta : "";
 }
 
+// ------------------------------------------------------------
+// Gastos en dólares. El dólar observado del Banco Central lo guarda la base
+// dos veces al día (tabla tipos_cambio, ver 20261113120000_rendir_en_dolares.sql);
+// para un fin de semana o feriado se usa el último publicado antes.
+// ------------------------------------------------------------
+const dolarObservadoCache = new Map();
+async function dolarObservadoPara(fechaISO) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaISO || "")) return null;
+  if (!dolarObservadoCache.has(fechaISO)) {
+    const { data, error } = await db.rpc("dolar_observado", { p_fecha: fechaISO });
+    if (error) throw error;
+    dolarObservadoCache.set(fechaISO, data || null);
+  }
+  return dolarObservadoCache.get(fechaISO);
+}
+const fmtUsd = (n) => Number(n).toLocaleString("es-CL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtTipoCambio = (n) => "$" + Number(n).toLocaleString("es-CL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Con "Dólares": el monto en pesos queda calculado (USD x tipo de cambio) y no
+// se escribe a mano. El tipo de cambio se propone solo con el dólar observado
+// de la fecha del documento (o de la rendición) y se puede corregir si la
+// cartola muestra otro cargo; corregido a mano, ya no se reemplaza.
+function conectarMonedaGasto({ selMoneda, inpUsd, inpTc, rowUsd, tcHint, inpMonto, inpFecha }) {
+  const core = window.RindeCore;
+  const fechaReferencia = () => inpFecha?.value || document.getElementById("nr-fecha")?.value || new Date().toISOString().slice(0, 10);
+  const recalcular = () => {
+    if (selMoneda.value !== "USD") return;
+    const usd = core.parseDecimal(inpUsd.value), tc = core.parseDecimal(inpTc.value);
+    const clp = usd > 0 && tc >= 100 && tc <= 5000 ? core.pesosDesdeDolares(usd, tc) : null;
+    inpMonto.value = clp ? clp.toLocaleString("es-CL") : "";
+    const base = inpTc.dataset.texto || "";
+    tcHint.textContent = (clp ? `USD ${fmtUsd(usd)} × ${fmtTipoCambio(tc)} = ${fmtCLP(clp)}. ` : "") + base;
+    recalcTotal();
+  };
+  const proponer = async () => {
+    if (selMoneda.value !== "USD") return;
+    const fecha = fechaReferencia();
+    inpTc.dataset.fecha = fecha;
+    if (inpTc.value && inpTc.dataset.auto !== "1") { inpTc.dataset.texto = "Tipo de cambio escrito a mano."; recalcular(); return; }
+    try {
+      const d = await dolarObservadoPara(fecha);
+      if (selMoneda.value !== "USD" || (inpTc.value && inpTc.dataset.auto !== "1")) return;
+      if (d) {
+        inpTc.value = Number(d.valor).toLocaleString("es-CL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        inpTc.dataset.auto = "1"; inpTc.dataset.fecha = d.fecha;
+        inpTc.dataset.texto = `Dólar observado del ${fmtDate(d.fecha)} (Banco Central). Si tu cartola muestra otro cargo, corrige el tipo de cambio.`;
+      } else {
+        inpTc.value = ""; delete inpTc.dataset.auto;
+        inpTc.dataset.texto = `No hay dólar observado guardado para el ${fmtDate(fecha)}: escribe el tipo de cambio de tu cartola o del Banco Central.`;
+      }
+    } catch (error) {
+      inpTc.dataset.texto = "No se pudo traer el dólar observado: escribe el tipo de cambio. " + (error?.message || "");
+    }
+    recalcular();
+  };
+  const aplicar = () => {
+    const usd = selMoneda.value === "USD";
+    rowUsd.hidden = !usd; tcHint.hidden = !usd;
+    inpMonto.readOnly = usd;
+    inpMonto.title = usd ? "Se calcula: monto en dólares × tipo de cambio" : "";
+    if (usd) proponer();
+    else { delete inpTc.dataset.auto; recalcTotal(); }
+  };
+  selMoneda.addEventListener("change", aplicar);
+  inpUsd.addEventListener("input", recalcular);
+  inpTc.addEventListener("input", () => { delete inpTc.dataset.auto; inpTc.dataset.texto = "Tipo de cambio escrito a mano."; recalcular(); });
+  inpFecha?.addEventListener("change", proponer);
+  document.getElementById("nr-fecha")?.addEventListener("change", proponer);
+}
+
+// Datos de moneda de un gasto "Comprobante/Boleta" para enviarlo, o un error.
+function leerMonedaGasto(id, montoPesos) {
+  if (document.getElementById(`${id}-moneda`)?.value !== "USD") return { datos: { moneda: "CLP" } };
+  const usd = window.RindeCore.parseDecimal(document.getElementById(`${id}-usd`).value);
+  const inpTc = document.getElementById(`${id}-tc`), tc = window.RindeCore.parseDecimal(inpTc.value);
+  if (!(usd > 0)) return { error: "Falta el monto en dólares" };
+  if (!(tc >= 100 && tc <= 5000)) return { error: "Revisa el tipo de cambio" };
+  if (window.RindeCore.pesosDesdeDolares(usd, tc) !== montoPesos) return { error: "El monto en pesos no calza con dólares × tipo de cambio" };
+  const fecha = inpTc.dataset.fecha || document.getElementById(`${id}-fecha2`)?.value || document.getElementById("nr-fecha")?.value;
+  return { datos: { moneda: "USD", monto_original: usd, tipo_cambio: tc, fecha_tipo_cambio: fecha } };
+}
+
 function buildSinDocumentoFields(id) {
   const box = el("div", { class: "sin-documento" });
   const rowProv = el("div", { class: "field-row" }, [
@@ -4989,6 +5073,17 @@ function buildSinDocumentoFields(id) {
     fieldInputMoney(`${id}-monto2`, "Monto"),
   ]);
   row2.querySelector("select").value = opcionesCC.includes(ccHeaderActual) ? ccHeaderActual : opcionesCC[0];
+  // Gasto en dólares (comprobantes extranjeros: Netlify, software, viajes). El
+  // monto en pesos se calcula: USD x dólar observado del día (ver conectarMonedaGasto).
+  const selMoneda = el("select", { id: `${id}-moneda` }, [el("option", { value: "CLP" }, "Pesos (CLP)"), el("option", { value: "USD" }, "Dólares (USD)")]);
+  const inpUsd = el("input", { id: `${id}-usd`, type: "text", inputmode: "decimal", placeholder: "9,00" });
+  const inpTc = el("input", { id: `${id}-tc`, type: "text", inputmode: "decimal", placeholder: "979,88" });
+  const rowMoneda = el("div", { class: "field-row" }, [el("div", { class: "field" }, [el("label", { for: selMoneda.id }, "Moneda del comprobante"), selMoneda])]);
+  const rowUsd = el("div", { class: "field-row moneda-usd", hidden: "" }, [
+    el("div", { class: "field" }, [el("label", { for: inpUsd.id }, "Monto en dólares (USD)"), inpUsd]),
+    el("div", { class: "field" }, [el("label", { for: inpTc.id }, "Tipo de cambio ($ por USD)"), inpTc]),
+  ]);
+  const tcHint = el("p", { class: "ocr-status show", id: `${id}-tc-hint`, hidden: "" });
   const row3 = el("div", { class: "field-row" }, [
     fieldInput(`${id}-desc2`, "Descripción", "text"),
   ]);
@@ -5020,10 +5115,14 @@ function buildSinDocumentoFields(id) {
   box.appendChild(row1);
   box.appendChild(historialHint);
   box.appendChild(row2);
+  box.appendChild(rowMoneda);
+  box.appendChild(rowUsd);
+  box.appendChild(tcHint);
   box.appendChild(row3);
   box.appendChild(row4);
   box.appendChild(row5);
   box.appendChild(foto);
+  conectarMonedaGasto({ selMoneda, inpUsd, inpTc, rowUsd, tcHint, inpMonto: row2.querySelector("input"), inpFecha: row5.querySelector('input[type="date"]') });
 
   const fotoInput2 = foto.querySelector("input[type=file]");
   fotoInput2.addEventListener("change", async () => {
@@ -5494,8 +5593,11 @@ async function submitRendicion() {
         toast(`El RUT del proveedor del Ítem ${idx + 1} no es válido.`);
         return;
       }
+      const monedaGasto = leerMonedaGasto(id, monto);
+      if (monedaGasto.error) { toast(`${monedaGasto.error} del Ítem ${idx + 1}.`); return; }
       items.push({
         tipo_item: "SinDocumento",
+        ...monedaGasto.datos,
         nombre_proveedor: document.getElementById(`${id}-nombreprov2`).value.trim() || null,
         // Informativos: quien aprueba los contrasta contra el adjunto sin
         // abrirlo. NO cambian el asiento -- cuenta_contable sigue siendo la
@@ -6404,6 +6506,8 @@ async function openDetalle(id, pushHistory = true) {
     celdas.push(el("td", { class: "wrap" }, it.centro_costo || "-"));
     celdas.push(el("td", { class: "wrap" }, it.descripcion || "-"));
     const montoCellContenido = [fmtCLP(it.monto)];
+    if (it.moneda === "USD") montoCellContenido.push(el("small", { class: "monto-usd", style: "display:block;color:var(--ink-soft)" },
+      `USD ${fmtUsd(it.monto_original)} × ${fmtTipoCambio(it.tipo_cambio)} (${fmtDate(it.fecha_tipo_cambio)})`));
     if (itemsConMontoEditado.has(it.id)) {
       montoCellContenido.push(el("span", {
         title: "El monto de este ítem fue editado manualmente después de cargarse.",
@@ -7260,6 +7364,12 @@ function iniciarEdicionItem(it, lineWrap, rendicion, esAprobadorViewer) {
 
   const monto = fieldInputMoney(`${pfx}monto`, "Monto");
   monto.querySelector("input").value = Number(it.monto || 0).toLocaleString("es-CL");
+  // Un gasto en dólares tiene los pesos calculados (USD x tipo de cambio); la
+  // base rechaza un monto que no calce, así que aquí no se edita.
+  if (it.moneda === "USD") {
+    monto.querySelector("input").readOnly = true;
+    monto.appendChild(el("small", { class: "portal-muted" }, `USD ${fmtUsd(it.monto_original)} × ${fmtTipoCambio(it.tipo_cambio)}. Para cambiarlo, rechaza el gasto y pide que lo corrijan.`));
+  }
   const desc = fieldInput(`${pfx}desc`, "Descripción", "text");
   desc.querySelector("input").value = it.descripcion || "";
 
@@ -7387,9 +7497,12 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null,
     } else {
       // Sin proveedor, pero igual va con Ficha: la del empleado que hizo el
       // gasto, para poder trazar de quién es cada línea.
+      // Un gasto en dólares deja en el comentario de su línea de dónde salen los pesos.
+      const comentarioLinea = it.moneda === "USD" && it.monto_original && it.tipo_cambio
+        ? `${glosa} · USD ${fmtUsd(it.monto_original)} TC ${Number(it.tipo_cambio).toLocaleString("es-CL", { minimumFractionDigits: 2 })}` : glosa;
       rows.push(fila([
         "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
-        glosa, rendicion.rut_empleado || "", rendicion.empleado_nombre, "", "", "",
+        comentarioLinea, rendicion.rut_empleado || "", rendicion.empleado_nombre, "", "", "",
         it.centro_costo || it.empresa || "", "", "",
       ]));
     }

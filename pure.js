@@ -204,7 +204,35 @@
     if (debe !== haber || debe !== compensado || pendientes.reduce((s,p) => s + p.monto, 0) !== neto) throw new Error("El asiento de la liquidación no cuadra.");
     return {filas, tipo:"TRASPASO", glosa, total:debe, compensado, pendientes, fileName:`comprobante_liquidacion_L-${liq.folio}.csv`};
   }
-
+
+  // Monto con decimales escrito a mano o leído de un comprobante extranjero:
+  // "9.00", "9,00", "1.234,56", "1,234.56", "USD 8.71". Con un solo separador,
+  // si le siguen 1 o 2 dígitos es el decimal; si le siguen 3, son miles.
+  function parseDecimal(texto) {
+    const t = String(texto ?? "").replace(/[^\d.,-]/g, "");
+    if (!/\d/.test(t)) return null;
+    const ultPunto = t.lastIndexOf("."), ultComa = t.lastIndexOf(",");
+    let normal;
+    if (ultPunto >= 0 && ultComa >= 0) {
+      const dec = ultPunto > ultComa ? "." : ",";
+      normal = t.split(dec === "." ? "," : ".").join("").replace(dec, ".");
+    } else if (ultPunto >= 0 || ultComa >= 0) {
+      const sep = ultPunto >= 0 ? "." : ",", partes = t.split(sep);
+      normal = partes.length === 2 && partes[1].length <= 2 ? partes[0] + "." + partes[1] : partes.join("");
+    } else normal = t;
+    const n = Number(normal);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Pesos de un gasto en dólares: USD x tipo de cambio, redondeado al peso con
+  // la misma regla que la base (validar_moneda_item). Se calcula en centavos
+  // para no arrastrar errores de punto flotante (9 x 979,88 = 8.818,92 -> 8.819).
+  function pesosDesdeDolares(usd, tipoCambio) {
+    const u = Math.round(Number(usd) * 100), tc = Math.round(Number(tipoCambio) * 100);
+    if (!Number.isFinite(u) || !Number.isFinite(tc) || u <= 0 || tc <= 0) return null;
+    return Math.round(u * tc / 10000);
+  }
+
   // Línea de comprobante Kame invertida (Debe <-> Haber), con la fecha del
   // reverso y "REVERSO" en el comentario. Columnas: 3 Fecha, 4 Comentario,
   // 6 Debe, 7 Haber, 8 Comentario Línea (ver CSV_HEADER en app.js).
@@ -300,7 +328,7 @@
     return null;
   }
 
-  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido, invertirFilaKame, notasCreditoCercanas,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido, invertirFilaKame, notasCreditoCercanas, parseDecimal, pesosDesdeDolares,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {
