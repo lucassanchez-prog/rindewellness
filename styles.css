@@ -898,3 +898,14 @@ button {
 .revision-campo [hidden], .revision-comprobante [hidden] { display:none !important; }
 @media(max-width:760px) { .revision-cuerpo { grid-template-columns:1fr; } .revision-comprobante { padding:12px; } }
 @media(max-width:640px) { .stat-row .stat-card:last-child { grid-column:1/-1; } .stat-card .value { overflow-wrap:anywhere; } }
+
+/* Netlify inyecta en el sitio publicado un sello fijo "Powered by Netlify"
+   (iframe #nl-badge-frame, ~197x64 px, esquina inferior derecha). En el
+   teléfono tapaba el botón Ingresar y el final de cada pantalla. Se deja
+   espacio debajo del contenido para que todo pueda subir por encima, y el
+   aviso flotante se levanta para no quedar detrás. El sello se apaga en
+   Netlify: Project configuration > General > "Powered by Netlify" badge. */
+@media (max-width: 900px) {
+  body { padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px)); }
+  .toast { bottom: calc(96px + env(safe-area-inset-bottom, 0px)); }
+}
