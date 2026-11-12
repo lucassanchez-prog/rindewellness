@@ -145,8 +145,8 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
    oscurece el resto con su sombra; sin elemento, oscurece el fondo completo. */
 .recorrido-capa { position:fixed; inset:0; z-index:1000; }
 .recorrido-fondo { position:fixed; inset:0; background:transparent; }
-.recorrido-capa:has(.recorrido-luz[hidden]) .recorrido-fondo { background:rgba(8,14,18,.62); }
-.recorrido-luz { position:fixed; border-radius:10px; box-shadow:0 0 0 9999px rgba(8,14,18,.62); outline:2px solid var(--blue); pointer-events:none; transition:all .2s ease; }
+.recorrido-capa:has(.recorrido-luz[hidden]) .recorrido-fondo { background:rgba(4,8,11,.74); }
+.recorrido-luz { position:fixed; border-radius:10px; box-shadow:0 0 0 9999px rgba(4,8,11,.74); outline:2px solid var(--blue); pointer-events:none; transition:all .2s ease; }
 .recorrido-luz[hidden] { display:none; }
 .recorrido-caja { position:fixed; width:max-content; background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:var(--shadow); }
 .recorrido-titulo { margin:0 0 6px; font-size:1.05rem; }

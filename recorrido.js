@@ -76,6 +76,9 @@
   function cerrar(completo) {
     if (!activo) return;
     if (contexto?.usuarioId) guardar(clave(contexto.usuarioId), completo ? "visto" : "saltado");
+    // Terminado o saltado, cuenta como visto: queda en el perfil y no vuelve a
+    // aparecer solo en ningún dispositivo (se puede repetir desde el menú).
+    try { contexto?.alTerminar?.(); } catch { /* el aviso al servidor no debe trabar el cierre */ }
     raiz.removeEventListener("resize", activo.reubicar);
     raiz.removeEventListener("scroll", activo.reubicar, true);
     doc.removeEventListener("keydown", activo.teclas, true);
@@ -180,7 +183,7 @@
     // Inicio se vuelve a pintar tras cada cambio: el recorrido se ofrece solo una
     // vez por sesión, aunque el navegador no permita guardar que ya se vio.
     const enInicio = doc.getElementById("view-inicio")?.classList.contains("active");
-    if (enInicio && datos?.usuarioId && !ofrecido.has(datos.usuarioId) && !leer(clave(datos.usuarioId))) {
+    if (enInicio && datos?.usuarioId && !datos.yaVisto && !ofrecido.has(datos.usuarioId) && !leer(clave(datos.usuarioId))) {
       ofrecido.add(datos.usuarioId);
       iniciar();
     }

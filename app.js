@@ -870,7 +870,11 @@ async function loadDashboard() {
   applyDashboardFilters();
   window.RindeUI.renderHome(dashboardData,esAprobadorEfectivo(perfil),resumirConsumoFondo,renderList);
   // Recorrido guiado: se ofrece la primera vez y queda en el menú ("Ver recorrido").
-  try { window.RindeRecorrido?.preparar({ usuarioId: usuario.id, nombre: perfil?.nombre || "", rol: perfil?.rol || "empleado", aprobador: esAprobadorEfectivo(perfil) }); }
+  // Solo la primera vez: el perfil guarda cuándo lo vio (recorrido_visto_en), en cualquier dispositivo.
+  try { window.RindeRecorrido?.preparar({ usuarioId: usuario.id, nombre: perfil?.nombre || "", rol: perfil?.rol || "empleado", aprobador: esAprobadorEfectivo(perfil),
+    yaVisto: !!perfil?.recorrido_visto_en,
+    alTerminar: () => { if (perfil.recorrido_visto_en) return; perfil.recorrido_visto_en = new Date().toISOString();
+      db.rpc("marcar_recorrido_visto").then(({ error }) => { if (error) console.error("No se pudo guardar que se vio el recorrido:", error); }); } }); }
   catch (error) { console.error("No se pudo preparar el recorrido:", error); }
   if(aviso)aviso.hidden=true;
   } catch (error) {
