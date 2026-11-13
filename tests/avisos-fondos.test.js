@@ -75,6 +75,9 @@ test('el correo: simulación sin envíos, un aviso por semana, y no depende de q
   assert.match(fn,/import \{ clasificarFondos, type FilaFondo \} from "\.\.\/_shared\/avisos-fondos\.ts";/);
   assert.match(fn,/const DIAS_FONDO_SIN_RENDIR = 7;\s*const DIAS_FONDO_PARA_LIQUIDAR = 15;/);
   assert.match(fn,/if \(simular \|\| !correo\) continue;/);
+  assert.match(fn,/const copia = correo \? \(await destinatariosAdmin\(\)\)\.filter\(\(e\) => e\.toLowerCase\(\) !== correo\.toLowerCase\(\)\) : \[\];/,'copia a administradores y aprobadores');
+  assert.match(fn,/await enviarCorreo\(\[correo\], `Tienes \$\{fmt\(total\)\} sin rendir en tus fondos`, html, copia\);/);
+  assert.match(fn,/Destinatario real: \$\{escapeHtml\(\[\.\.\.destinatarios, \.\.\.copia\]\.join\(", "\)\)\}/,'en modo de pruebas la copia también se reenvía');
   assert.match(fn,/if \(!simular && !yaAvisado\)/);
   assert.match(fn,/new Date\(f\.ultimo_aviso_empleado\)\.getTime\(\) < haceUnaSemana/);
   assert.match(fn,/admin\.rpc\("marcar_aviso_fondos", \{ p_ids: fondos\.map\(\(f\) => f\.id\) \}\)/);

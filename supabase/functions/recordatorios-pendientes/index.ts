@@ -76,15 +76,17 @@ const fmt = (n: unknown) => "$" + Math.round(Number(n) || 0).toLocaleString("es-
 
 // Envía con Resend; en modo de pruebas reenvía al respaldo con "[Reenviado]" y
 // la línea "Destinatario real:" (los usa un reenvío automático del usuario).
-async function enviarCorreo(destinatarios: string[], asunto: string, html: string) {
+// En modo de pruebas de Resend la copia no llega a nadie más, así que se suma a
+// "Destinatario real:" (igual que notificar-estado-rendicion).
+async function enviarCorreo(destinatarios: string[], asunto: string, html: string, copia: string[] = []) {
   let resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: FROM_EMAIL, to: destinatarios, subject: asunto, html }),
+    body: JSON.stringify({ from: FROM_EMAIL, to: destinatarios, cc: copia.length ? copia : undefined, subject: asunto, html }),
   });
   let data = await resp.json();
   if (!resp.ok && FALLBACK_EMAIL && /only send testing emails/i.test(data?.message || "")) {
-    const htmlConAviso = `<p style="background:#f4f7fb;color:#5b6472;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;font-size:12px;">Destinatario real: ${escapeHtml(destinatarios.join(", "))}</p>${html}`;
+    const htmlConAviso = `<p style="background:#f4f7fb;color:#5b6472;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;font-size:12px;">Destinatario real: ${escapeHtml([...destinatarios, ...copia].join(", "))}</p>${html}`;
     resp = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
@@ -115,7 +117,9 @@ async function avisarFondos(admin: ReturnType<typeof createClient>, destinatario
     const { data: u } = await admin.auth.admin.getUserById(g.empleado_id);
     const correo = u?.user?.email;
     const total = fondos.reduce((s, f) => s + (Number(f.sin_rendir) || 0), 0);
-    empleados.push({ persona: g.empleado_nombre, tiene_correo: !!correo, fondos: fondos.map((f) => "S-" + f.folio), sin_rendir: total });
+    // Con copia a administradores y aprobadores (sin repetir a la persona si también lo es).
+    const copia = correo ? (await destinatariosAdmin()).filter((e) => e.toLowerCase() !== correo.toLowerCase()) : [];
+    empleados.push({ persona: g.empleado_nombre, tiene_correo: !!correo, fondos: fondos.map((f) => "S-" + f.folio), sin_rendir: total, con_copia: copia.length });
     if (simular || !correo) continue;
     const filasHtml = fondos.map((f) => `<tr style="border-bottom:1px solid #eef1f5;">${td("S-" + escapeHtml(f.folio), false, true)}${td(escapeHtml(f.motivo || f.empresa))}${td(fmt(f.otorgado), true)}${td(fmt(f.sin_rendir), true, true)}${td(f.dias_sin_movimiento + " días", true)}</tr>`).join("");
     const html = construirEmailHTML({
@@ -124,7 +128,7 @@ async function avisarFondos(admin: ReturnType<typeof createClient>, destinatario
       extraHtml: `<table style="border-collapse:collapse;width:100%;margin-bottom:18px;"><thead><tr>${th("Fondo")}${th("Motivo")}${th("Entregado", true)}${th("Sin rendir", true)}${th("Quieto", true)}</tr></thead><tbody>${filasHtml}</tbody></table>`,
       botonTexto: "Rendir mis gastos", botonUrl: `${APP_URL}/#nueva`,
     });
-    await enviarCorreo([correo], `Tienes ${fmt(total)} sin rendir en tus fondos`, html);
+    await enviarCorreo([correo], `Tienes ${fmt(total)} sin rendir en tus fondos`, html, copia);
     const { error: errMarca } = await admin.rpc("marcar_aviso_fondos", { p_ids: fondos.map((f) => f.id) });
     if (errMarca) throw errMarca;
   }
