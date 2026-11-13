@@ -25,6 +25,7 @@ import { logEvent } from "../_shared/logging.ts";
 import { esAprobadorEfectivo } from "../_shared/auth.ts";
 import { emailsDePerfiles, leerTodas } from "../_shared/data.ts";
 import { construirEmailHTML } from "../_shared/email.ts";
+import { clasificarFondos, type FilaFondo } from "../_shared/avisos-fondos.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -34,6 +35,11 @@ const FROM_EMAIL = Deno.env.get("RESEND_FROM_EMAIL") || "RindeWellness <onboardi
 const FALLBACK_EMAIL = Deno.env.get("RESEND_FALLBACK_EMAIL");
 const APP_URL = Deno.env.get("APP_URL") || "https://rindewellness.netlify.app";
 const DIAS_PARA_RECORDAR = 3;
+// Avisos de fondos: a la persona si un fondo lleva 7 días sin rendirse (como
+// mucho uno por semana por fondo); a administradores, una vez por semana, los
+// fondos listos para liquidar (gastados enteros o quietos hace 15 días).
+const DIAS_FONDO_SIN_RENDIR = 7;
+const DIAS_FONDO_PARA_LIQUIDAR = 15;
 // Secreto compartido con pg_cron (mismo que usa ocr-reintento-pendientes).
 const CRON_SECRET = Deno.env.get("CRON_SECRET");
 
@@ -66,6 +72,88 @@ async function requireProfile(req: Request, admin: ReturnType<typeof createClien
   return profile;
 }
 
+const fmt = (n: unknown) => "$" + Math.round(Number(n) || 0).toLocaleString("es-CL");
+
+// Envía con Resend; en modo de pruebas reenvía al respaldo con "[Reenviado]" y
+// la línea "Destinatario real:" (los usa un reenvío automático del usuario).
+async function enviarCorreo(destinatarios: string[], asunto: string, html: string) {
+  let resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: FROM_EMAIL, to: destinatarios, subject: asunto, html }),
+  });
+  let data = await resp.json();
+  if (!resp.ok && FALLBACK_EMAIL && /only send testing emails/i.test(data?.message || "")) {
+    const htmlConAviso = `<p style="background:#f4f7fb;color:#5b6472;padding:10px 14px;border-radius:6px;font-family:Arial,sans-serif;font-size:12px;">Destinatario real: ${escapeHtml(destinatarios.join(", "))}</p>${html}`;
+    resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: FROM_EMAIL, to: [FALLBACK_EMAIL], subject: `[Reenviado] ${asunto}`, html: htmlConAviso }),
+    });
+    data = await resp.json();
+  }
+  if (!resp.ok) throw new Error(data?.message || "Error enviando el correo con Resend");
+}
+
+const th = (t: string, derecha = false) => `<th style="padding:0 10px 8px;text-align:${derecha ? "right" : "left"};font-size:11px;text-transform:uppercase;letter-spacing:0.04em;color:#9aa4ae;border-bottom:2px solid #eef1f5;">${t}</th>`;
+const td = (v: string, derecha = false, fuerte = false) => `<td style="padding:10px;${derecha ? "text-align:right;white-space:nowrap;" : ""}${fuerte ? "font-weight:700;" : ""}color:#1a1f27;">${v}</td>`;
+
+// Avisos de fondos (ver _shared/avisos-fondos.ts). Con simular, solo informa
+// qué mandaría: no envía correos ni marca nada.
+async function avisarFondos(admin: ReturnType<typeof createClient>, destinatariosAdmin: () => Promise<string[]>, simular: boolean) {
+  const { data: filas, error } = await admin.rpc("estado_fondos_abiertos");
+  if (error) throw error;
+  const { porRendir, porLiquidar } = clasificarFondos((filas || []) as FilaFondo[], { diasRendir: DIAS_FONDO_SIN_RENDIR, diasLiquidar: DIAS_FONDO_PARA_LIQUIDAR });
+  const haceUnaSemana = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const empleados: unknown[] = [];
+  let liquidar: unknown = null;
+
+  // 1. A cada persona: sus fondos quietos que no se le avisaron esta semana.
+  for (const g of porRendir) {
+    const fondos = g.fondos.filter((f) => !f.ultimo_aviso_empleado || new Date(f.ultimo_aviso_empleado).getTime() < haceUnaSemana);
+    if (!fondos.length) continue;
+    const { data: u } = await admin.auth.admin.getUserById(g.empleado_id);
+    const correo = u?.user?.email;
+    const total = fondos.reduce((s, f) => s + (Number(f.sin_rendir) || 0), 0);
+    empleados.push({ persona: g.empleado_nombre, tiene_correo: !!correo, fondos: fondos.map((f) => "S-" + f.folio), sin_rendir: total });
+    if (simular || !correo) continue;
+    const filasHtml = fondos.map((f) => `<tr style="border-bottom:1px solid #eef1f5;">${td("S-" + escapeHtml(f.folio), false, true)}${td(escapeHtml(f.motivo || f.empresa))}${td(fmt(f.otorgado), true)}${td(fmt(f.sin_rendir), true, true)}${td(f.dias_sin_movimiento + " días", true)}</tr>`).join("");
+    const html = construirEmailHTML({
+      appUrl: APP_URL, eyebrow: "FONDOS POR RENDIR", saludo: `Hola ${escapeHtml(String(g.empleado_nombre).split(" ")[0])},`,
+      cuerpo: `Tienes <strong>${fmt(total)}</strong> sin rendir en ${fondos.length === 1 ? "un fondo" : fondos.length + " fondos"} que llevan más de ${DIAS_FONDO_SIN_RENDIR} días sin movimiento. Rinde los gastos que hiciste con ese dinero o, si sobró, coordina su devolución con Finanzas.`,
+      extraHtml: `<table style="border-collapse:collapse;width:100%;margin-bottom:18px;"><thead><tr>${th("Fondo")}${th("Motivo")}${th("Entregado", true)}${th("Sin rendir", true)}${th("Quieto", true)}</tr></thead><tbody>${filasHtml}</tbody></table>`,
+      botonTexto: "Rendir mis gastos", botonUrl: `${APP_URL}/#nueva`,
+    });
+    await enviarCorreo([correo], `Tienes ${fmt(total)} sin rendir en tus fondos`, html);
+    const { error: errMarca } = await admin.rpc("marcar_aviso_fondos", { p_ids: fondos.map((f) => f.id) });
+    if (errMarca) throw errMarca;
+  }
+
+  // 2. A administradores, una vez por semana: fondos listos para liquidar.
+  if (porLiquidar.length) {
+    const { data: previo } = await admin.from("system_events").select("created_at").eq("tipo", "aviso_fondos_liquidar_ok")
+      .gte("created_at", new Date(Date.now() - 6.5 * 24 * 60 * 60 * 1000).toISOString()).limit(1);
+    const yaAvisado = !!previo?.length;
+    liquidar = { grupos: porLiquidar.map((g) => ({ persona: g.empleado_nombre, empresa: g.empresa, fondos: g.fondos.map((f) => "S-" + f.folio), neto: g.neto })), ya_avisado_esta_semana: yaAvisado };
+    if (!simular && !yaAvisado) {
+      const destinatarios = await destinatariosAdmin();
+      if (destinatarios.length) {
+        const resultado = (n: number) => n > 0 ? "Devuelve " + fmt(n) : n < 0 ? "Se le paga " + fmt(-n) : "Compensado";
+        const filasHtml = porLiquidar.map((g) => `<tr style="border-bottom:1px solid #eef1f5;">${td(escapeHtml(g.empleado_nombre), false, true)}${td(escapeHtml(g.empresa))}${td(g.fondos.map((f) => "S-" + f.folio).join(", "))}${td(resultado(g.neto), true, true)}${td(g.dias + " días", true)}</tr>`).join("");
+        const html = construirEmailHTML({
+          appUrl: APP_URL, eyebrow: "FONDOS PARA LIQUIDAR", saludo: "Estimado(a),",
+          cuerpo: `Hay ${porLiquidar.length === 1 ? "una persona" : porLiquidar.length + " personas"} con fondos listos para liquidar: sin rendiciones en revisión, y ya gastados o sin movimiento hace más de ${DIAS_FONDO_PARA_LIQUIDAR} días. Se liquidan desde el detalle de cualquiera de sus fondos.`,
+          extraHtml: `<table style="border-collapse:collapse;width:100%;margin-bottom:18px;"><thead><tr>${th("Persona")}${th("Empresa")}${th("Fondos")}${th("Resultado", true)}${th("Abierto", true)}</tr></thead><tbody>${filasHtml}</tbody></table>`,
+          botonTexto: "Ver fondos", botonUrl: `${APP_URL}/#fondos`,
+        });
+        await enviarCorreo(destinatarios, `${porLiquidar.length} persona(s) con fondos para liquidar`, html);
+        await logEvent(admin, "aviso_fondos_liquidar_ok", { metadata: { grupos: porLiquidar.length } });
+      }
+    }
+  }
+  return { empleados, liquidar };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -75,6 +163,8 @@ Deno.serve(async (req: Request) => {
     if (!RESEND_API_KEY) throw new Error("Falta configurar el secret RESEND_API_KEY en el proyecto.");
     const caller = await requireProfile(req, admin);
     callerId = caller?.id ?? null;
+    const cuerpo = await req.json().catch(() => ({}));
+    const simular = cuerpo?.simular === true;
 
     // Misma ventana de N días gobierna dos cosas distintas (hace cuánto se
     // creó, hace cuánto se recordó por última vez) -- un solo valor alcanza.
@@ -97,8 +187,29 @@ Deno.serve(async (req: Request) => {
     if (errSolicitudes) throw errSolicitudes;
 
     const totalPendientes = (rendiciones?.length || 0) + (solicitudes?.length || 0);
-    if (totalPendientes === 0) {
-      return new Response(JSON.stringify({ ok: true, enviados: 0, nota: "No hay nada pendiente hace más de " + DIAS_PARA_RECORDAR + " días sin recordatorio reciente." }), {
+
+    // Destinatarios aprobadores/admin: se buscan una sola vez y solo si hacen falta.
+    let cacheDestinatarios: string[] | null = null;
+    const destinatariosAprobadores = async () => {
+      if (cacheDestinatarios) return cacheDestinatarios;
+      const perfiles = await leerTodas(() => admin.from("profiles")
+        .select("id, nombre, rol, activo, delegado_activo, delegado_hasta", { count: "exact" })
+        .eq("activo", true).or("rol.in.(aprobador,admin),delegado_activo.eq.true").order("id"));
+      const ahora = Date.now();
+      const elegidos = (perfiles || []).filter((p) => ["aprobador", "admin"].includes(p.rol) || (p.delegado_activo && (!p.delegado_hasta || new Date(p.delegado_hasta).getTime() > ahora)));
+      const emails = await emailsDePerfiles(admin, elegidos);
+      cacheDestinatarios = [...new Set(elegidos.map((p) => emails.get(p.id)).filter((e): e is string => !!e))];
+      return cacheDestinatarios;
+    };
+
+    // Los avisos de fondos corren aunque no haya rendiciones pendientes, y su
+    // falla no impide el resumen de pendientes (queda en Salud del sistema).
+    let fondos: unknown = null;
+    try { fondos = await avisarFondos(admin, destinatariosAprobadores, simular); }
+    catch (e) { const m = e instanceof Error ? e.message : String(e); fondos = { error: m }; await logEvent(admin, "aviso_fondos_fail", { usuarioId: callerId, detalle: m }); }
+
+    if (totalPendientes === 0 || simular) {
+      return new Response(JSON.stringify({ ok: true, enviados: 0, simulado: simular, total_pendientes: totalPendientes, fondos, nota: simular ? "Simulación: no se envió nada." : "No hay nada pendiente hace más de " + DIAS_PARA_RECORDAR + " días sin recordatorio reciente." }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
@@ -219,7 +330,7 @@ Deno.serve(async (req: Request) => {
     }
 
     await logEvent(admin, "recordatorios_ok", { usuarioId: callerId, metadata: { total: totalPendientes } });
-    return new Response(JSON.stringify({ ok: true, enviados: destinatarios.length, total_pendientes: totalPendientes }), {
+    return new Response(JSON.stringify({ ok: true, enviados: destinatarios.length, total_pendientes: totalPendientes, fondos }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {

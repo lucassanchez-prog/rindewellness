@@ -204,7 +204,53 @@
     if (debe !== haber || debe !== compensado || pendientes.reduce((s,p) => s + p.monto, 0) !== neto) throw new Error("El asiento de la liquidación no cuadra.");
     return {filas, tipo:"TRASPASO", glosa, total:debe, compensado, pendientes, fileName:`comprobante_liquidacion_L-${liq.folio}.csv`};
   }
-
+
+  // Clasifica los fondos abiertos (filas de estado_fondos_abiertos()) para los
+  // avisos. MISMA lógica que supabase/functions/_shared/avisos-fondos.ts (la usa
+  // el correo diario); una prueba compara las dos con los mismos datos.
+  //   porRendir:   plata sin rendir, nada en revisión y sin movimiento hace
+  //                diasRendir días o más.
+  //   porLiquidar: nada en revisión y ya gastado entero o quieto hace
+  //                diasLiquidar días o más; por persona y empresa.
+  function clasificarFondos(filas, { diasRendir = 7, diasLiquidar = 15, montoMinimo = 1000 } = {}) {
+    const num = (v) => Number(v) || 0;
+    const porRendir = new Map(), porLiquidar = new Map();
+    for (const f of [...(filas || [])].sort((a, b) => num(a.folio) - num(b.folio))) {
+      if (num(f.rendiciones_pendientes) > 0) continue;
+      // Bajo montoMinimo (vuelto de $27, redondeos) cuenta como gastado entero.
+      const saldo = num(f.sin_rendir) < montoMinimo ? 0 : num(f.sin_rendir);
+      if (saldo > 0 && num(f.dias_sin_movimiento) >= diasRendir) {
+        const g = porRendir.get(f.empleado_id) || { empleado_id: f.empleado_id, empleado_nombre: f.empleado_nombre, sin_rendir: 0, fondos: [] };
+        g.sin_rendir += saldo; g.fondos.push(f); porRendir.set(f.empleado_id, g);
+      }
+      if (saldo === 0 || num(f.dias_sin_movimiento) >= diasLiquidar) {
+        const k = f.empleado_id + "|" + f.empresa;
+        const g = porLiquidar.get(k) || { empleado_id: f.empleado_id, empleado_nombre: f.empleado_nombre, empresa: f.empresa, otorgado: 0, aprobado: 0, neto: 0, dias: 0, fondos: [] };
+        g.otorgado += num(f.otorgado); g.aprobado += num(f.aprobado); g.neto = g.otorgado - g.aprobado;
+        g.dias = Math.max(g.dias, num(f.dias_abierto)); g.fondos.push(f); porLiquidar.set(k, g);
+      }
+    }
+    return {
+      porRendir: [...porRendir.values()].sort((a, b) => b.sin_rendir - a.sin_rendir),
+      porLiquidar: [...porLiquidar.values()].sort((a, b) => b.dias - a.dias),
+    };
+  }
+
+  // Aviso antes de entregarle otro fondo a alguien: cuántos tiene abiertos,
+  // cuánto sin rendir y hace cuánto el más antiguo. "" si no tiene ninguno.
+  function textoFondosAbiertos(filas, nombre) {
+    const lista = filas || [];
+    if (!lista.length) return "";
+    const num = (v) => Number(v) || 0;
+    const sinRendir = lista.reduce((s, f) => s + num(f.sin_rendir), 0);
+    const enRevision = lista.reduce((s, f) => s + num(f.pendiente), 0);
+    const masAntiguo = Math.max(...lista.map((f) => num(f.dias_abierto)));
+    const folios = [...lista].sort((a, b) => num(a.folio) - num(b.folio)).map((f) => "S-" + f.folio);
+    return `${nombre} ya tiene ${lista.length === 1 ? "1 fondo abierto" : lista.length + " fondos abiertos"} (${folios.join(", ")}): ` +
+      `${fmtCLP(sinRendir)} sin rendir` + (enRevision ? ` y ${fmtCLP(enRevision)} en revisión` : "") +
+      `; el más antiguo se entregó hace ${masAntiguo === 1 ? "1 día" : masAntiguo + " días"}.`;
+  }
+
   // Monto con decimales escrito a mano o leído de un comprobante extranjero:
   // "9.00", "9,00", "1.234,56", "1,234.56", "USD 8.71". Con un solo separador,
   // si le siguen 1 o 2 dígitos es el decimal; si le siguen 3, son miles.
@@ -328,7 +374,7 @@
     return null;
   }
 
-  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido, invertirFilaKame, notasCreditoCercanas, parseDecimal, pesosDesdeDolares,comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
+  const RindeCore = { repartirEntreFondos, validarFondosRendicion, ordenarItemsRendicion, folioDocumentoValido, invertirFilaKame, notasCreditoCercanas, parseDecimal, pesosDesdeDolares, clasificarFondos, textoFondosAbiertos, comprobanteEntregaFondo, comprobanteLiquidacionFondos, grupoDocumentoContable, formatearRut, validarRut, fmtCLP, fmtDate, fmtDateSlash, parseMoneyValue, esAprobadorEfectivo, claveDocumento, documentosDuplicados, campoCSV, campoCSVSeguro, resumenRendicion };
   if (typeof module !== "undefined" && module.exports) {
     module.exports = RindeCore;
   } else {

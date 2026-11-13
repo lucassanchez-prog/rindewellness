@@ -869,6 +869,7 @@ async function loadDashboard() {
 
   applyDashboardFilters();
   window.RindeUI.renderHome(dashboardData,esAprobadorEfectivo(perfil),resumirConsumoFondo,renderList);
+  if (esAprobadorEfectivo(perfil)) void mostrarFondosPorCerrar(gen);
   // Recorrido guiado: se ofrece la primera vez y queda en el menú ("Ver recorrido").
   // Solo la primera vez: el perfil guarda cuándo lo vio (recorrido_visto_en), en cualquier dispositivo.
   try { window.RindeRecorrido?.preparar({ usuarioId: usuario.id, nombre: perfil?.nombre || "", rol: perfil?.rol || "empleado", aprobador: esAprobadorEfectivo(perfil),
@@ -1970,7 +1971,8 @@ function abrirFormularioFondoEntregado(contenedor, usuarios) {
     if (!empleado) { toast("Selecciona al empleado."); return; }
     if (!monto) { toast("Ingresa el monto transferido."); return; }
     if (!motivo) { toast("Indica el motivo del fondo."); return; }
-    if (!confirm(`¿Registrar un fondo APROBADO de ${fmtCLP(monto)} para ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})?`)) return;
+    const abiertos = await avisoFondosAbiertos(empleado.id, empleado.nombre);
+    if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Registrar un fondo APROBADO de ${fmtCLP(monto)} para ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})?`)) return;
 
     btnRegistrar.disabled = true;
     btnRegistrar.textContent = "Registrando...";
@@ -6244,7 +6246,8 @@ async function openDetalleSolicitud(id, pushHistory = true) {
 
     const btnAprobar = el("button", { class: "btn btn-success" }, "Aprobar");
     btnAprobar.addEventListener("click", async () => {
-      if (!confirm(`¿Aprobar la solicitud de fondos de ${s.empleado_nombre} por ${fmtCLP(s.monto_solicitado)}? Esta acción no se puede deshacer.`)) return;
+      const abiertos = await avisoFondosAbiertos(s.empleado_id, s.empleado_nombre, s.id);
+      if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Aprobar la solicitud de fondos de ${s.empleado_nombre} por ${fmtCLP(s.monto_solicitado)}? Esta acción no se puede deshacer.`)) return;
       btnAprobar.disabled = true;
       btnAprobar.textContent = "Aprobando...";
       await aprobarSolicitud(s, "Aprobado");
@@ -6260,6 +6263,64 @@ async function openDetalleSolicitud(id, pushHistory = true) {
   }
 
   if (pushHistory) pushView("view-detalle-solicitud", { id }); else show("view-detalle-solicitud");
+}
+
+// ------------------------------------------------------------
+// Avisos de fondos: una sola fuente, estado_fondos_abiertos() (la misma que
+// usa el correo diario de recordatorios-pendientes).
+// ------------------------------------------------------------
+async function leerEstadoFondos() {
+  const { data, error } = await db.rpc("estado_fondos_abiertos");
+  if (error) throw error;
+  return data || [];
+}
+
+// Texto para el confirm de aprobar/registrar un fondo; "" si la persona no
+// tiene otros abiertos o si no se pudo consultar (el aviso no bloquea).
+async function avisoFondosAbiertos(empleadoId, nombre, excluirId = null) {
+  try {
+    const filas = (await leerEstadoFondos()).filter((f) => f.empleado_id === empleadoId && f.id !== excluirId);
+    return window.RindeCore.textoFondosAbiertos(filas, nombre || "La persona");
+  } catch (error) {
+    console.warn("No se pudo revisar los fondos abiertos:", error);
+    return "";
+  }
+}
+
+// Tarjeta "Fondos por cerrar" en Inicio (aprobadores y admin): personas con
+// fondos listos para liquidar y fondos quietos sin rendir.
+async function mostrarFondosPorCerrar(gen) {
+  let filas;
+  try { filas = await leerEstadoFondos(); }
+  catch (error) { console.warn("No se pudo cargar Fondos por cerrar:", error); return; }
+  if (gen !== dashboardCarga) return;
+  const home = document.getElementById("portal-home-content");
+  if (!home) return;
+  document.getElementById("portal-fondos-por-cerrar")?.remove();
+  const { porRendir, porLiquidar } = window.RindeCore.clasificarFondos(filas);
+  if (!porRendir.length && !porLiquidar.length) return;
+  const abrir = (f) => (e) => { e.preventDefault(); openDetalleSolicitud(f.id); };
+  const masAntiguo = (fondos) => fondos.reduce((a, f) => (Number(f.dias_abierto) > Number(a.dias_abierto) ? f : a), fondos[0]);
+  const resultado = (n) => (n > 0 ? "Devuelve " + fmtCLP(n) : n < 0 ? "Se le paga " + fmtCLP(-n) : "Compensado");
+  const filasHtml = [
+    ...porLiquidar.slice(0, 5).map((g) => el("a", { class: "portal-attention", href: "#detalle-solicitud/" + masAntiguo(g.fondos).id, onclick: abrir(masAntiguo(g.fondos)) }, [
+      el("div", {}, [el("strong", {}, g.empleado_nombre || "Fondo"), el("span", {}, g.empresa + " · " + g.fondos.map((f) => "S-" + f.folio).join(", ")), el("small", {}, "Lista para liquidar · abierto hace " + g.dias + " días")]),
+      el("b", {}, resultado(g.neto)),
+    ])),
+    ...porRendir.filter((g) => !porLiquidar.some((l) => l.empleado_id === g.empleado_id)).slice(0, 5).map((g) => el("a", { class: "portal-attention", href: "#detalle-solicitud/" + masAntiguo(g.fondos).id, onclick: abrir(masAntiguo(g.fondos)) }, [
+      el("div", {}, [el("strong", {}, g.empleado_nombre || "Fondo"), el("span", {}, g.fondos.map((f) => "S-" + f.folio).join(", ")), el("small", {}, "Sin movimiento hace " + Math.max(...g.fondos.map((f) => Number(f.dias_sin_movimiento) || 0)) + " días · se le recuerda por correo")]),
+      el("b", {}, fmtCLP(g.sin_rendir) + " sin rendir"),
+    ])),
+  ];
+  const tarjeta = el("section", { class: "card", id: "portal-fondos-por-cerrar", style: "margin-bottom:24px;" }, [
+    el("div", { class: "portal-section-heading" }, [
+      el("div", {}, [el("h2", {}, "Fondos por cerrar"), el("small", {}, "Sin rendiciones en revisión. Se liquidan por persona y empresa desde el detalle del fondo.")]),
+      el("a", { href: "#fondos", class: "btn btn-secondary", onclick: (e) => { e.preventDefault(); navegarPortal("fondos"); } }, "Ver fondos"),
+    ]),
+    ...filasHtml,
+  ]);
+  const columnas = home.querySelector(".portal-two-columns");
+  home.insertBefore(tarjeta, columnas ? columnas.nextSibling : null);
 }
 
 async function aprobarSolicitud(solicitud, estado, motivoRechazo = null) {
