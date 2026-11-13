@@ -4,3 +4,4 @@ supabase-go.exe
 supabase_windows_amd64/
 supabase_windows_amd64.tar.gz
 supabase/.temp/
+dist/

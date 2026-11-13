@@ -42,7 +42,8 @@ test('el CSV para Kame avisa si ya se descargó y lo registra después',async()=
   assert.equal(c.textoExportacionKame({kame_exportado_en:'2026-11-09T10:00:00Z',kame_exportado_por_nombre:'Ana',kame_exportaciones:2}),'CSV para Kame descargado el 2026-11-09 por Ana (2 veces)');
   const r=[{id:'a'},{id:'b',kame_exportado_en:'2026-11-01',kame_exportaciones:1}];
   await c.registrarExportacionKame(r);
-  assert.deepEqual(llamadas,[['marcar_exportado_kame',{p_rendiciones:['a','b']}]]);
+  // JSON: los objetos se crean dentro del contexto aislado (otro prototipo).
+  assert.deepEqual(JSON.parse(JSON.stringify(llamadas)),[['marcar_exportado_kame',{p_rendiciones:['a','b']}]]);
   assert.equal(r[0].kame_exportaciones,1);assert.equal(r[0].kame_exportado_por_nombre,'Ana');
   assert.equal(r[1].kame_exportado_en,'2026-11-01');assert.equal(r[1].kame_exportaciones,2);
   // Si el registro falla no se rompe nada: el CSV ya se descargó.

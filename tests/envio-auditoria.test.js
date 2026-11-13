@@ -64,6 +64,8 @@ function contextoEnvio(fallar){
     conflictosSinConfirmar:()=>[],parseMoneyValue:Number,validarRut:()=>true,estadoReintentoOcr:()=>null,montoSigueVerificado:()=>false,documentosDuplicados:()=>[],
     window:{RindeCore:{claveDocumento:()=>null},RindeData:data},conTimeout:esperar,toast:m=>mensajes.push(m),mensajeErrorAmigable:e=>e.message,
     notificarAsync:name=>notificaciones.push(name),replaceView(){},loadDashboard(){},borrarBorradorRendicion(){}});
+  // La moneda del gasto (pesos o dólares) se lee con la función real de la app.
+  vm.runInContext(app.slice(app.indexOf('function leerMonedaGasto('),app.indexOf('function buildSinDocumentoFields(')),ctx);
   vm.runInContext(app.slice(app.indexOf('async function submitRendicion()'),app.indexOf('// Solicitudes de fondos por rendir')),ctx);
   return {ctx,elementos,mensajes,rpc,notificaciones};
 }

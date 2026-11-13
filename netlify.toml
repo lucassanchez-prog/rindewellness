@@ -1,0 +1,25 @@
+# Netlify publica solo dist/ (ver scripts/publicar.sh): la app y sus assets,
+# no los SQL, el código del servidor, las pruebas ni las notas internas.
+[build]
+  command = "bash scripts/publicar.sh"
+  publish = "dist"
+
+# Protecciones del navegador. No restringen los scripts (la app carga
+# librerías de CDN y Supabase); solo impiden que otra página la incruste
+# para engañar a alguien y hacerle aprobar algo, y que el navegador
+# "adivine" el tipo de un archivo.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    Content-Security-Policy = "frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(self), microphone=(), geolocation=()"
+
+# El service worker siempre se revisa contra el servidor, para que una versión
+# nueva de la app llegue apenas se publica.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"

@@ -89,3 +89,17 @@ test('la base: solo admin/aprobador ven el estado; solo el servidor marca avisos
   assert.match(sql,/revoke all on public\.avisos_fondos from anon, authenticated;/);
   assert.match(sql,/count\(\*\) filter \(where v\.estado = 'Pendiente'\)::integer rendiciones_pendientes/);
 });
+
+test('el botón queda desactivado mientras se consultan los fondos abiertos (sin doble confirmación)',()=>{
+  assert.match(app,/if \(btnAprobar\.disabled\) return;\s*btnAprobar\.disabled = true;\s*const abiertos = await avisoFondosAbiertos/);
+  assert.match(app,/if \(btnRegistrar\.disabled\) return;\s*btnRegistrar\.disabled = true;\s*const abiertos = await avisoFondosAbiertos/);
+  assert.equal((app.match(/\{ btn(Aprobar|Registrar)\.disabled = false; return; \}/g)||[]).length,2,'al cancelar se reactiva');
+});
+
+test('el service worker guarda las mismas versiones que carga la página',()=>{
+  const html=leer('index.html'), sw=leer('sw.js');
+  const enPagina=[...html.matchAll(/(?:src|href)="([a-z\-]+\.(?:js|css)\?v=\d+)"/g)].map(m=>'/'+m[1]).sort();
+  const enSw=[...sw.matchAll(/"(\/[a-z\-]+\.(?:js|css)\?v=\d+)"/g)].map(m=>m[1]).sort();
+  assert.ok(enPagina.length>=10);
+  assert.deepEqual(enSw,enPagina);
+});

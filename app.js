@@ -1971,10 +1971,11 @@ function abrirFormularioFondoEntregado(contenedor, usuarios) {
     if (!empleado) { toast("Selecciona al empleado."); return; }
     if (!monto) { toast("Ingresa el monto transferido."); return; }
     if (!motivo) { toast("Indica el motivo del fondo."); return; }
-    const abiertos = await avisoFondosAbiertos(empleado.id, empleado.nombre);
-    if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Registrar un fondo APROBADO de ${fmtCLP(monto)} para ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})?`)) return;
-
+    if (btnRegistrar.disabled) return;
     btnRegistrar.disabled = true;
+    const abiertos = await avisoFondosAbiertos(empleado.id, empleado.nombre);
+    if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Registrar un fondo APROBADO de ${fmtCLP(monto)} para ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})?`)) { btnRegistrar.disabled = false; return; }
+
     btnRegistrar.textContent = "Registrando...";
     const { data: folio, error } = await db.rpc("registrar_fondo_entregado", {
       p_empleado_id: empleado.id,
@@ -6246,9 +6247,11 @@ async function openDetalleSolicitud(id, pushHistory = true) {
 
     const btnAprobar = el("button", { class: "btn btn-success" }, "Aprobar");
     btnAprobar.addEventListener("click", async () => {
-      const abiertos = await avisoFondosAbiertos(s.empleado_id, s.empleado_nombre, s.id);
-      if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Aprobar la solicitud de fondos de ${s.empleado_nombre} por ${fmtCLP(s.monto_solicitado)}? Esta acción no se puede deshacer.`)) return;
+      // Desactivado mientras se consultan sus fondos abiertos: un doble clic no abre dos confirmaciones.
+      if (btnAprobar.disabled) return;
       btnAprobar.disabled = true;
+      const abiertos = await avisoFondosAbiertos(s.empleado_id, s.empleado_nombre, s.id);
+      if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Aprobar la solicitud de fondos de ${s.empleado_nombre} por ${fmtCLP(s.monto_solicitado)}? Esta acción no se puede deshacer.`)) { btnAprobar.disabled = false; return; }
       btnAprobar.textContent = "Aprobando...";
       await aprobarSolicitud(s, "Aprobado");
       btnAprobar.disabled = false;
