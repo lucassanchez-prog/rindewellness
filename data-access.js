@@ -76,6 +76,14 @@ function abrirPdfSeguro(pdfjs,datos) {
   return pdfjs.getDocument({data:datos,isEvalSupported:false});
 }
 
-const api={consultarTodas,distribuirFondosCsv,prepararAdjuntos,guardarRendicionCompleta,abrirPdfSeguro};
+// Libera un PDF abierto. pdf.js 6 quitó pdf.destroy(); loadingTask.destroy()
+// existe en todas las versiones. Sin esto la lectura local fallaba en silencio.
+function cerrarPdf(pdf) {
+  if (!pdf) return Promise.resolve();
+  if (pdf.loadingTask && typeof pdf.loadingTask.destroy === "function") return pdf.loadingTask.destroy();
+  return typeof pdf.destroy === "function" ? pdf.destroy() : Promise.resolve();
+}
+
+const api={consultarTodas,distribuirFondosCsv,prepararAdjuntos,guardarRendicionCompleta,abrirPdfSeguro,cerrarPdf};
 if(typeof module!=="undefined" && module.exports)module.exports=api;else root.RindeData=api;
 })(typeof window!=="undefined"?window:globalThis);

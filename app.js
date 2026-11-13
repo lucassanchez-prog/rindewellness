@@ -2972,28 +2972,28 @@ function conTimeout(promise, ms, mensaje) {
 // texto), que es donde de verdad aporta. Si acá no se logra sacar lo
 // esencial, se cae a la IA como siempre.
 // ---------------------------------------------------------------------
-const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+// pdf.js 6 (antes 3.11.174, con fallas conocidas). Desde la v4 es un módulo
+// (.mjs): se carga con import(). Build "legacy": funciona también en celulares
+// con navegadores no tan recientes (cdnjs solo publica la build moderna).
+const PDFJS_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/legacy/build/pdf.min.mjs";
+const PDFJS_WORKER_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@6.4.299/legacy/build/pdf.worker.min.mjs";
 let pdfjsCargando = null;
 
-// Se carga recién cuando alguien adjunta un PDF (son ~300KB): no tiene
+// Se carga recién cuando alguien adjunta o abre un PDF (son ~500KB): no tiene
 // sentido que los pague en descarga quien solo sube fotos.
 function cargarPdfJs() {
   if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
   if (pdfjsCargando) return pdfjsCargando;
   pdfjsCargando = new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    const fallo=()=>{clearTimeout(timer);s.remove();pdfjsCargando=null;reject(new Error("No se pudo cargar el lector de PDF. Puedes reintentar."));};
+    const fallo=()=>{clearTimeout(timer);pdfjsCargando=null;reject(new Error("No se pudo cargar el lector de PDF. Puedes reintentar."));};
     const timer=setTimeout(fallo,30000);
-    s.src = PDFJS_URL;
-    s.onload = () => {
+    import(PDFJS_URL).then((pdfjs) => {
       clearTimeout(timer);
-      if(!window.pdfjsLib){fallo();return;}
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
-      resolve(window.pdfjsLib);
-    };
-    s.onerror = fallo;
-    document.head.appendChild(s);
+      if(!pdfjs?.getDocument || !pdfjs.GlobalWorkerOptions){fallo();return;}
+      pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+      window.pdfjsLib = pdfjs;
+      resolve(pdfjs);
+    }, fallo);
   });
   return pdfjsCargando;
 }
@@ -4111,8 +4111,8 @@ async function prepararArchivoParaLectura(input, status, analizar) {
     status.className = "ocr-status show"; status.textContent = "Revisando las páginas del PDF…";
     const pdfjs = await cargarPdfJs();
     const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await original.arrayBuffer()).promise;
-    if (!vigente()) {await pdf.destroy(); return;}
-    if (pdf.numPages === 1) {input.dataset.paginaPendiente="false";await pdf.destroy(); await analizar(original); return;}
+    if (!vigente()) {await window.RindeData.cerrarPdf(pdf); return;}
+    if (pdf.numPages === 1) {input.dataset.paginaPendiente="false";await window.RindeData.cerrarPdf(pdf); await analizar(original); return;}
     const panel = el("div", {class:"selector-pagina-ocr"});
     panel.appendChild(el("p", {}, "Este PDF contiene " + pdf.numPages + " páginas. Elige el comprobante de este gasto; las fichas de rendición no son el documento original."));
     const select = el("select", {"aria-label":"Página del comprobante"});
@@ -4120,7 +4120,7 @@ async function prepararArchivoParaLectura(input, status, analizar) {
     for (let n=1;n<=pdf.numPages;n++) {
       const page = await pdf.getPage(n);
       const contenido = await page.getTextContent();
-      if (!vigente()) {await pdf.destroy();return;}
+      if (!vigente()) {await window.RindeData.cerrarPdf(pdf);return;}
       const tipo = clasificarPaginaComprobante(contenido.items.map(i=>i.str).join(" "));
       select.appendChild(el("option", {value:String(n)}, "Página " + n + " · " + tipo));
       if (sugerida === null && tipo !== "Ficha de rendición" && tipo !== "Documento") sugerida=n;
@@ -4133,7 +4133,7 @@ async function prepararArchivoParaLectura(input, status, analizar) {
     const usar = el("button", {type:"button",class:"btn btn-primary",disabled:true}, "Leer este comprobante"); panel.appendChild(usar);
     input.parentElement.appendChild(panel);
     let renderToken=0, archivoPagina=null, url=null;
-    token.limpiar = () => {if(url)URL.revokeObjectURL(url);pdf.destroy();};
+    token.limpiar = () => {if(url)URL.revokeObjectURL(url);window.RindeData.cerrarPdf(pdf);};
     async function mostrarPagina() {
       const lectura=++renderToken; usar.disabled=true; archivoPagina=null; input.dataset.paginaPendiente="true";
       try {
@@ -4176,15 +4176,15 @@ async function leerPdfLocal(file) {
     const pdfjs = await cargarPdfJs();
     const pdf = await window.RindeData.abrirPdfSeguro(pdfjs,await file.arrayBuffer()).promise;
     let texto = "";
-    if (pdf.numPages !== 1) {await pdf.destroy(); return null;}
+    if (pdf.numPages !== 1) {await window.RindeData.cerrarPdf(pdf); return null;}
     // Tope de páginas: una factura tiene 1-2; leer un PDF enorme entero solo
     // para buscar un RUT no aporta y traba el navegador.
     for (let p = 1; p <= Math.min(pdf.numPages, 3); p++) {
       const contenido = await (await pdf.getPage(p)).getTextContent();
       texto += contenido.items.map((i) => i.str).join(" ") + "\n";
     }
-    if (clasificarPaginaComprobante(texto) === "Ficha de rendición") {await pdf.destroy(); return null;}
-    await pdf.destroy();
+    if (clasificarPaginaComprobante(texto) === "Ficha de rendición") {await window.RindeData.cerrarPdf(pdf); return null;}
+    await window.RindeData.cerrarPdf(pdf);
     if (texto.trim().length < 50) return null; // PDF escaneado: es una imagen, no hay texto que leer
     const datos = parsearTextoFactura(texto);
     // El piso para considerarlo bueno: RUT válido + monto. Sin esos dos no
@@ -4219,7 +4219,7 @@ async function prepararComprobanteIa(file) {
         const blob = await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
         if (!blob) throw new Error("No se pudo preparar la página del comprobante.");
         imagen = new File([blob],"pagina-comprobante.png",{type:"image/png"});
-      } finally {await pdf.destroy();}
+      } finally {await window.RindeData.cerrarPdf(pdf);}
     }
     if (!imagen.type.startsWith("image/")) return imagen;
     const resultado = await window.RindeFoto.preparar(imagen,{recortar:file.type!=="application/pdf",...opcionesFotos.get(file)});
@@ -4732,7 +4732,7 @@ async function leerEscaneadoLocal(file){
     const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
     return blob?await leerFotoLocal(new File([blob],"comprobante.png",{type:"image/png"})):null;
   }catch(error){console.error("El respaldo local no pudo leer el PDF:",error);return null;}
-  finally{if(pdf)await pdf.destroy();}
+  finally{if(pdf)await window.RindeData.cerrarPdf(pdf);}
 }
 
 async function aplicarRespaldoFoto(id, file, gen, statusEl, aplicar, campos) {
@@ -7722,7 +7722,7 @@ async function* iterarImagenesAdjunto(path) {
         yield {imagen:canvasAJpegRedimensionado(canvas),pagina:n,total:pdf.numPages};
         page.cleanup();canvas.width=canvas.height=0;
       }
-    }finally{await pdf.destroy();}
+    }finally{await window.RindeData.cerrarPdf(pdf);}
   }else{
     const bitmap=await createImageBitmap(blob);
     try{
@@ -7802,7 +7802,9 @@ async function generarInformePDF(rendicion, items) {
       }
     }
     doc.setFont("helvetica","bold");doc.setFontSize(12);doc.setTextColor(...tinta);doc.text("Detalle de gastos",margen,y);y+=6;
-    doc.autoTable({
+    // jspdf-autotable 5 ya no se engancha a jsPDF: es la función global autoTable(doc, opciones).
+    const autoTable = window.autoTable || ((d, o) => d.autoTable(o));
+    autoTable(doc, {
       startY:y,margin:{left:margen,right:margen,top:18,bottom:19},
       head:[["Gasto / proveedor","Documento","Descripción / centro de costo / cuenta","Monto","Estado"]],
       body:(items || []).map((it,i)=>[
@@ -7827,11 +7829,11 @@ async function generarInformePDF(rendicion, items) {
       .map((it, indiceOriginal) => ({ it, indiceOriginal }))
       .filter(({ it }) => it.adjunto_url);
     const itemsSinAdjunto=(items || []).map((it,i)=>({it,i})).filter(({it})=>!it.adjunto_url);
-    if(itemsSinAdjunto.length){doc.addPage();doc.setFont('helvetica','bold');doc.setFontSize(16);doc.setTextColor(...tinta);doc.text('Gastos sin comprobante adjunto',margen,23);doc.setFont('helvetica','normal');doc.setFontSize(9);doc.text('Este informe contiene gastos sin respaldo documental adjunto.',margen,32);doc.autoTable({startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[['Gasto','Proveedor / descripción','Monto CLP','Estado']],body:itemsSinAdjunto.map(({it,i})=>[i+1,[it.nombre_proveedor,it.descripcion].filter(Boolean).join('\n')||'-',fmtCLP(it.monto),it.estado||'Pendiente']),styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:'right'},3:{cellWidth:35}}});}
+    if(itemsSinAdjunto.length){doc.addPage();doc.setFont('helvetica','bold');doc.setFontSize(16);doc.setTextColor(...tinta);doc.text('Gastos sin comprobante adjunto',margen,23);doc.setFont('helvetica','normal');doc.setFontSize(9);doc.text('Este informe contiene gastos sin respaldo documental adjunto.',margen,32);autoTable(doc,{startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[['Gasto','Proveedor / descripción','Monto CLP','Estado']],body:itemsSinAdjunto.map(({it,i})=>[i+1,[it.nombre_proveedor,it.descripcion].filter(Boolean).join('\n')||'-',fmtCLP(it.monto),it.estado||'Pendiente']),styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:'right'},3:{cellWidth:35}}});}
     let adjuntosFallidos=0;
     const adjuntosPorRuta=new Map();
     for(const dato of itemsConAdjunto){if(!adjuntosPorRuta.has(dato.it.adjunto_url))adjuntosPorRuta.set(dato.it.adjunto_url,[]);adjuntosPorRuta.get(dato.it.adjunto_url).push(dato);}
-    if(itemsConAdjunto.length){doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(16);doc.setTextColor(...tinta);doc.text("Anexo de comprobantes",margen,23);doc.setFont("helvetica","normal");doc.setFontSize(9);doc.text("Imágenes originales y todas las páginas de cada PDF, en orden de gasto.",margen,32);doc.autoTable({startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[["Gasto(s)","Proveedor / documento","Monto CLP","Estado"]],body:[...adjuntosPorRuta.values()].map(grupo=>[grupo.map(x=>x.indiceOriginal+1).join(", "),(grupo[0].it.nombre_proveedor || "Comprobante")+"\n"+(grupo[0].it.tipo_documento || "")+(grupo[0].it.nro_documento?" #"+grupo[0].it.nro_documento:""),fmtCLP(grupo.reduce((s,x)=>s+Number(x.it.monto||0),0)),[...new Set(grupo.map(x=>x.it.estado || "Pendiente"))].join(" / ")]),theme:"striped",styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:"right"},3:{cellWidth:35}}});}
+    if(itemsConAdjunto.length){doc.addPage();doc.setFont("helvetica","bold");doc.setFontSize(16);doc.setTextColor(...tinta);doc.text("Anexo de comprobantes",margen,23);doc.setFont("helvetica","normal");doc.setFontSize(9);doc.text("Imágenes originales y todas las páginas de cada PDF, en orden de gasto.",margen,32);autoTable(doc,{startY:40,margin:{left:margen,right:margen,top:18,bottom:19},head:[["Gasto(s)","Proveedor / documento","Monto CLP","Estado"]],body:[...adjuntosPorRuta.values()].map(grupo=>[grupo.map(x=>x.indiceOriginal+1).join(", "),(grupo[0].it.nombre_proveedor || "Comprobante")+"\n"+(grupo[0].it.tipo_documento || "")+(grupo[0].it.nro_documento?" #"+grupo[0].it.nro_documento:""),fmtCLP(grupo.reduce((s,x)=>s+Number(x.it.monto||0),0)),[...new Set(grupo.map(x=>x.it.estado || "Pendiente"))].join(" / ")]),theme:"striped",styles:{fontSize:9,cellPadding:3,textColor:tinta},headStyles:{fillColor:verde},columnStyles:{0:{cellWidth:20},1:{cellWidth:97},2:{cellWidth:30,halign:"right"},3:{cellWidth:35}}});}
     for(const grupoAdjunto of adjuntosPorRuta.values()){
       const {it,indiceOriginal}=grupoAdjunto[0];
       const numeroGastos=grupoAdjunto.map(x=>x.indiceOriginal+1).join(", ");

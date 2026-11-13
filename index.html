@@ -12,17 +12,9 @@
 <link rel="stylesheet" href="portal-ui.css?v=117" />
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script>
-  // El PDF de un comprobante (no las fotos, que son imágenes normales) se
-  // renderiza con pdf.js para poder incrustarlo como imagen en el informe;
-  // pdf.js necesita saber dónde está su "worker" (mismo CDN, misma versión).
-  if (window.pdfjsLib) {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-  }
-</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.2.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/5.0.9/jspdf.plugin.autotable.min.js"></script>
+<!-- pdf.js se carga recién cuando hace falta leer o mostrar un PDF (cargarPdfJs en app.js). -->
 <script>
   // Aplicar el tema guardado antes de pintar la página, para que no "parpadee".
   try {
@@ -481,13 +473,13 @@
        el navegador seguía sirviendo la versión anterior. -->
   <script src="pure.js?v=118"></script>
   <script src="borradores.js?v=116"></script>
-  <script src="data-access.js?v=116"></script>
+  <script src="data-access.js?v=117"></script>
   <script src="reportes-exportacion.js?v=116"></script>
   <script src="lector-local.js?v=116"></script>
   <script src="foto-comprobante.js?v=116"></script>
   <script src="revision-comprobante.js?v=116"></script>
   <script src="portal-ui.js?v=116"></script>
   <script src="recorrido.js?v=116"></script>
-  <script src="app.js?v=119"></script>
+  <script src="app.js?v=120"></script>
 </body>
 </html>
