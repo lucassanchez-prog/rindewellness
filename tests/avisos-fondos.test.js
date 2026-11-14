@@ -64,7 +64,8 @@ test('la regla del correo es la misma que la de la app (pure.js = avisos-fondos.
 
 test('la app avisa antes de aprobar o registrar un fondo y muestra Fondos por cerrar',()=>{
   assert.match(app,/const abiertos = await avisoFondosAbiertos\(s\.empleado_id, s\.empleado_nombre, s\.id\);\s*if \(!confirm\(\(abiertos \? abiertos \+ "\\n\\n" : ""\) \+ `¿Aprobar la solicitud/);
-  assert.match(app,/const abiertos = await avisoFondosAbiertos\(empleado\.id, empleado\.nombre\);\s*if \(!confirm\(\(abiertos \? abiertos \+ "\\n\\n" : ""\) \+ `¿Registrar un fondo APROBADO/);
+  assert.match(app,/const abiertos = await avisoFondosAbiertos\(empleado\.id, empleado\.nombre\);\s*if \(selModo\.value === "pendiente"\) \{\s*if \(!confirm\(\(abiertos \? abiertos \+ "\\n\\n" : ""\) \+ `¿Crear una solicitud PENDIENTE/);
+  assert.match(app,/\}\s*if \(!confirm\(\(abiertos \? abiertos \+ "\\n\\n" : ""\) \+ `¿Registrar un fondo APROBADO/,'los dos modos muestran el aviso');
   assert.match(app,/if \(esAprobadorEfectivo\(perfil\)\) void mostrarFondosPorCerrar\(gen\);/);
   const aviso=app.slice(app.indexOf('async function avisoFondosAbiertos('),app.indexOf('async function mostrarFondosPorCerrar('));
   assert.match(aviso,/catch \(error\) \{[^}]*return "";/,'si la consulta falla, el aviso no bloquea la aprobación');
@@ -96,7 +97,7 @@ test('la base: solo admin/aprobador ven el estado; solo el servidor marca avisos
 test('el botón queda desactivado mientras se consultan los fondos abiertos (sin doble confirmación)',()=>{
   assert.match(app,/if \(btnAprobar\.disabled\) return;\s*btnAprobar\.disabled = true;\s*const abiertos = await avisoFondosAbiertos/);
   assert.match(app,/if \(btnRegistrar\.disabled\) return;\s*btnRegistrar\.disabled = true;\s*const abiertos = await avisoFondosAbiertos/);
-  assert.equal((app.match(/\{ btn(Aprobar|Registrar)\.disabled = false; return; \}/g)||[]).length,2,'al cancelar se reactiva');
+  assert.equal((app.match(/\{ btn(Aprobar|Registrar)\.disabled = false; return; \}/g)||[]).length,3,'al cancelar se reactiva (aprobar, y registrar en sus dos modos)');
 });
 
 test('el service worker guarda las mismas versiones que carga la página',()=>{

@@ -1944,13 +1944,30 @@ function abrirFormularioFondoEntregado(contenedor, usuarios) {
   llenarCentros();
   const inpMonto = el("input", { id: "ff-monto", type: "text", inputmode: "numeric", placeholder: "0" });
   inpMonto.addEventListener("input", () => formatearInputMoney(inpMonto));
-  const inpMotivo = el("input", { id: "ff-motivo", type: "text", placeholder: "Ej. Fondo transferido desde Neo para insumos" });
-  const btnRegistrar = el("button", { class: "btn btn-primary", type: "button" }, "Registrar fondo aprobado");
+  const inpMotivo = el("input", { id: "ff-motivo", type: "text", placeholder: "Ej. Compra de materiales" });
+  // Pendiente: lo pidió el empleado por otro canal (WhatsApp, correo) y sigue la
+  // aprobación normal. Entregado: el dinero ya se transfirió y queda aprobado.
+  const selModo = el("select", { id: "ff-modo" }, [
+    el("option", { value: "pendiente" }, "Solicitud pendiente de aprobación"),
+    el("option", { value: "entregado" }, "Fondo ya entregado (queda aprobado)"),
+  ]);
+  const textoModo = el("p", { style: "margin:0 0 12px;font-size:0.85rem;" });
+  const btnRegistrar = el("button", { class: "btn btn-primary", type: "button" });
+  const pintarModo = () => {
+    const pendiente = selModo.value === "pendiente";
+    textoModo.textContent = pendiente
+      ? "Queda pendiente a nombre del empleado y se avisa a los aprobadores por correo, igual que si la hubiera enviado él."
+      : "Queda aprobado de inmediato y el empleado lo verá disponible para rendir. Úsalo solo si el dinero ya fue transferido.";
+    btnRegistrar.textContent = pendiente ? "Crear solicitud pendiente" : "Registrar fondo aprobado";
+  };
+  selModo.addEventListener("change", pintarModo);
+  pintarModo();
   const btnCancelar = el("button", { class: "btn btn-secondary", type: "button" }, "Cancelar");
 
   const tarjeta = el("div", { class: "card", id: "form-fondo-entregado", style: "margin-bottom:16px;" }, [
-    el("h3", { style: "margin:0 0 4px;" }, "Registrar fondo ya entregado"),
-    el("p", { style: "margin:0 0 12px;font-size:0.85rem;" }, "Queda aprobado de inmediato y el empleado lo verá disponible para rendir. Úsalo solo si el dinero ya fue transferido."),
+    el("h3", { style: "margin:0 0 4px;" }, "Fondo a nombre de un empleado"),
+    el("div", { class: "field" }, [el("label", { for: "ff-modo" }, "Tipo"), selModo]),
+    textoModo,
     el("div", { class: "field" }, [el("label", { for: "ff-empleado" }, "Empleado"), selEmpleado]),
     el("div", { class: "field-row" }, [
       el("div", { class: "field" }, [el("label", { for: "ff-empresa" }, "Empresa"), selEmpresa]),
@@ -1974,6 +1991,27 @@ function abrirFormularioFondoEntregado(contenedor, usuarios) {
     if (btnRegistrar.disabled) return;
     btnRegistrar.disabled = true;
     const abiertos = await avisoFondosAbiertos(empleado.id, empleado.nombre);
+    if (selModo.value === "pendiente") {
+      if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Crear una solicitud PENDIENTE de ${fmtCLP(monto)} a nombre de ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})? Se avisará a los aprobadores.`)) { btnRegistrar.disabled = false; return; }
+      btnRegistrar.textContent = "Creando...";
+      const { data: creada, error: errCrear } = await db.rpc("admin_crear_solicitud_fondos", {
+        p_empleado_id: empleado.id,
+        p_empresa: selEmpresa.value,
+        p_centro_costo: selCC.value,
+        p_monto: monto,
+        p_motivo: motivo,
+      });
+      if (errCrear || !creada?.id) {
+        toast("No se pudo crear la solicitud: " + (errCrear ? mensajeErrorAmigable(errCrear) : "respuesta incompleta."));
+        btnRegistrar.disabled = false;
+        pintarModo();
+        return;
+      }
+      notificarAsync("notificar-aprobador", { tipo: "solicitud", rendicion_id: creada.id }, "No se pudo notificar al aprobador:");
+      toast(`Solicitud S-${creada.folio} creada a nombre de ${empleado.nombre}; se avisó a los aprobadores.`);
+      tarjeta.remove();
+      return;
+    }
     if (!confirm((abiertos ? abiertos + "\n\n" : "") + `¿Registrar un fondo APROBADO de ${fmtCLP(monto)} para ${empleado.nombre} en ${selEmpresa.value} (${selCC.value})?`)) { btnRegistrar.disabled = false; return; }
 
     btnRegistrar.textContent = "Registrando...";
@@ -6182,6 +6220,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
       box.appendChild(el("p",{class:"portal-muted"},"El saldo reserva tanto los gastos aprobados como los que siguen en revisión."));
     }
     if (abierto && currentProfile?.rol === "admin" && !esPropia) box.appendChild(panelLiquidarFondo(s));
+    if (abierto && currentProfile?.rol === "admin" && !esPropia && !errorConsumo && !(rendidas || []).length) box.appendChild(panelDevolverSolicitud(s));
     if(esPropia&&abierto)box.appendChild(el("button",{class:"btn btn-primary",type:"button",onclick:async()=>{
       if(enviandoRendicion){toast("Espera a que termine el envío actual.");return;}
       openNuevaRendicion();document.getElementById("nr-empresa").value=s.empresa;actualizarCentroCostoRendicion();
@@ -6931,6 +6970,27 @@ function formularioCorreccion({ titulo, descripcion, campos = [], textoBoton, ej
     finally { boton.disabled = false; }
   });
   return { abrir, caja };
+}
+
+// Un fondo aprobado por error (o registrado como entregado sin estarlo) vuelve
+// a Pendiente mientras no tenga rendiciones ni liquidación; la base lo revalida.
+function panelDevolverSolicitud(s) {
+  const f = formularioCorreccion({
+    titulo: "Devolver a pendiente",
+    descripcion: `Quita la aprobación de S-${s.folio} y la deja esperando revisión, como si ${s.empleado_nombre} recién la hubiera enviado. Solo se puede mientras no tenga rendiciones. Si ya contabilizaste la entrega en Kame, revierte ese asiento allá.`,
+    textoBoton: "Devolver a pendiente",
+    ejecutar: async (motivo) => {
+      if (!confirm(`¿Devolver S-${s.folio} (${fmtCLP(s.monto_solicitado)}, ${s.empleado_nombre}) a pendiente de aprobación?`)) return;
+      const { error } = await db.rpc("admin_devolver_solicitud_pendiente", { p_solicitud: s.id, p_motivo: motivo });
+      if (error) throw error;
+      toast(`S-${s.folio} quedó pendiente de aprobación.`); loadDashboard(); openDetalleSolicitud(s.id, false);
+    },
+  });
+  return el("section", { class: "card correcciones-admin", "aria-label": "Correcciones de administrador" }, [
+    el("h3", { style: "margin:0 0 4px;font-size:1rem" }, "Correcciones de administrador"),
+    el("p", { class: "portal-muted", style: "margin:0 0 10px;font-size:0.85rem" }, "Cada corrección pide un motivo y queda en el registro de eventos."),
+    el("div", { style: "display:flex;flex-wrap:wrap;gap:8px" }, [f.abrir]), f.caja,
+  ]);
 }
 
 async function panelCorreccionesAdmin(r, items) {
