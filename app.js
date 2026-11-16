@@ -6203,7 +6203,7 @@ async function openDetalleSolicitud(id, pushHistory = true) {
     // exceso se contabilizó como Rendiciones por Pagar (ver
     // calcularSplitFondo), no como parte de este fondo.
     let rendidas = [], errorConsumo = null;
-    try { rendidas = await consultarTodas(() => db.from("rendiciones_por_fondo").select("id, folio, monto_total, monto_aprobado, estado, monto_total_rendicion",{count:"exact"}).eq("solicitud_fondo_id",s.id).order("created_at").order("id")); }
+    try { rendidas = await consultarTodas(() => db.from("rendiciones_por_fondo").select("id, folio, monto_total, monto_aprobado, estado, monto_total_rendicion, created_at, fecha_aprobacion",{count:"exact"}).eq("solicitud_fondo_id",s.id).order("created_at").order("id")); }
     catch (error) {errorConsumo=error; box.appendChild(el("p",{class:"ocr-status show err"},"No se pudo comprobar el consumo del fondo. Vuelve a abrir el detalle para reintentar."));}
     const aprobadas = (rendidas || []).filter((r) => r.estado === "Aprobado");
     const rendido = errorConsumo ? null : resumirConsumoFondo(rendidas,s.monto_solicitado).consumido;
@@ -6230,15 +6230,28 @@ async function openDetalleSolicitud(id, pushHistory = true) {
 
     if (rendidas && rendidas.length) {
       box.appendChild(el("p", { style: "margin:16px 0 8px;font-weight:600;font-size:0.9rem" }, "Rendiciones contra este fondo"));
+      const detalle = await detalleRendicionesFondo(rendidas.map((r) => r.id));
+      const nota = (texto) => el("small", { style: "display:block;color:var(--ink-soft);font-weight:400" }, texto);
       const tabla = el("table", { class: "items-table" });
-      const cols = ["Rendición", "Monto", "Estado"];
-      tabla.appendChild(el("thead", {}, [el("tr", {}, cols.map((c) => el("th", { class: c === "Monto" ? "right" : "" }, c)))]));
+      const cols = ["Rendición", "Enviada", "Revisión", "Gastos", "Monto", "Saldo del fondo"];
+      tabla.appendChild(el("thead", {}, [el("tr", {}, cols.map((c) => el("th", { class: c === "Monto" || c === "Saldo del fondo" ? "right" : "" }, c)))]));
       const tbody = el("tbody");
+      let saldoCorrido = Number(s.monto_solicitado);
       rendidas.forEach((r) => {
+        const d = detalle.get(r.id) || {};
+        const vigente = r.estado === "Pendiente" || r.estado === "Aprobado";
+        if (vigente) saldoCorrido -= Number(r.monto_total || 0);
+        const aprobadoParcial = r.estado === "Aprobado" && r.monto_aprobado != null && Number(r.monto_aprobado) !== Number(r.monto_total);
         const celdas = [
-          el("td", {}, `N° ${r.folio ?? "-"}`),
-          el("td", { class: "monto" }, Number(r.monto_total_rendicion) !== Number(r.monto_total) ? [fmtCLP(r.monto_total), el("small", { style: "display:block;color:var(--ink-soft)" }, "de " + fmtCLP(r.monto_total_rendicion) + " (multifondo)")] : fmtCLP(r.monto_total)),
-          el("td", {}, el("span", { class: "pill " + r.estado }, r.estado)),
+          el("td", {}, [`N° ${r.folio ?? "-"}`, d.comentario ? nota(d.comentario) : null].filter(Boolean)),
+          el("td", {}, fmtDate(r.created_at)),
+          el("td", {}, [el("span", { class: "pill " + r.estado }, r.estado),
+            r.estado !== "Pendiente" && r.fecha_aprobacion ? nota(`${fmtDate(r.fecha_aprobacion)}${d.aprobador ? " · " + d.aprobador : ""}`) : null].filter(Boolean)),
+          el("td", {}, d.gastos == null ? "-" : [String(d.gastos), d.rechazados ? nota(`${d.rechazados} rechazado${d.rechazados === 1 ? "" : "s"}`) : null].filter(Boolean)),
+          el("td", { class: "monto" }, [fmtCLP(r.monto_total),
+            aprobadoParcial ? nota("aprobado " + fmtCLP(r.monto_aprobado)) : null,
+            Number(r.monto_total_rendicion) !== Number(r.monto_total) ? nota("de " + fmtCLP(r.monto_total_rendicion) + " (multifondo)") : null].filter(Boolean)),
+          el("td", { class: "monto" }, vigente ? fmtCLP(saldoCorrido) : nota("no descuenta")),
         ];
         celdas.forEach((td, i) => td.setAttribute("data-label", cols[i]));
         tbody.appendChild(filaClickable(() => openDetalle(r.id), celdas));
@@ -6970,6 +6983,28 @@ function formularioCorreccion({ titulo, descripcion, campos = [], textoBoton, ej
     finally { boton.disabled = false; }
   });
   return { abrir, caja };
+}
+
+// Comentario, aprobador y cantidad de gastos de las rendiciones de un fondo,
+// para la tabla del detalle. Si falla, la tabla se muestra igual sin esos datos.
+async function detalleRendicionesFondo(ids) {
+  const mapa = new Map();
+  if (!ids.length) return mapa;
+  try {
+    const [rends, items] = await Promise.all([
+      db.from("rendiciones").select("id, comentario, aprobador_nombre").in("id", ids),
+      consultarTodas(() => db.from("rendicion_items").select("id, rendicion_id, estado", { count: "exact" }).in("rendicion_id", ids).order("id")),
+    ]);
+    if (rends.error) throw rends.error;
+    for (const r of rends.data || []) mapa.set(r.id, { comentario: r.comentario || "", aprobador: r.aprobador_nombre || "", gastos: 0, rechazados: 0 });
+    for (const i of items) {
+      const d = mapa.get(i.rendicion_id);
+      if (!d) continue;
+      d.gastos++;
+      if (i.estado === "Rechazado") d.rechazados++;
+    }
+  } catch (error) { console.error("No se pudo leer el detalle de las rendiciones del fondo", error); }
+  return mapa;
 }
 
 // Un fondo aprobado por error (o registrado como entregado sin estarlo) vuelve

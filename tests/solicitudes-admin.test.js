@@ -51,3 +51,12 @@ test('la app: formulario con modo pendiente por defecto, aviso a aprobadores y b
   assert.match(app,/abierto && currentProfile\?\.rol === "admin" && !esPropia && !errorConsumo && !\(rendidas \|\| \[\]\)\.length\) box\.appendChild\(panelDevolverSolicitud\(s\)\)/);
   assert.match(app,/db\.rpc\("admin_devolver_solicitud_pendiente", \{ p_solicitud: s\.id, p_motivo: motivo \}\)/);
 });
+
+test('detalle del fondo: cada rendición muestra fecha de envío, revisión, gastos y saldo',()=>{
+  assert.match(app,/\.select\("id, folio, monto_total, monto_aprobado, estado, monto_total_rendicion, created_at, fecha_aprobacion",\{count:"exact"\}\)\.eq\("solicitud_fondo_id",s\.id\)/);
+  assert.match(app,/const cols = \["Rendición", "Enviada", "Revisión", "Gastos", "Monto", "Saldo del fondo"\];/);
+  assert.match(app,/el\("td", \{\}, fmtDate\(r\.created_at\)\)/,'fecha de envío');
+  assert.match(app,/const vigente = r\.estado === "Pendiente" \|\| r\.estado === "Aprobado";\s*if \(vigente\) saldoCorrido -= Number\(r\.monto_total \|\| 0\);/,'el saldo descuenta igual que resumirConsumoFondo');
+  const det=app.slice(app.indexOf('async function detalleRendicionesFondo('),app.indexOf('function panelDevolverSolicitud('));
+  assert.match(det,/catch \(error\) \{ console\.error/,'si falla, la tabla se muestra igual');
+});

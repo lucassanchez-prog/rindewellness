@@ -33,7 +33,7 @@ test('abrir fondo aprobado presenta consumo y saldo sin ReferenceError',async()=
  const fondo={id:'f',folio:2,estado:'Aprobado',empleado_id:'u',monto_solicitado:100};
  const q={select:()=>q,eq:()=>q,maybeSingle:async()=>({data:fondo,error:null})};
  const nodo=(tag,attrs,children)=>({tag,attrs,children,nodes:[],appendChild(n){this.nodes.push(n);},setAttribute(){}});
- const c=ctx({window:{RindeUI:{metric:(label,value,help)=>nodo("div",{},[label,value,help])}},db:{from:()=>q},document:{getElementById:()=>box},currentProfile:{},currentUser:{id:'u'},esAprobadorEfectivo:()=>false,fmtCLP:String,fmtDate:String,el:nodo,filaClickable:(_,c)=>nodo('tr',{},c),consultarTodas:async()=>[{id:'r',folio:1,estado:'Pendiente',monto_total:80,monto_aprobado:0}],pushView(){},replaceView(){},show(){},pushState(){},history:{pushState(){}},toast(){},renderRoute(){}});
+ const c=ctx({window:{RindeUI:{metric:(label,value,help)=>nodo("div",{},[label,value,help])}},db:{from:()=>q},document:{getElementById:()=>box},currentProfile:{},currentUser:{id:'u'},esAprobadorEfectivo:()=>false,fmtCLP:String,fmtDate:String,el:nodo,filaClickable:(_,c)=>nodo('tr',{},c),consultarTodas:async()=>[{id:'r',folio:1,estado:'Pendiente',monto_total:80,monto_aprobado:0}],detalleRendicionesFondo:async()=>new Map(),pushView(){},replaceView(){},show(){},pushState(){},history:{pushState(){}},toast(){},renderRoute(){}});
  vm.runInContext(tramo('function resumirConsumoFondo(','async function cargarConsumoFondos('),c);
  vm.runInContext(tramo('async function openDetalleSolicitud(','async function '),c);
  await c.openDetalleSolicitud('f',false);const texto=JSON.stringify(box.nodes);assert.match(texto,/Consumo aprobado/);assert.match(texto,/En revisión/);assert.match(texto,/80/);assert.match(texto,/20/);
