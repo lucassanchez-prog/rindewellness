@@ -7099,6 +7099,46 @@ async function panelCorreccionesAdmin(r, items) {
 
   if (r.estado === "Aprobado" && r.empleado_id !== currentUser.id) {
     const exportada = !!r.kame_exportado_en;
+    // Un ticket o boleta cargado como "Documento electrónico" (factura): se pasa a
+    // Comprobante/Boleta con su cuenta de gasto y, si ya se importó, ajuste para Kame.
+    const conDocumento = items.filter((it) => it.estado === "Aprobado" && it.tipo_item === "ConDocumento");
+    if (conDocumento.length) {
+      const cuentas = CATEGORIAS_GASTO.filter((c) => c.cuenta);
+      const filas = conDocumento.map((it) => {
+        const cb = el("input", { type: "checkbox", id: "cc-" + it.id });
+        const sugerida = cuentas.find((c) => c.nombre === it.categoria)?.cuenta || "";
+        const sel = el("select", { "aria-label": "Cuenta de gasto" }, [el("option", { value: "" }, "Elige la cuenta de gasto"),
+          ...cuentas.map((c) => el("option", { value: c.cuenta }, `${c.cuenta} · ${c.nombre}`))]);
+        sel.value = sugerida;
+        return { it, cb, sel, nodo: el("div", { style: "margin:6px 0" }, [
+          el("label", { for: cb.id, style: "display:flex;gap:8px;align-items:center" }, [cb,
+            `${it.nombre_proveedor || "Sin proveedor"} · ${it.tipo_documento || "Documento"} #${it.nro_documento || "-"} · ${fmtCLP(it.monto)}`]),
+          sel]) };
+      });
+      agregar(formularioCorreccion({
+        titulo: "Cambiar a Comprobante/Boleta",
+        descripcion: "Para tickets o boletas que se cargaron como documento electrónico. Pasan a Comprobante/Boleta con la cuenta de gasto que elijas; el RUT y el folio se conservan."
+          + (exportada ? " Esta rendición ya se descargó para Kame: se descarga un AJUSTE (sale de Proveedores y entra al gasto) que hay que importar una sola vez." : ""),
+        campos: filas.map((f) => f.nodo),
+        textoBoton: "Cambiar a Comprobante/Boleta",
+        ejecutar: async (motivo, estado) => {
+          const elegidas = filas.filter((f) => f.cb.checked);
+          if (!elegidas.length) { estado.textContent = "Marca al menos un gasto."; return; }
+          if (elegidas.some((f) => !f.sel.value)) { estado.textContent = "Elige la cuenta de gasto de cada gasto marcado."; return; }
+          const cuentaPorItem = new Map(elegidas.map((f) => [f.it.id, f.sel.value]));
+          let ajuste = null;
+          if (exportada) {
+            const [y, m, d] = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Santiago", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()).split("-");
+            ajuste = construirAjusteComprobante(await conDatosActualesDeEmpleado(r), items, cuentaPorItem, `${d}/${m}/${y}`);
+          }
+          const total = elegidas.reduce((s, f) => s + Number(f.it.monto || 0), 0);
+          if (!confirm(`¿Cambiar ${elegidas.length} gasto(s) de la N° ${r.folio} (${fmtCLP(total)}) a Comprobante/Boleta?` + (ajuste ? "\n\nSe descargará el ajuste para Kame." : ""))) { estado.textContent = ""; return; }
+          await rpc("admin_cambiar_a_comprobante", { p_rendicion: r.id, p_cambios: elegidas.map((f) => ({ item: f.it.id, cuenta: f.sel.value })), p_motivo: motivo });
+          if (ajuste) descargarTextoCsv(ajuste.fileName, ajuste.content);
+          toast(`${elegidas.length} gasto(s) de la N° ${r.folio} ahora son Comprobante/Boleta.` + (ajuste ? " Importa el ajuste en Kame una sola vez." : "")); openDetalle(r.id, false);
+        },
+      }));
+    }
     agregar(formularioCorreccion({
       titulo: "Anular aprobación",
       descripcion: "Pasa la rendición a Rechazada con este motivo y le avisa a " + r.empleado_nombre + " por correo."
@@ -7619,6 +7659,53 @@ function csvRow(fields) {
 // invertidos, para anular en Kame un comprobante ya importado (ver
 // anularAprobacionAdmin). Mismos folios de documento y fichas, así Kame
 // cancela exactamente lo que se importó.
+// Campos de la línea (Debe) de un gasto en el comprobante de Kame.
+function lineaGastoKame(rendicion, it, folioTransaccion, fecha, glosa) {
+  if (it.tipo_item === "ConDocumento") {
+    // El Centro de Costo de un "Documento electrónico" es solo para uso
+    // interno de la app (reportes, Excel) -- no se manda en el
+    // comprobante de Kame para este tipo de ítem.
+    return [
+      "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
+      glosa, it.rut_proveedor, it.nombre_proveedor || "", it.tipo_documento, it.nro_documento,
+      it.fecha_vencimiento ? fmtDateSlash(it.fecha_vencimiento) : "",
+      "", "", "",
+    ];
+  }
+  // Sin proveedor, pero igual va con Ficha: la del empleado que hizo el
+  // gasto, para poder trazar de quién es cada línea.
+  // Un gasto en dólares deja en el comentario de su línea de dónde salen los pesos.
+  const comentarioLinea = it.moneda === "USD" && it.monto_original && it.tipo_cambio
+    ? `${glosa} · USD ${fmtUsd(it.monto_original)} TC ${Number(it.tipo_cambio).toLocaleString("es-CL", { minimumFractionDigits: 2 })}` : glosa;
+  return [
+    "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
+    comentarioLinea, rendicion.rut_empleado || "", rendicion.empleado_nombre, "", "", "",
+    it.centro_costo || it.empresa || "", "", "",
+  ];
+}
+
+// Ajuste para Kame al pasar gastos ya importados de "Documento electrónico" a
+// "Comprobante/Boleta": por cada gasto, el reverso de su línea original (sale
+// de Proveedores, con la misma ficha y documento) y la línea nueva al gasto.
+// La contrapartida de la rendición no cambia, así que el ajuste cuadra solo.
+function construirAjusteComprobante(rendicion, items, cuentaPorItem, fechaHoy) {
+  const fechaOriginal = fmtDateSlash(rendicion.fecha_rendicion || rendicion.created_at) || rendicion.created_at;
+  const glosaOriginal = `RENDICION N° ${rendicion.folio ?? ""} ${rendicion.empleado_nombre}`.replace(/\s+/g, " ").trim();
+  const glosaAjuste = "AJUSTE " + glosaOriginal;
+  const filas = [];
+  for (const it of items) {
+    const cuenta = cuentaPorItem.get(it.id);
+    if (!cuenta) continue;
+    if (it.tipo_item !== "ConDocumento" || it.estado !== "Aprobado") throw new Error("Solo se ajustan gastos aprobados con documento electrónico.");
+    const reverso = window.RindeCore.invertirFilaKame(lineaGastoKame(rendicion, it, 1, fechaOriginal, glosaOriginal), fechaHoy);
+    reverso[4] = glosaAjuste;
+    const nueva = lineaGastoKame(rendicion, { ...it, tipo_item: "SinDocumento", cuenta_contable: cuenta }, 1, fechaHoy, glosaAjuste);
+    filas.push(csvRow(reverso), csvRow(nueva));
+  }
+  if (!filas.length) throw new Error("Elige al menos un gasto.");
+  return { fileName: `ajuste_rendicion_${rendicion.folio ?? rendicion.id.slice(0, 8)}.csv`, content: [CSV_HEADER, ...filas].join("\r\n") };
+}
+
 function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null, opciones = {}) {
   const fila = (campos) => csvRow(opciones.reverso ? window.RindeCore.invertirFilaKame(campos, opciones.reverso.fecha) : campos);
   const fecha = fmtDateSlash(rendicion.fecha_rendicion || rendicion.created_at) || rendicion.created_at;
@@ -7643,28 +7730,7 @@ function construirFilasCSV(rendicion, items, folioTransaccion = 1, split = null,
   // comprobante para Kame" y con el export por rango de fechas), las líneas
   // Debe sumaban más que el Haber y el comprobante quedaba descuadrado.
   (items || []).filter((it) => it.estado === "Aprobado").forEach((it) => {
-    if (it.tipo_item === "ConDocumento") {
-      // El Centro de Costo de un "Documento electrónico" es solo para uso
-      // interno de la app (reportes, Excel) -- no se manda en el
-      // comprobante de Kame para este tipo de ítem.
-      rows.push(fila([
-        "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
-        glosa, it.rut_proveedor, it.nombre_proveedor || "", it.tipo_documento, it.nro_documento,
-        it.fecha_vencimiento ? fmtDateSlash(it.fecha_vencimiento) : "",
-        "", "", "",
-      ]));
-    } else {
-      // Sin proveedor, pero igual va con Ficha: la del empleado que hizo el
-      // gasto, para poder trazar de quién es cada línea.
-      // Un gasto en dólares deja en el comentario de su línea de dónde salen los pesos.
-      const comentarioLinea = it.moneda === "USD" && it.monto_original && it.tipo_cambio
-        ? `${glosa} · USD ${fmtUsd(it.monto_original)} TC ${Number(it.tipo_cambio).toLocaleString("es-CL", { minimumFractionDigits: 2 })}` : glosa;
-      rows.push(fila([
-        "TRASPASO", "S", folioTransaccion, fecha, glosa, it.cuenta_contable, it.monto, 0,
-        comentarioLinea, rendicion.rut_empleado || "", rendicion.empleado_nombre, "", "", "",
-        it.centro_costo || it.empresa || "", "", "",
-      ]));
-    }
+    rows.push(fila(lineaGastoKame(rendicion, it, folioTransaccion, fecha, glosa)));
   });
 
   const folioDoc = rendicion.folio ?? rendicion.id.slice(0, 8);
