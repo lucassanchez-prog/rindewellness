@@ -7051,6 +7051,54 @@ async function panelCorreccionesAdmin(r, items) {
       },
     }));
 
+    // Un gasto compartido (p. ej. una notaría por finiquitos de dos empresas) se
+    // reparte en dos rendiciones, porque cada una se importa en Kame a una empresa.
+    const divisible = items.length && items.every((it) => it.estado === "Pendiente" && it.tipo_item !== "ConDocumento" && (it.moneda || "CLP") === "CLP");
+    if (divisible) {
+      const parte = (titulo, empresaInicial) => {
+        const emp = el("select", {}, EMPRESAS.map((e) => el("option", { value: e }, e)));
+        const cc = el("select", {});
+        const llenar = () => { cc.replaceChildren(...(CENTROS_COSTO_POR_EMPRESA[emp.value] || ["Casa Matriz"]).map((o) => el("option", { value: o }, o))); };
+        emp.value = empresaInicial; llenar();
+        emp.addEventListener("change", () => { llenar(); calcular(); });
+        return { emp, cc, nodo: el("div", { class: "field-row" }, [
+          el("div", { class: "field" }, [el("label", {}, titulo + " · empresa"), emp]),
+          el("div", { class: "field" }, [el("label", {}, "Centro de costo"), cc]),
+        ]) };
+      };
+      const actual = parte(`N° ${r.folio}`, r.empresa);
+      const nueva = parte("Rendición nueva", EMPRESAS.find((e) => e !== r.empresa) || r.empresa);
+      const pct = el("input", { type: "number", min: "1", max: "99", step: "1", value: "50" });
+      const resumen = el("p", { class: "portal-muted", style: "margin:4px 0 8px" });
+      const repartir = () => {
+        const p = Number(pct.value);
+        const nuevaMonto = items.reduce((s, it) => s + Math.round(Number(it.monto) * p / 100), 0);
+        return { p, nuevaMonto, actualMonto: items.reduce((s, it) => s + Number(it.monto), 0) - nuevaMonto };
+      };
+      function calcular() {
+        const { p, nuevaMonto, actualMonto } = repartir();
+        resumen.textContent = p > 0 && p < 100
+          ? `N° ${r.folio}: ${fmtCLP(actualMonto)} en ${actual.emp.value} · Nueva: ${fmtCLP(nuevaMonto)} en ${nueva.emp.value}`
+          : "El porcentaje debe estar entre 1 y 99.";
+      }
+      pct.addEventListener("input", calcular); actual.emp.addEventListener("change", calcular);
+      calcular();
+      agregar(formularioCorreccion({
+        titulo: "Dividir entre empresas",
+        descripcion: `Reparte cada gasto entre dos empresas. La N° ${r.folio} queda con una parte y se crea otra rendición pendiente a nombre de ${r.empleado_nombre}, con el mismo comprobante, por el resto. Las dos se aprueban por separado.`,
+        campos: [actual.nodo, nueva.nodo, el("div", { class: "field" }, [el("label", {}, "% para la rendición nueva"), pct]), resumen],
+        textoBoton: "Dividir",
+        ejecutar: async (motivo, estado) => {
+          const { p, nuevaMonto, actualMonto } = repartir();
+          if (!(p > 0 && p < 100)) { estado.textContent = "El porcentaje debe estar entre 1 y 99."; return; }
+          if (!confirm(`¿Dividir la N° ${r.folio}?\n\n${fmtCLP(actualMonto)} quedan en ${actual.emp.value} (${actual.cc.value}).\n${fmtCLP(nuevaMonto)} pasan a una rendición nueva en ${nueva.emp.value} (${nueva.cc.value}).`)) return;
+          const res = await rpc("admin_dividir_rendicion", { p_rendicion: r.id, p_empresa_actual: actual.emp.value, p_cc_actual: actual.cc.value,
+            p_empresa_nueva: nueva.emp.value, p_cc_nueva: nueva.cc.value, p_porcentaje_nueva: p, p_motivo: motivo });
+          toast(`Listo: N° ${res.folio} por ${fmtCLP(res.monto)} y N° ${res.nueva_folio} por ${fmtCLP(res.nueva_monto)}.`); loadDashboard(); openDetalle(r.id, false);
+        },
+      }));
+    }
+
     const { data: perfiles } = await db.from("profiles").select("id, nombre, activo").eq("activo", true).order("nombre");
     const candidatos = (perfiles || []).filter((p) => p.id !== r.empleado_id && p.id !== currentUser.id);
     if (candidatos.length) {
